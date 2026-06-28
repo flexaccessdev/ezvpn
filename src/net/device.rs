@@ -2128,16 +2128,26 @@ fn parse_macos_route_get(output: &str, peer_ip: IpAddr) -> VpnResult<BypassRoute
 /// machines is shadowed by PowerShell 7 (`pwsh.exe` symlinked/copied as
 /// `powershell.exe`), a Microsoft Store alias, or another shim. The NetTCPIP
 /// scripts here are written for, and verified against, the always-present
-/// Windows PowerShell 5.1, so we pin to its fixed `System32` location under the
-/// real Windows directory (`%SystemRoot%`, fallback `C:\Windows`). This is the
-/// native-bitness copy; a 64-bit process reaches it directly and a 32-bit
-/// process is redirected to the matching `SysWOW64` copy, both of which ship the
-/// NetTCPIP module.
+/// Windows PowerShell 5.1, so we pin to its fixed location under the real
+/// `System32` directory.
+///
+/// `System32` is resolved via the Known Folders API
+/// (`SHGetKnownFolderPath(FOLDERID_System)`) — the same authoritative source
+/// used for `%ProgramData%` — which follows the real install drive and cannot
+/// be redirected by a spoofed `%SystemRoot%`. The `%SystemRoot%` env var, then
+/// the `C:\Windows` literal, are last-ditch fallbacks only reached if that call
+/// fails. The returned path is the native-bitness `System32`; a 64-bit process
+/// reaches `powershell.exe` directly and a 32-bit process is filesystem-
+/// redirected to the matching `SysWOW64` copy, both of which ship NetTCPIP.
 #[cfg(target_os = "windows")]
 fn windows_powershell_path() -> std::path::PathBuf {
-    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    std::path::Path::new(&system_root)
-        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+    let system32 = known_folders::get_known_folder_path(known_folders::KnownFolder::System)
+        .unwrap_or_else(|| {
+            let system_root =
+                std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+            std::path::Path::new(&system_root).join("System32")
+        });
+    system32.join(r"WindowsPowerShell\v1.0\powershell.exe")
 }
 
 /// Run a PowerShell script via the in-box `powershell.exe` (async).
