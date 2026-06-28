@@ -36,8 +36,9 @@ the fixed `default` instance for `server status` / `server list`.
 
 `ezvpn` keeps its per-instance lock file and control socket in a **fixed,
 machine-global runtime directory**: `/run/ezvpn` on Linux, `/var/run/ezvpn` on
-macOS, and `%ProgramData%\ezvpn` on Windows. It is created (owner-only) on first run. This directory holds only
-ephemeral state — on Linux `/run` is tmpfs and cleared on reboot. (The
+macOS, and `%ProgramData%\ezvpn` on Windows. It is created on first run
+(owner-only, `0700`, on Unix). This directory holds only ephemeral state — on
+Linux `/run` is tmpfs and cleared on reboot. (The
 `--daemon` log file is kept separately under the persistent log directory; see
 above. The service-manager setups below run in the foreground and capture logs
 via the service manager, so they don't use it.)

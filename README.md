@@ -7,12 +7,6 @@ QUIC connections. Clients dial the server by its stable iroh `EndpointId`, so
 they do not need the server's current IP address and the server does not need
 open inbound ports. Relay fallback is used when a direct path is unavailable.
 
-> [!IMPORTANT]
-> `ezvpn` is a server-centered access tunnel. It is not a site-to-site network
-> joiner, and it intentionally does not provide client-to-client connectivity.
-> The server drops client-to-client packets in userspace before they reach the
-> TUN device.
-
 > [!WARNING]
 > While `ezvpn` remains in the `0.0.x` series, there is no backward
 > compatibility between versions. Regenerate server keys and refresh configs on
@@ -45,11 +39,20 @@ Use `ezvpn` when you need:
 - Cross-platform VPN connectivity on Linux, macOS, and Windows
 - A WireGuard/OpenVPN alternative over iroh transport
 
-Do not use it for site-to-site routing between two LANs or for direct
-client-to-client traffic. Within the VPN address pool, a client can reach only
-the server VPN gateway; packets to other client-assigned VPN IPs are dropped.
-Routes can still forward non-VPN destinations through the server, subject to
-the server host's routing, forwarding/NAT, and firewall rules.
+`ezvpn` is a server-centered access tunnel, not a site-to-site network joiner,
+and it intentionally does not provide client-to-client connectivity. Within the
+VPN address pool a client can reach only the server VPN gateway; packets to
+other client-assigned VPN IPs are dropped in userspace before they reach the TUN
+device. Routes can still forward non-VPN destinations through the server,
+subject to the server host's routing, forwarding/NAT, and firewall rules.
+
+Ruling out client-to-client traffic is deliberate: it sidesteps the IP-conflict
+pain point of conventional VPNs, which need sophisticated state management to
+keep each client's assigned address stable so peers can reliably address one
+another. Here every client only ever talks to the server gateway, so assigned
+IPs carry no such guarantee and the whole class of stale-IP and address-collision
+bookkeeping disappears. So do not use `ezvpn` for site-to-site routing between
+two LANs or for direct client-to-client traffic.
 
 ## Installation
 
