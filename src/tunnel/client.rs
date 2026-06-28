@@ -16,7 +16,7 @@ use crate::net::device::{
 };
 use crate::control::{ClientConnectedInfo, ClientStatusHandle};
 use crate::error::{VpnError, VpnResult};
-use crate::lock::{LockRole, VpnLock};
+use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::{TcpGroTable, VirtioNetHdr, materialize_offload_into};
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
 use crate::tunnel::signaling::{

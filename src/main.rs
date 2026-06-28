@@ -10,8 +10,8 @@ mod auth;
 mod config;
 mod control;
 mod error;
-mod lock;
 mod net;
+mod runtime;
 mod secret;
 mod transport;
 mod tunnel;
@@ -28,7 +28,7 @@ use crate::config::file_config::{
     VpnClientConfigBuilder, VpnServerConfig as TomlServerConfig, expand_tilde,
     load_vpn_client_config, load_vpn_server_config,
 };
-use crate::lock::LockRole;
+use crate::runtime::LockRole;
 use crate::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
 // Runtime config types (different from the TOML config types in config::file_config)
 use crate::config::{VpnClientConfig, VpnServerConfig};
@@ -312,9 +312,9 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
 /// Default daemon log-file path for a client instance (absolute; in the log
 /// dir, so it survives the daemon's `chdir("/")`).
 fn client_log_path(instance: &str) -> PathBuf {
-    lock::log_dir().join(format!(
+    runtime::log_dir().join(format!(
         "{}.log",
-        lock::runtime_base_name(LockRole::Client, instance)
+        runtime::runtime_base_name(LockRole::Client, instance)
     ))
 }
 
@@ -347,7 +347,7 @@ fn main() -> Result<()> {
                     daemon,
                 },
         } => {
-            lock::validate_instance_name(&instance)?;
+            runtime::validate_instance_name(&instance)?;
             let mut resolved = prepare_client_start(
                 config,
                 default_config,
@@ -458,7 +458,7 @@ async fn run_async(command: Command) -> Result<()> {
         Command::Client {
             action: ClientAction::Status { json, instance },
         } => {
-            lock::validate_instance_name(&instance)?;
+            runtime::validate_instance_name(&instance)?;
             show_status(LockRole::Client, json, &instance).await
         }
         Command::Client {
@@ -604,7 +604,7 @@ fn daemonize_client(log_path: &Path) -> Result<()> {
     use std::os::fd::{FromRawFd, OwnedFd};
 
     // The log lives in the log dir, which may not exist on first run.
-    lock::ensure_log_dir().context("creating log directory for daemon log")?;
+    runtime::ensure_log_dir().context("creating log directory for daemon log")?;
 
     // Resolve the cap before the fork so any warning lands on the foreground
     // terminal rather than (post-redirect) in the log file itself.
@@ -735,7 +735,7 @@ async fn shutdown_signal() {
 /// the status socket, and tearing down the TUN device).
 #[cfg(unix)]
 async fn stop_client(instance: &str) -> Result<()> {
-    lock::validate_instance_name(instance)?;
+    runtime::validate_instance_name(instance)?;
 
     // Confirm an instance is actually serving before signaling a PID.
     if control::query_status(LockRole::Client, instance).await?.is_none() {
@@ -743,7 +743,7 @@ async fn stop_client(instance: &str) -> Result<()> {
         return Ok(());
     }
 
-    let pid = lock::read_instance_pid(LockRole::Client, instance)?
+    let pid = runtime::read_instance_pid(LockRole::Client, instance)?
         .context("could not determine client PID from lock file")?;
 
     // SAFETY: a plain SIGTERM to a PID we just confirmed is a live instance.

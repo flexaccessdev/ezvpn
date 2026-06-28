@@ -2,7 +2,7 @@
 //!
 //! A running VPN server or client exposes a small JSON-over-local-socket
 //! endpoint. The `status` subcommand connects to it, reads a one-shot snapshot,
-//! and prints it. The single-instance lock (`crate::lock`) guarantees at most
+//! and prints it. The single-instance lock (`crate::runtime`) guarantees at most
 //! one instance per (role, instance name), so the socket lives at a fixed path
 //! — derived from the role and instance name — next to the lock file.
 //!
@@ -18,7 +18,7 @@
 //! socket, or connection refused) treats the instance as not running.
 
 use crate::error::{VpnError, VpnResult};
-use crate::lock::{LockRole, runtime_base_name, runtime_dir, validate_instance_name};
+use crate::runtime::{LockRole, runtime_base_name, runtime_dir, validate_instance_name};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -471,14 +471,14 @@ pub struct InstanceInfo {
 /// List instances for `role` discovered in the runtime directory, probing each
 /// for a live status snapshot.
 ///
-/// Discovery is by lock file (see [`crate::lock::list_locked_instances`]), which
+/// Discovery is by lock file (see [`crate::runtime::list_locked_instances`]), which
 /// can include stale entries; each candidate is then probed via its control
 /// socket. A probe that fails is recorded on that instance (as a stale lock when
 /// nothing is listening, or via `error` otherwise) rather than failing the whole
 /// listing, so one bad instance can't hide the others.
 pub async fn list_instances(role: LockRole) -> VpnResult<Vec<InstanceInfo>> {
     let mut out = Vec::new();
-    for instance in crate::lock::list_locked_instances(role) {
+    for instance in crate::runtime::list_locked_instances(role) {
         let (status, error) = match query_status(role, &instance).await {
             Ok(status) => (status, None),
             Err(e) => {
@@ -878,7 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_instances_includes_a_running_client() {
-        use crate::lock::VpnLock;
+        use crate::runtime::VpnLock;
 
         // A running instance has both a lock file (discovery) and a listener
         // (the probe). Use a per-run-unique name so other tests' lock files and
@@ -908,7 +908,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn list_instances_distinguishes_probe_error_from_stale_lock() {
-        use crate::lock::VpnLock;
+        use crate::runtime::VpnLock;
 
         // An instance whose socket exists and accepts a connection but replies
         // with a malformed (non-JSON) response: this is a probe *error*, not a

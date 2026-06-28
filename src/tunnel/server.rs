@@ -14,7 +14,7 @@ use crate::tunnel::datagram::{
 use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
 use crate::control::{ClientEntry, ServerStatsView, ServerStatus, StatusSnapshot};
 use crate::error::{VpnError, VpnResult};
-use crate::lock::{LockRole, VpnLock};
+use crate::runtime::{LockRole, VpnLock};
 use crate::config::file_config::TransportTuning;
 use crate::tunnel::offload::{
     CoalescedOutput, TcpGroTable, VirtioNetHdr, materialize_offload_into,

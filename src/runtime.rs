@@ -1,17 +1,23 @@
-//! Single-instance lock for the VPN client and server.
+//! Runtime filesystem layout and single-instance locking.
 //!
-//! Ensures only one VPN instance runs at a time per (role, instance name) to
-//! prevent routing conflicts and TUN device issues. The client and server use
-//! separate lock files, so a client and a server can run simultaneously on the
-//! same host. Clients are additionally scoped by an instance name (default
-//! `default`), so multiple clients with distinct instance names can coexist.
+//! Owns the per-platform locations `ezvpn` uses at runtime — the ephemeral
+//! runtime directory ([`runtime_dir`], for lock files and control sockets) and
+//! the persistent log directory ([`log_dir`]) — plus instance-name validation
+//! and the file-based single-instance lock ([`VpnLock`]).
+//!
+//! The lock ensures only one VPN instance runs at a time per (role, instance
+//! name) to prevent routing conflicts and TUN device issues. The client and
+//! server use separate lock files, so a client and a server can run
+//! simultaneously on the same host. Clients are additionally scoped by an
+//! instance name (default `default`), so multiple clients with distinct
+//! instance names can coexist.
 //!
 //! # Platform Support
 //!
 //! This module supports Linux, macOS, and Windows.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-compile_error!("VPN lock is only supported on Linux, macOS, and Windows");
+compile_error!("VPN runtime support is only available on Linux, macOS, and Windows");
 
 use crate::error::{VpnError, VpnResult};
 use std::fs::{File, OpenOptions, TryLockError};
