@@ -48,6 +48,17 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// interval so a single lost keep-alive never trips it.
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Interval at which the server re-publishes its candidate iroh underlay
+/// addresses to each connected client (on the unreliable datagram path).
+///
+/// The server also publishes once immediately on connect and promptly whenever
+/// `Endpoint::watch_addr()` reports a change; this interval is the loss-tolerance
+/// floor (a dropped publication datagram is recovered within one tick). The
+/// client merges the set add-only into its bypass-route manager, so a newly
+/// learned server address is pinned off the VPN tunnel within at most this
+/// interval even if iroh has not yet selected it for the active path.
+pub const SERVER_ADDR_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Per-direction QUIC datagram buffer size (bytes).
 ///
 /// The QUIC-level analog of the OS socket `SO_RCVBUF`/`SO_SNDBUF`: it bounds how

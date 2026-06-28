@@ -288,14 +288,34 @@ tunnel — the exact failure the bypass exists to prevent. A bypass route only
 pins one peer's underlay address (the server's transport address) off the
 tunnel, so keeping a no-longer-listed one for the session is harmless.
 
-Only the addresses iroh actually uses for transport are ever bypassed: the
-manager's required set comes from `collect_addresses_from_paths`, i.e. the
-connection's direct remote addresses (the server's underlay address) and any
-relay it falls back to — never arbitrary destinations. So a bypass pins **only
-that one transport endpoint, not the rest of the routed prefix**: other hosts
-inside the same CIDR still route through the VPN normally. In a full tunnel
-(`0.0.0.0/0`/`::/0`) the server and relay addresses are always covered and thus
-always pinned; in a split tunnel only an endpoint that overlaps a routed CIDR is.
+The manager's required set has two sources, both fed into the same add-only
+`update`:
+
+1. **Reactive (path snapshots).** `collect_addresses_from_paths` yields the
+   connection's current direct remote address (the server's underlay address) and
+   any relay it falls back to, as iroh's `paths_stream` reports changes.
+2. **Proactive (server-published).** The server periodically publishes the full
+   set of candidate underlay addresses it may be reached on
+   (`endpoint.addr().ip_addrs()`) to each client over the data path — once on
+   connect, every `SERVER_ADDR_PUBLISH_INTERVAL` for loss tolerance, and promptly
+   on any local-address change (`Endpoint::watch_addr`). This is carried as a
+   `DataMessageType::ServerAddrs` datagram (`ServerAddrsMsg`), decoded by the
+   client's inbound loop and handed to the manager. It closes a gap the reactive
+   source alone cannot: a server may have **more candidate addresses than ever
+   appear in the active path snapshot**, so if iroh later migrates to a
+   not-yet-seen server address that overlaps a routed prefix (e.g. an AWS IPv6 GUA
+   inside a broad routed CIDR), the bypass is already in place before the
+   migration self-captures it. The client still filters published addresses to
+   those a VPN route would capture, so the server can publish its whole set
+   (including LAN/private addresses) without the client pinning anything outside
+   the routed range.
+
+Either way, only transport-relevant addresses are bypassed — never arbitrary
+destinations. So a bypass pins **only that one transport endpoint, not the rest of
+the routed prefix**: other hosts inside the same CIDR still route through the VPN
+normally. In a full tunnel (`0.0.0.0/0`/`::/0`) the server and relay addresses are
+always covered and thus always pinned; in a split tunnel only an endpoint that
+overlaps a routed CIDR is.
 
 **Caveat (user-visible).** As a consequence, the one address used for tunnel
 transport is reachable only over the underlay, not through the VPN, while the

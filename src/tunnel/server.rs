@@ -9,7 +9,7 @@ use crate::net::buffer::uninitialized_vec;
 use crate::config::{Ip6Strategy, VpnServerConfig, validate_ip6_strategy};
 use crate::tunnel::datagram::{
     DATAGRAM_FRAMING_OVERHEAD, Datagram, FRAME_ARENA_CHUNK, build_datagrams, build_gro_datagrams,
-    classify,
+    classify, encode_server_addrs_datagram,
 };
 use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
 use crate::control::{ClientEntry, ServerStatsView, ServerStatus, StatusSnapshot};
@@ -20,18 +20,20 @@ use crate::tunnel::offload::{
     CoalescedOutput, TcpGroTable, VirtioNetHdr, materialize_offload_into,
 };
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
+use crate::transport::SERVER_ADDR_PUBLISH_INTERVAL;
 use crate::tunnel::signaling::{
-    MAX_HANDSHAKE_SIZE, VpnHandshake, VpnHandshakeResponse, WireTransport, parse_ip_packet_v2,
-    read_message, write_message,
+    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse, WireTransport,
+    parse_ip_packet_v2, read_message, write_message,
 };
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
+use futures::StreamExt;
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, SendDatagramError};
-use iroh::{Endpoint, EndpointId};
+use iroh::{Endpoint, EndpointId, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -925,9 +927,15 @@ impl VpnServer {
                     let server = server.clone();
                     let tun_write_tx = tun_write_tx.clone();
                     let local_iroh_udp_ports = local_iroh_udp_ports.clone();
+                    let endpoint = endpoint.clone();
                     tokio::spawn(async move {
                         if let Err(e) = server
-                            .handle_connection(incoming, tun_write_tx, local_iroh_udp_ports)
+                            .handle_connection(
+                                incoming,
+                                tun_write_tx,
+                                local_iroh_udp_ports,
+                                endpoint,
+                            )
                             .await
                         {
                             log::error!("Connection error: {}", e);
@@ -966,6 +974,7 @@ impl VpnServer {
         incoming: iroh::endpoint::Incoming,
         tun_write_tx: mpsc::Sender<TunWriteRequest>,
         local_iroh_udp_ports: Arc<HashSet<u16>>,
+        endpoint: Endpoint,
     ) -> VpnResult<()> {
         let connection = incoming
             .await
@@ -1057,6 +1066,7 @@ impl VpnServer {
                 tun_write_tx,
                 local_iroh_udp_ports,
                 handshake,
+                endpoint,
             )
             .await;
 
@@ -1067,6 +1077,7 @@ impl VpnServer {
     }
 
     /// Inner connection handler - separated to ensure atomic counter cleanup.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection_inner(
         &self,
         send: &mut iroh::endpoint::SendStream,
@@ -1075,6 +1086,7 @@ impl VpnServer {
         tun_write_tx: mpsc::Sender<TunWriteRequest>,
         local_iroh_udp_ports: Arc<HashSet<u16>>,
         handshake: VpnHandshake,
+        endpoint: Endpoint,
     ) -> VpnResult<()> {
         let device_id = handshake.device_id;
         let client_gso_enabled = handshake.gso_enabled;
@@ -1282,6 +1294,26 @@ impl VpnServer {
             if let Some(err_msg) = error {
                 let _ = writer_error_tx.send(err_msg);
             }
+        });
+
+        // Periodically publish the server's candidate iroh underlay addresses to
+        // this client so it can bypass-route any that fall within its VPN range,
+        // pre-empting the self-capture of a server address iroh has discovered but
+        // not yet selected for the active path (which the client's path-snapshot
+        // discovery alone would miss). Self-terminates when the connection closes
+        // or the writer's receiver is gone (queueing via `packet_tx` fails).
+        let publisher_endpoint = endpoint.clone();
+        let publisher_tx = packet_tx.clone();
+        let publisher_conn = connection.clone();
+        let publisher_label = remote_id.to_string();
+        tokio::spawn(async move {
+            run_server_addr_publisher(
+                publisher_endpoint,
+                publisher_conn,
+                publisher_tx,
+                publisher_label,
+            )
+            .await;
         });
 
         // Generate unique session ID for this connection
@@ -1579,6 +1611,11 @@ impl VpnServer {
 
                 let body = match classify(&dgram) {
                     Ok(Datagram::Ip(body)) => body,
+                    Ok(Datagram::ServerAddrs(_)) => {
+                        // Server → client only; a client never sends this. Ignore.
+                        log::trace!("Ignoring unexpected ServerAddrs datagram from {}", client_id);
+                        continue;
+                    }
                     Err(e) => {
                         log::trace!("Ignoring undecodable datagram from {}: {}", client_id, e);
                         continue;
@@ -2129,6 +2166,88 @@ fn read_ipv6_addr(packet: &[u8], offset: usize) -> Ipv6Addr {
 /// Collect local UDP ports bound by the iroh endpoint.
 fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
     endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
+}
+
+/// Publish the server's current candidate underlay addresses to one client over
+/// the data-datagram path.
+///
+/// Returns `Err(())` only when the client's writer receiver is gone (the
+/// connection is being torn down), which tells the caller to stop publishing.
+/// An empty address set or an encode error is a no-op (`Ok`): the next tick
+/// retries.
+async fn publish_server_addrs(
+    endpoint: &Endpoint,
+    packet_tx: &mpsc::Sender<Bytes>,
+    label: &str,
+) -> Result<(), ()> {
+    let mut addrs: Vec<IpAddr> = endpoint.addr().ip_addrs().map(|sa| sa.ip()).collect();
+    if addrs.is_empty() {
+        // No direct addresses discovered yet; nothing to bypass.
+        return Ok(());
+    }
+    addrs.sort_unstable();
+    addrs.dedup();
+
+    let msg = ServerAddrsMsg::new(addrs);
+    let mut buf = BytesMut::new();
+    if let Err(e) = encode_server_addrs_datagram(&mut buf, &msg) {
+        log::warn!("Failed to encode server addrs for {}: {}", label, e);
+        return Ok(());
+    }
+
+    match packet_tx.send(buf.freeze()).await {
+        Ok(()) => {
+            log::trace!(
+                "Published {} candidate server underlay addrs to {}",
+                msg.addrs.len(),
+                label
+            );
+            Ok(())
+        }
+        // Writer's receiver dropped: the connection is gone, stop publishing.
+        Err(_) => Err(()),
+    }
+}
+
+/// Periodically publish the server's candidate iroh underlay addresses to one
+/// client (see [`publish_server_addrs`]): once immediately, then every
+/// [`SERVER_ADDR_PUBLISH_INTERVAL`] for loss tolerance, and promptly whenever
+/// the local address set changes ([`Endpoint::watch_addr`]). Ends when the
+/// connection closes or the client's writer is gone.
+async fn run_server_addr_publisher(
+    endpoint: Endpoint,
+    connection: Connection,
+    packet_tx: mpsc::Sender<Bytes>,
+    label: String,
+) {
+    // The first `tick()` resolves immediately, giving the eager initial publish.
+    let mut interval = tokio::time::interval(SERVER_ADDR_PUBLISH_INTERVAL);
+    let mut addr_changes = endpoint.watch_addr().stream();
+    let mut watcher_alive = true;
+
+    loop {
+        tokio::select! {
+            _ = connection.closed() => break,
+            _ = interval.tick() => {
+                if publish_server_addrs(&endpoint, &packet_tx, &label).await.is_err() {
+                    break;
+                }
+            }
+            changed = addr_changes.next(), if watcher_alive => {
+                match changed {
+                    Some(_) => {
+                        if publish_server_addrs(&endpoint, &packet_tx, &label).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Watcher ended: disable this branch and rely on the interval.
+                    None => watcher_alive = false,
+                }
+            }
+        }
+    }
+
+    log::debug!("Server addr publisher for {} ending", label);
 }
 
 /// Return true if packet is UDP and either source/destination port matches a blocked port.

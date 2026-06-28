@@ -14,7 +14,7 @@ use crate::error::{VpnError, VpnResult};
 use crate::tunnel::offload::{
     CoalescedOutput, VIRTIO_NET_HDR_LEN, VirtioNetHdr, materialize_offload_into,
 };
-use crate::tunnel::signaling::DataMessageType;
+use crate::tunnel::signaling::{DataMessageType, ServerAddrsMsg};
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// Reserve granularity for the framing arena. Frames are appended to a
@@ -33,6 +33,9 @@ pub enum Datagram<'a> {
     /// IP packet message body (everything after the type byte): pass to
     /// [`crate::tunnel::signaling::parse_ip_packet_v2`].
     Ip(&'a [u8]),
+    /// Server-published candidate-address message body (everything after the
+    /// type byte): pass to [`ServerAddrsMsg::decode`]. Server → client only.
+    ServerAddrs(&'a [u8]),
 }
 
 /// Append an IP-packet datagram to `buf` (arena-style) and return the number of
@@ -200,11 +203,23 @@ pub fn classify(dgram: &[u8]) -> VpnResult<Datagram<'_>> {
     };
     match DataMessageType::from_byte(type_byte) {
         Some(DataMessageType::IpPacket) => Ok(Datagram::Ip(rest)),
+        Some(DataMessageType::ServerAddrs) => Ok(Datagram::ServerAddrs(rest)),
         None => Err(VpnError::Signaling(format!(
             "Unknown datagram message type: 0x{:02x}",
             type_byte
         ))),
     }
+}
+
+/// Append a server-addresses datagram to `buf` (arena-style) and return the
+/// number of bytes written. Layout: `[type: 0x01] [json(ServerAddrsMsg)]`.
+pub fn encode_server_addrs_datagram(buf: &mut BytesMut, msg: &ServerAddrsMsg) -> VpnResult<usize> {
+    let body = msg.encode()?;
+    let total = 1 + body.len();
+    buf.reserve(total);
+    buf.put_u8(DataMessageType::ServerAddrs.as_byte());
+    buf.put_slice(&body);
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -235,6 +250,7 @@ mod tests {
                 assert!(offload.is_none());
                 assert_eq!(ip, &packet[..]);
             }
+            other => panic!("expected Ip, got {:?}", other),
         }
     }
 
@@ -261,6 +277,7 @@ mod tests {
                 assert_eq!(parsed, Some(offload));
                 assert_eq!(ip, &packet[..]);
             }
+            other => panic!("expected Ip, got {:?}", other),
         }
     }
 
@@ -268,6 +285,26 @@ mod tests {
     fn test_classify_empty_and_unknown() {
         assert!(classify(&[]).is_err());
         assert!(classify(&[0x7f]).is_err());
+    }
+
+    #[test]
+    fn test_server_addrs_datagram_roundtrip() {
+        let msg = ServerAddrsMsg::new(vec![
+            "203.0.113.5".parse().expect("parse v4"),
+            "2001:db8::1".parse().expect("parse v6"),
+        ]);
+        let mut buf = BytesMut::new();
+        let written = encode_server_addrs_datagram(&mut buf, &msg).expect("encode");
+        assert_eq!(written, buf.len());
+        assert_eq!(buf[0], DataMessageType::ServerAddrs.as_byte());
+
+        match classify(&buf).expect("classify") {
+            Datagram::ServerAddrs(body) => {
+                let decoded = ServerAddrsMsg::decode(body).expect("decode body");
+                assert_eq!(decoded, msg);
+            }
+            other => panic!("expected ServerAddrs, got {:?}", other),
+        }
     }
 
     #[test]

@@ -366,14 +366,22 @@ the host route is pinned with `New-NetRoute`.
 
 ### Caveat: the transport endpoint address is pinned off the tunnel
 
-The bypass route is installed **only for the exact address iroh uses to carry
-the tunnel** — the server's underlay address, plus any relay the connection
-falls back to — and **only when that address happens to fall inside one of your
-routed CIDRs**. A common example is the server's AWS public IPv6 when you route a
+The bypass route is installed **only for an address iroh may use to carry the
+tunnel** — the server's underlay addresses, plus any relay the connection falls
+back to — and **only when that address happens to fall inside one of your routed
+CIDRs**. A common example is the server's AWS public IPv6 when you route a
 `2600:1f13:adc::/…` prefix that contains it. `ezvpn` pins a `/32`/`/128` bypass
 host route for that single address so the QUIC tunnel's own underlay packets are
 not fed back into the tunnel (which would deadlock the connection). The bypass is
 installed for the lifetime of the session and is **not** removed mid-session.
+
+The client learns these addresses two ways: from the live iroh connection path,
+and from the **server, which periodically publishes the full set of underlay
+addresses it may be reached on**. The server-published set lets the client pin a
+server address *before* iroh migrates to it — so a server address that overlaps
+your routed range but has not yet been selected for the active path can't
+momentarily self-capture into the tunnel. Only addresses that fall inside a routed
+CIDR are ever pinned, so publishing the full set is harmless.
 
 This affects **only that one transport address — not the rest of the prefix.**
 Other hosts inside the same routed CIDR still route through the VPN normally; only
