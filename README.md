@@ -5,7 +5,7 @@
 `ezvpn` provides full-network tunneling over encrypted QUIC. It creates a TUN interface and routes IP packets directly through an iroh connection, so peers can connect without open inbound ports or public IPs.
 
 > [!IMPORTANT]
-> **Project Goal:** `ezvpn` is built for development and homelab use. It is not intended for production at scale.
+> **Project Goal:** `ezvpn` is built for easy setup as a server-centered access tunnel. It is not meant to join two networks together like WireGuard site-to-site, and it does not provide client-to-client connectivity.
 
 > [!WARNING]
 > **No Backward Compatibility in 0.0.x:** While `ezvpn` remains in the `0.0.x` series, there is no backward compatibility between any versions. Regenerate server keys and refresh configs on every upgrade.
