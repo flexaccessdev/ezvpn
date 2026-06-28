@@ -46,8 +46,10 @@ Use `ezvpn` when you need:
 - A WireGuard/OpenVPN alternative over iroh transport
 
 Do not use it for site-to-site routing between two LANs or for direct
-client-to-client traffic. The only in-VPN peer a client can reach is the server
-VPN gateway.
+client-to-client traffic. Within the VPN address pool, a client can reach only
+the server VPN gateway; packets to other client-assigned VPN IPs are dropped.
+Routes can still forward non-VPN destinations through the server, subject to
+the server host's routing, forwarding/NAT, and firewall rules.
 
 ## Installation
 
@@ -306,8 +308,11 @@ lock file and probes each control socket; stopped clients may briefly show as
 
 ## Routing
 
-The VPN subnet itself is always routed by default. Add extra routes with
-repeatable `--route` and `--route6`.
+The VPN subnet itself is always routed by default. Within that subnet, the
+server VPN gateway is reachable and other client-assigned VPN IPs are dropped.
+Add extra non-VPN destinations with repeatable `--route` and `--route6`; those
+routes are forwarded by the server host according to its routing,
+forwarding/NAT, and firewall configuration.
 
 Split tunnel example:
 
