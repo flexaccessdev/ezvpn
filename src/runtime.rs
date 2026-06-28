@@ -20,9 +20,10 @@
 compile_error!("VPN runtime support is only available on Linux, macOS, and Windows");
 
 use crate::error::{VpnError, VpnResult};
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Directory for runtime files (lock files and control sockets).
 ///
@@ -39,7 +40,8 @@ use std::path::PathBuf;
 /// `%ProgramData%\ezvpn` on Windows (lock files only; control sockets there
 /// are named pipes in a global namespace).
 /// Override with the `EZVPN_RUNTIME_DIR` environment variable (e.g. for
-/// containers, tests, or a rootless deployment).
+/// containers, tests, or a rootless deployment); it must be an absolute path
+/// (validated at startup by [`validate_dir_env`]).
 #[cfg(not(test))]
 pub(crate) fn runtime_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("EZVPN_RUNTIME_DIR")
@@ -97,7 +99,8 @@ fn platform_runtime_dir() -> PathBuf {
 /// `chdir("/")`.
 ///
 /// Defaults: `/var/log/ezvpn` on Linux and macOS, and `%ProgramData%\ezvpn\logs`
-/// on Windows. Override with the `EZVPN_LOG_DIR` environment variable.
+/// on Windows. Override with the `EZVPN_LOG_DIR` environment variable; it must
+/// be an absolute path (validated at startup by [`validate_dir_env`]).
 #[cfg(not(test))]
 pub(crate) fn log_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("EZVPN_LOG_DIR")
@@ -127,6 +130,37 @@ fn platform_log_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
     base.join("ezvpn").join("logs")
+}
+
+/// Names of the directory-override environment variables, checked by
+/// [`validate_dir_env`].
+const DIR_ENV_VARS: [&str; 2] = ["EZVPN_RUNTIME_DIR", "EZVPN_LOG_DIR"];
+
+/// Reject a non-absolute directory override. An unset/empty value is accepted
+/// (the platform default is used instead).
+///
+/// The daemon `chdir("/")`s and every subcommand must resolve the same fixed
+/// location, so a relative override would silently point different invocations
+/// at different directories — fail fast instead.
+fn check_absolute_dir(var: &str, val: Option<&OsStr>) -> VpnResult<()> {
+    if let Some(val) = val.filter(|v| !v.is_empty())
+        && !Path::new(val).is_absolute()
+    {
+        return Err(VpnError::config(format!(
+            "{var} must be an absolute path, got {:?}",
+            Path::new(val).display()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the directory-override environment variables at startup, before any
+/// Tokio runtime or daemonization. Each, if set, must be an absolute path.
+pub(crate) fn validate_dir_env() -> VpnResult<()> {
+    for var in DIR_ENV_VARS {
+        check_absolute_dir(var, std::env::var_os(var).as_deref())?;
+    }
+    Ok(())
 }
 
 /// Create `dir` owner-only (`0700` on Unix) if it does not already exist,
@@ -470,5 +504,28 @@ mod tests {
         // Exactly at the limit is accepted.
         let at_limit = "a".repeat(MAX_INSTANCE_NAME_LEN);
         assert!(validate_instance_name(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn test_check_absolute_dir() {
+        // Unset and empty are accepted (platform default is used).
+        assert!(check_absolute_dir("EZVPN_RUNTIME_DIR", None).is_ok());
+        assert!(check_absolute_dir("EZVPN_RUNTIME_DIR", Some(OsStr::new(""))).is_ok());
+
+        // Absolute paths are accepted.
+        #[cfg(unix)]
+        assert!(check_absolute_dir("EZVPN_LOG_DIR", Some(OsStr::new("/var/log/ezvpn"))).is_ok());
+        #[cfg(windows)]
+        assert!(
+            check_absolute_dir("EZVPN_LOG_DIR", Some(OsStr::new(r"C:\ProgramData\ezvpn"))).is_ok()
+        );
+
+        // Relative paths are rejected.
+        for rel in ["ezvpn", "./ezvpn", "../ezvpn", "a/b"] {
+            assert!(
+                check_absolute_dir("EZVPN_RUNTIME_DIR", Some(OsStr::new(rel))).is_err(),
+                "{rel:?} should be rejected"
+            );
+        }
     }
 }

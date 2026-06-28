@@ -321,6 +321,11 @@ fn client_log_path(instance: &str) -> PathBuf {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Validate directory-override env vars up front, before building any Tokio
+    // runtime or daemonizing: a relative EZVPN_RUNTIME_DIR / EZVPN_LOG_DIR would
+    // resolve differently across subcommands and after the daemon's chdir("/").
+    runtime::validate_dir_env()?;
+
     match args.command {
         // `client start` is the only command that may daemonize. Its whole
         // validation phase runs synchronously here so config/flag/path errors
@@ -675,8 +680,16 @@ fn drain_to_capped_log(mut pipe: std::fs::File, path: &Path, max_bytes: u64) {
             .append(true)
             .open(path)
     };
-    let Ok(mut file) = open_active() else { return };
-    let mut size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    // `None` means the log could not be opened. We still drain the pipe (so the
+    // daemon never blocks on a full pipe) and retry opening on later chunks,
+    // rather than exiting the thread or writing to a stale rotated handle.
+    let (mut file, mut size) = match open_active() {
+        Ok(f) => {
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            (Some(f), len)
+        }
+        Err(_) => (None, 0),
+    };
 
     // Chunks are at most `buf.len()`, so a rotated file never exceeds
     // `max_bytes + buf.len()`.
@@ -689,20 +702,30 @@ fn drain_to_capped_log(mut pipe: std::fs::File, path: &Path, max_bytes: u64) {
             Err(_) => return,
         };
 
-        // Rotate before writing if this chunk would breach the cap. Skip when
-        // the active file is still empty (can't rotate a fresh file usefully).
+        // Recover from an earlier failed open before writing this chunk.
+        if file.is_none()
+            && let Ok(f) = open_active()
+        {
+            size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            file = Some(f);
+        }
+
+        // Rotate before writing if this chunk would breach the cap. On a failed
+        // reopen, fall back to discarding (still draining) and retry next chunk;
+        // never keep writing to the rotated handle.
         if size > 0
             && size + n as u64 > max_bytes
             && std::fs::rename(path, rotated_log_path(path)).is_ok()
-            && let Ok(fresh) = open_active()
         {
-            file = fresh;
+            file = open_active().ok();
             size = 0;
         }
 
-        // Best-effort: on a write error, keep draining so the pipe never fills
-        // and blocks the daemon's logging.
-        if file.write_all(&buf[..n]).is_ok() {
+        // Write if we have a file, else discard. Either way the pipe is drained
+        // (and write errors are ignored) so the daemon's logging never blocks.
+        if let Some(f) = file.as_mut()
+            && f.write_all(&buf[..n]).is_ok()
+        {
             size += n as u64;
         }
     }
@@ -1116,6 +1139,39 @@ mod tests {
         let bound = max_bytes + 16 * 1024;
         assert!(active.len() <= bound, "active {} too big", active.len());
         assert!(backup.len() <= bound, "backup {} too big", backup.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // When the active log can't be opened (here: the path is a directory), the
+    // writer must keep draining the pipe and exit cleanly on EOF rather than
+    // returning early and letting the daemon block on a full pipe.
+    #[test]
+    fn drain_keeps_draining_when_log_unopenable() {
+        let dir = std::env::temp_dir().join(format!("ezvpn-logtest2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory at the log path makes the file open fail.
+        let log_path = dir.join("ezvpn-client-default.log");
+        std::fs::create_dir_all(&log_path).unwrap();
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let mut write_end = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+
+        let reader = {
+            let path = log_path.clone();
+            std::thread::spawn(move || drain_to_capped_log(std::fs::File::from(read_end), &path, 1024))
+        };
+
+        // More than the pipe buffer: if the writer had returned, these writes
+        // would block forever and the join below would hang.
+        let chunk = vec![b'x'; 1024];
+        for _ in 0..256 {
+            write_end.write_all(&chunk).unwrap();
+        }
+        drop(write_end);
+        reader.join().unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
