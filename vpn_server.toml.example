@@ -1,7 +1,7 @@
 # ezvpn server configuration example
 #
-# Usage: ezvpn server run -c vpn_server.toml
-#        ezvpn server run --default-config
+# Usage: ezvpn server start -c vpn_server.toml
+#        ezvpn server start --default-config
 #
 # Server runtime settings are read from this config file. The server CLI only
 # selects the config path (-c or --default-config).

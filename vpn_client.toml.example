@@ -1,7 +1,7 @@
 # ezvpn client configuration example
 #
-# Usage: ezvpn client run -c vpn_client.toml
-#        ezvpn client run --default-config
+# Usage: ezvpn client start -c vpn_client.toml
+#        ezvpn client start --default-config
 #
 # CLI arguments take precedence over config file values.
 #
