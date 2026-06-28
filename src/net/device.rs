@@ -2566,6 +2566,23 @@ pub struct BypassRouteGuard {
     owned: bool,
 }
 
+#[cfg(test)]
+impl BypassRouteGuard {
+    /// Test-only constructor for a **non-owning** guard. `owned` is `false`, so
+    /// `Drop` is a no-op and runs no OS route commands — letting tests pre-seed
+    /// `BypassRouteManager::active_routes` without touching the system.
+    pub(crate) fn test_unowned(peer_ip: IpAddr) -> Self {
+        Self {
+            peer_ip,
+            device: String::new(),
+            gateway: None,
+            gateway_str: None,
+            if_index: None,
+            owned: false,
+        }
+    }
+}
+
 impl Drop for BypassRouteGuard {
     fn drop(&mut self) {
         if !self.owned {

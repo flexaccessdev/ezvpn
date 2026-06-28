@@ -24,6 +24,7 @@ use crate::tunnel::signaling::{
     parse_ip_packet_v2, read_message, write_message,
 };
 use crate::transport::build_quic_transport_config;
+use crate::transport::endpoint::parse_relay_mode;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -57,9 +58,6 @@ const ADVERTISED_GSO: bool = true;
 
 /// Timeout for resolving relay URLs via DNS.
 const RESOLVE_RELAY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Maximum wait for initial bypass route setup before continuing startup.
-const INITIAL_BYPASS_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A decoded inbound packet queued for the dedicated TUN writer task.
 struct InboundTunWrite {
@@ -417,17 +415,16 @@ impl VpnClient {
         // Create TUN device
         let tun_device = self.create_tun_device(&server_info)?;
 
-        // Add bypass routes for the iroh connection BEFORE adding VPN routes.
-        // This ensures the iroh connection (via relay or direct) continues to use
-        // the original network path even if VPN routes would otherwise capture it.
-        // Without this, VPN routes could black-hole the iroh connection traffic.
-        //
-        // This spawns a monitoring task that dynamically updates bypass routes as
-        // the connection paths change (e.g., relay -> direct, new paths discovered).
+        // Bootstrap the iroh relay bypasses BEFORE adding VPN routes: the relay
+        // set is known up front, so the relay fallback path is protected the
+        // moment VPN routes go in, with no blocking wait on path discovery.
+        // This also spawns an event-driven task that adds a bypass for the
+        // server's direct underlay path once iroh selects it; until then traffic
+        // rides the already-bypassed relay, so VPN routes never black-hole iroh.
         let will_add_routes = (server_info.assigned_ip.is_some() && !self.config.routes.is_empty())
             || (server_info.assigned_ip6.is_some() && !self.config.routes6.is_empty());
         let bypass_route_task: Option<JoinHandle<()>> = if will_add_routes {
-            self.add_iroh_bypass_routes(endpoint, &connection, tun_device.name())
+            self.add_iroh_bypass_routes(endpoint, &connection, tun_device.name(), relay_urls)
                 .await
         } else {
             None
@@ -708,72 +705,75 @@ impl VpnClient {
         TunDevice::create(tun_config)
     }
 
-    /// Add bypass routes for iroh connection addresses and spawn a monitoring task.
+    /// Eagerly bypass the iroh relay IPs, then spawn the event-driven manager.
     ///
-    /// Queries the connection paths from the iroh connection and adds bypass routes for:
-    /// - Direct connection addresses (UDP socket addresses)
-    /// - Relay server addresses (resolved from relay URLs)
+    /// The relay set is known up front (configured relay URLs, or the default
+    /// relay map when none are configured), so it needs no path discovery: we
+    /// resolve every relay (IPv4 and IPv6) and install a bypass for each address
+    /// that a VPN route would otherwise capture, *before* the caller installs the
+    /// VPN routes. This guarantees the relay fallback path survives VPN route
+    /// installation. The server's direct underlay path is handled by the spawned
+    /// event-driven task as paths appear; until its bypass lands, traffic simply
+    /// rides the (already-bypassed) relay, so there is no startup race to wait on.
     ///
-    /// This function waits for the initial bypass route setup to complete before
-    /// returning, ensuring VPN routes are not added until bypass routes are in place.
-    /// This prevents the iroh connection from being black-holed by VPN routes.
+    /// The underlay default gateway is captured here, while the routing table is
+    /// still pristine, so a direct path discovered later can be re-pinned via it.
     ///
-    /// Also spawns a background task that monitors path changes and dynamically
-    /// updates bypass routes as the connection evolves
-    /// (e.g., from relay to direct, or when new paths are discovered).
-    ///
-    /// Returns:
-    /// - A task handle for the monitoring task (caller should abort on shutdown)
-    /// - The monitoring task owns all bypass route guards internally
+    /// Returns the monitoring task handle (caller aborts it on shutdown); the
+    /// task owns all bypass route guards and drops them on connection close.
     async fn add_iroh_bypass_routes(
         &self,
         endpoint: &Endpoint,
         connection: &iroh::endpoint::Connection,
         vpn_tun_name: &str,
+        relay_urls: &[String],
     ) -> Option<JoinHandle<()>> {
-        // Clone endpoint and connection for the spawned task. The paths
-        // stream borrows the connection, so the task owns a clone and creates
-        // the stream inside.
-        let endpoint_clone = endpoint.clone();
-        let connection_clone = connection.clone();
-        let vpn_tun_name = vpn_tun_name.to_string();
-        let initial_routes = HashMap::new();
         // Bypass routes are only needed for iroh peer IPs that a VPN route would
         // otherwise capture, so hand the manager the prefixes about to be installed.
         let vpn_routes4 = self.config.routes.clone();
         let vpn_routes6 = self.config.routes6.clone();
 
-        // Create oneshot channel to signal when initial setup is complete
-        let (setup_done_tx, setup_done_rx) = tokio::sync::oneshot::channel();
+        // Capture the underlay default gateway now, while the routing table is
+        // still pristine (the caller installs VPN routes only after this returns).
+        // A direct iroh path discovered later would otherwise resolve through the
+        // tunnel and be impossible to bypass. Only query a family that actually
+        // has VPN routes, since only those can capture an iroh peer IP.
+        let underlay_gw4 = if vpn_routes4.is_empty() {
+            None
+        } else {
+            capture_underlay_gateway(false).await
+        };
+        let underlay_gw6 = if vpn_routes6.is_empty() {
+            None
+        } else {
+            capture_underlay_gateway(true).await
+        };
 
-        // Spawn a task that manages bypass routes dynamically
-        let handle = tokio::spawn(async move {
-            run_bypass_route_manager(
-                endpoint_clone,
-                connection_clone,
-                Some(setup_done_tx),
-                vpn_tun_name,
-                initial_routes,
-                vpn_routes4,
-                vpn_routes6,
-            )
-            .await;
-        });
+        let mut manager = BypassRouteManager::new(
+            vpn_tun_name.to_string(),
+            HashMap::new(),
+            vpn_routes4,
+            vpn_routes6,
+            underlay_gw4,
+            underlay_gw6,
+        );
 
-        // Wait for initial bypass route setup to complete before returning.
-        // This ensures VPN routes are not added until bypass routes are in place.
-        match tokio::time::timeout(INITIAL_BYPASS_SETUP_TIMEOUT, setup_done_rx).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                log::warn!("Bypass route manager task ended before initial setup completed");
-            }
-            Err(_) => {
-                log::warn!(
-                    "Initial bypass setup timed out after {:.1}s, continuing startup",
-                    INITIAL_BYPASS_SETUP_TIMEOUT.as_secs_f64()
-                );
-            }
+        // Eagerly bypass every relay IP (both families) before the caller installs
+        // VPN routes. `update` filters to addresses actually covered by a VPN route.
+        let relay_ips = collect_relay_ips(endpoint, relay_urls).await;
+        if !relay_ips.is_empty() {
+            manager.update(relay_ips).await;
         }
+
+        // Spawn the event-driven manager: it adds bypass routes for the server's
+        // direct underlay path (and any newly selected relay) as iroh path
+        // snapshots arrive. The paths stream borrows the connection, so the task
+        // owns clones and creates the stream inside.
+        let endpoint_clone = endpoint.clone();
+        let connection_clone = connection.clone();
+        let handle = tokio::spawn(async move {
+            run_bypass_route_manager(endpoint_clone, connection_clone, manager).await;
+        });
 
         Some(handle)
     }
@@ -1342,11 +1342,27 @@ impl BypassRouteManager {
 
     /// Update bypass routes based on a new set of required IP addresses.
     ///
-    /// - Adds routes for new addresses first
-    /// - Removes routes for addresses no longer needed only after successful adds
+    /// Add-only: a bypass route, once installed, is kept until the manager is
+    /// dropped on connection close (each guard's `Drop` removes its route). iroh
+    /// flaps an underlay peer in and out of successive path snapshots, so
+    /// removing a route the instant a peer drops from one snapshot caused
+    /// add/remove churn — between cycles the peer was self-captured into the VPN
+    /// tunnel (its address falls within a VPN route prefix), which broke the very
+    /// direct path the bypass exists to protect. A bypass route only pins one
+    /// iroh peer's underlay address (the server's transport address) off the
+    /// tunnel, so keeping a no-longer-listed one for the rest of the session is
+    /// harmless; never tearing it down mid-session is what keeps the path stable.
     ///
-    /// If any new route cannot be added, no removals are performed so existing
-    /// underlay reachability is preserved.
+    /// Scope: `required_ips` only ever contains the addresses iroh uses for
+    /// transport (the server's direct underlay address, plus any relay it falls
+    /// back to — see `collect_addresses_from_paths`), filtered to those covered
+    /// by a VPN route. So a bypass pins *only that one transport endpoint*, never
+    /// other hosts in the routed prefix; the rest of the CIDR still tunnels.
+    ///
+    /// User-visible caveat: the pinned address is reachable only over the
+    /// underlay, not through the VPN, so a resource on that same host must be
+    /// addressed by its VPN-internal IP. Documented in `docs/ARCHITECTURE.md`
+    /// ("Underlay Bypass Routes") and the README "Routing" section.
     async fn update(&mut self, required_ips: HashSet<IpAddr>) {
         // Only bypass iroh peer IPs that a VPN route would otherwise capture.
         // An IP outside every VPN route prefix is already routed correctly by
@@ -1398,23 +1414,10 @@ impl BypassRouteManager {
             }
         }
 
-        // Commit staged additions now that all new routes succeeded.
+        // Commit staged additions now that all new routes succeeded. Routes are
+        // never removed here (see the method doc) — only when the manager drops.
         for (ip, guard) in staged_guards {
             self.active_routes.insert(ip, guard);
-        }
-
-        // Remove routes for addresses no longer in the required set.
-        let to_remove: Vec<IpAddr> = self
-            .active_routes
-            .keys()
-            .filter(|ip| !required_ips.contains(ip))
-            .copied()
-            .collect();
-
-        for ip in to_remove {
-            log::info!("Removing stale bypass route for {}", ip);
-            self.active_routes.remove(&ip);
-            // Guard is dropped here, which removes the route
         }
     }
 
@@ -1450,74 +1453,25 @@ async fn capture_underlay_gateway(is_ipv6: bool) -> Option<UnderlayGateway> {
     }
 }
 
-/// Run the bypass route manager task.
+/// Run the event-driven bypass route manager task.
 ///
-/// Monitors path changes via the connection's paths stream and dynamically
-/// updates bypass routes as the connection evolves.
+/// The caller (`add_iroh_bypass_routes`) has already captured the underlay
+/// gateway and bootstrapped the relay bypasses into `manager`. This task just
+/// monitors the connection's paths stream and adds bypass routes for the
+/// server's direct underlay path (and any newly selected relay) as snapshots
+/// arrive. It is purely event-driven — there is no blocking initial-setup step.
 ///
-/// Returns after initial setup is complete, continuing to monitor in background.
-/// The returned oneshot receiver signals when initial setup is done.
+/// Add-only: routes are kept until this task ends (connection close drops the
+/// manager and all guards). It runs until the paths stream closes.
 async fn run_bypass_route_manager(
     endpoint: Endpoint,
     connection: iroh::endpoint::Connection,
-    initial_setup_done: Option<tokio::sync::oneshot::Sender<()>>,
-    vpn_tun_name: String,
-    initial_routes: HashMap<IpAddr, BypassRouteGuard>,
-    vpn_routes4: Vec<Ipv4Net>,
-    vpn_routes6: Vec<Ipv6Net>,
+    mut manager: BypassRouteManager,
 ) {
-    // Capture the underlay default gateway now, while the routing table is still
-    // pristine (the caller awaits initial setup before installing VPN routes).
-    // A direct iroh path discovered later would otherwise resolve through the
-    // tunnel and be impossible to bypass. Only query a family that actually has
-    // VPN routes, since only those can capture an iroh peer IP.
-    let underlay_gw4 = if vpn_routes4.is_empty() {
-        None
-    } else {
-        capture_underlay_gateway(false).await
-    };
-    let underlay_gw6 = if vpn_routes6.is_empty() {
-        None
-    } else {
-        capture_underlay_gateway(true).await
-    };
-
-    let mut manager = BypassRouteManager::new(
-        vpn_tun_name,
-        initial_routes,
-        vpn_routes4,
-        vpn_routes6,
-        underlay_gw4,
-        underlay_gw6,
-    );
-
     // The stream yields the current snapshot on the first poll, then a fresh
     // snapshot whenever the open or selected paths change; it ends when the
     // connection closes.
     let mut stream = connection.paths_stream();
-
-    // Process path snapshots until we get a usable (non-preserve) one, then
-    // report initial setup complete. A snapshot may legitimately require zero
-    // bypass routes (no iroh peer IP falls within a VPN route prefix), so
-    // completion is keyed on processing a real snapshot, not on having an
-    // active route — otherwise startup would stall until the timeout.
-    loop {
-        let Some(paths) = stream.next().await else {
-            break;
-        };
-        let result = collect_addresses_from_paths(&endpoint, &paths).await;
-        if result.preserve_routes {
-            log::warn!("Initial bypass route update skipped - keeping existing routes");
-            continue;
-        }
-        manager.update(result.ips).await;
-        break;
-    }
-
-    // Signal that initial setup is complete
-    if let Some(tx) = initial_setup_done {
-        let _ = tx.send(());
-    }
 
     while let Some(paths) = stream.next().await {
         log::debug!("Connection paths changed: {:?}", paths);
@@ -1527,7 +1481,6 @@ async fn run_bypass_route_manager(
         // to avoid disconnecting the relay during transient outages
         if result.preserve_routes {
             log::debug!("Bypass route update skipped: no paths yet or DNS resolution failed");
-            log::warn!("Skipping bypass route update - keeping existing routes");
             continue;
         }
 
@@ -1537,6 +1490,38 @@ async fn run_bypass_route_manager(
     log::debug!("Bypass route manager task ending (connection closed)");
     // When this function returns, manager is dropped, which drops all guards
     // and removes all bypass routes
+}
+
+/// Resolve every relay the endpoint may use to its IP addresses, for the eager
+/// startup bypass. The relay set is the configured relay URLs, or — when none
+/// are configured — the default relay map, so the client can bootstrap its own
+/// relay bypasses without waiting on path discovery. Both IPv4 and IPv6
+/// addresses are returned; the caller's `update` keeps only those a VPN route
+/// would capture. Unresolvable relays are skipped — the event-driven loop still
+/// installs a bypass for whichever relay the connection actually selects.
+async fn collect_relay_ips(endpoint: &Endpoint, relay_urls: &[String]) -> HashSet<IpAddr> {
+    let mut ips = HashSet::new();
+    let relay_map = match parse_relay_mode(relay_urls) {
+        Ok(mode) => mode.relay_map(),
+        Err(e) => {
+            log::warn!("Could not determine relay set for eager bypass: {}", e);
+            return ips;
+        }
+    };
+    // Resolve relays concurrently so startup isn't serialized across the whole
+    // (default) relay map.
+    let resolved = futures::future::join_all(relay_map.urls::<Vec<_>>().into_iter().map(|url| async move {
+        let result = resolve_relay_url(endpoint, &url).await;
+        (url, result)
+    }))
+    .await;
+    for (url, result) in resolved {
+        match result {
+            Ok(addrs) => ips.extend(addrs.into_iter().map(|addr| addr.ip())),
+            Err(()) => log::debug!("Eager relay bypass: could not resolve relay {}", url),
+        }
+    }
+    ips
 }
 
 /// Result of collecting addresses from active connection paths.
@@ -1791,6 +1776,46 @@ mod tests {
         let mgr = bypass_manager(&[], &[]);
         assert!(!mgr.ip_covered_by_vpn_routes("172.31.5.6".parse().unwrap()));
         assert!(!mgr.ip_covered_by_vpn_routes("2600:1f13:adc:a001::1".parse().unwrap()));
+    }
+
+    /// Regression: `update` is add-only. A route already in `active_routes` must
+    /// survive successive snapshots that omit it (no churn / premature removal);
+    /// it is only dropped when the manager itself is dropped. Locks in the fix
+    /// for the bypass-route add/remove churn.
+    ///
+    /// Snapshots use addresses *not* covered by the manager's VPN routes so
+    /// `update` performs no real OS route operations (covered IPs are filtered
+    /// before `add_bypass_route`); the retained entry is pre-seeded with a
+    /// non-owning guard so the manager can drop without touching the system.
+    #[tokio::test]
+    async fn test_update_is_add_only_keeps_routes_across_snapshots() {
+        let mut mgr = bypass_manager(&["172.31.0.0/16"], &["2600:1f13:adc:a000::/56"]);
+
+        // An already-installed bypass route (e.g. the server's underlay IPv6).
+        let pinned: IpAddr = "2600:1f13:adc:a0b1::1".parse().unwrap();
+        mgr.active_routes
+            .insert(pinned, BypassRouteGuard::test_unowned(pinned));
+
+        // A snapshot that no longer lists the pinned peer (only uncovered IPs,
+        // which are filtered out -> no real route ops): it must stay.
+        mgr.update(HashSet::from(["44.230.20.120".parse().unwrap()]))
+            .await;
+        assert!(
+            mgr.active_routes.contains_key(&pinned),
+            "pinned route removed when absent from snapshot (churn regression)"
+        );
+
+        // An empty snapshot must also not remove it.
+        mgr.update(HashSet::new()).await;
+        assert!(
+            mgr.active_routes.contains_key(&pinned),
+            "pinned route removed on empty snapshot"
+        );
+
+        // Re-listing it must not duplicate or churn it; still exactly one entry.
+        mgr.update(HashSet::from([pinned])).await;
+        assert_eq!(mgr.active_routes.len(), 1);
+        assert!(mgr.active_routes.contains_key(&pinned));
     }
 
     #[test]

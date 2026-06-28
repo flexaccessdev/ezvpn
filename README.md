@@ -364,6 +364,41 @@ off the tunnel automatically. On Windows the underlay next hop is resolved with
 the in-box `NetTCPIP` PowerShell cmdlets (`Find-NetRoute` / `Get-NetRoute`) and
 the host route is pinned with `New-NetRoute`.
 
+### Caveat: the transport endpoint address is pinned off the tunnel
+
+The bypass route is installed **only for the exact address iroh uses to carry
+the tunnel** — the server's underlay address, plus any relay the connection
+falls back to — and **only when that address happens to fall inside one of your
+routed CIDRs**. A common example is the server's AWS public IPv6 when you route a
+`2600:1f13:adc::/…` prefix that contains it. `ezvpn` pins a `/32`/`/128` bypass
+host route for that single address so the QUIC tunnel's own underlay packets are
+not fed back into the tunnel (which would deadlock the connection). The bypass is
+installed for the lifetime of the session and is **not** removed mid-session.
+
+This affects **only that one transport address — not the rest of the prefix.**
+Other hosts inside the same routed CIDR still route through the VPN normally; only
+the address iroh is actively using as its underlay endpoint is pinned. (In a full
+tunnel, `0.0.0.0/0`/`::/0` covers everything, so the server and relay addresses
+are always pinned — but those are iroh infrastructure, not resources you address
+directly.)
+
+The side effect is that **this one address is reachable only over the underlay,
+not through the VPN**, for as long as the client is connected. If that same host
+also serves resources you want to reach *through* the tunnel, do not address them
+by that public IP — it will skip the VPN.
+
+Instead, **access in-VPN resources by their VPN-internal address** (the
+server/peer's address inside the VPN subnet, e.g. `10.99.0.1` /
+`fd11:9a0b:1095:99::1`). Reserving the public address purely for tunnel transport
+and using VPN IPs for actual traffic avoids the ambiguity entirely.
+
+> Earlier versions tried to *remove* the bypass route whenever iroh dropped that
+> peer from its path set, in an attempt to restore direct access to the public
+> address. Because iroh flaps underlay peers in and out of its path snapshots,
+> this caused the route to churn (repeated add/remove), and between removals the
+> address was self-captured into the tunnel — flaky for both uses. The bypass is
+> now stable for the session; use the VPN IP for in-tunnel access.
+
 ## Protocol, MTU, and GSO
 
 - Wire protocol v3 is required on both peers. Mixed-version pairs do not
