@@ -295,7 +295,10 @@ graph TB
 
 #### ALPN and Protocol Versioning
 
-The current advertised ALPN is `ezvpn/4/<token>`; wire protocol v3 is separate from that ALPN version, and older peers are rejected during QUIC negotiation.
+There are two independent version numbers, checked at two different layers:
+
+- **ALPN/token-format version** — the advertised ALPN is `ezvpn/4/<token>`, where `4` is the ALPN/token-format version and `<token>` is the pre-shared ALPN "knock" token. A peer whose ALPN does not match (wrong version segment or wrong token) is rejected during QUIC ALPN negotiation, before any application streams are opened.
+- **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `3`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation.
 
 ### Client Isolation
 
