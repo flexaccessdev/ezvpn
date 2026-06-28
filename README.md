@@ -346,11 +346,12 @@ sudo ezvpn client start \
 
 Default routes are installed as split half-routes (`0.0.0.0/1` +
 `128.0.0.0/1`, and `::/1` + `8000::/1`) so the system default route is not
-removed. On Linux and macOS, `ezvpn` also installs host-specific bypass routes
-for iroh underlay addresses that would otherwise be captured by VPN routes.
-That automatic bypass is not implemented on Windows yet; on Windows, avoid
-full-tunnel routes unless you add equivalent host routes yourself or know the
-server/relay underlay addresses are not captured.
+removed. On Linux, macOS, and Windows, `ezvpn` also installs host-specific
+bypass routes for iroh underlay addresses that would otherwise be captured by
+VPN routes, so full-tunnel routes keep the underlay path to the server/relay
+off the tunnel automatically. On Windows the underlay next hop is resolved with
+the in-box `NetTCPIP` PowerShell cmdlets (`Find-NetRoute` / `Get-NetRoute`) and
+the host route is pinned with `New-NetRoute`.
 
 ## Protocol, MTU, and GSO
 

@@ -192,6 +192,10 @@ pub(crate) fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
 /// Ensure the log directory exists, creating it owner-only (`0700` on Unix) on
 /// first creation. Returns the directory path. Called when setting up the
 /// daemon log.
+///
+/// Only the Unix daemonization path creates the log dir up front, so this is
+/// Unix-only; elsewhere `log_dir` is resolved without pre-creating it.
+#[cfg(unix)]
 pub(crate) fn ensure_log_dir() -> std::io::Result<PathBuf> {
     ensure_dir(log_dir())
 }
@@ -371,6 +375,10 @@ impl VpnLock {
 ///
 /// Returns `Ok(None)` if no lock file exists (instance never started) or its
 /// contents aren't a valid PID. Used by `client stop` to signal the process.
+///
+/// `client stop` signals via `SIGTERM`, which only exists on Unix, so this
+/// PID-reading helper is Unix-only.
+#[cfg(unix)]
 pub(crate) fn read_instance_pid(role: LockRole, instance: &str) -> std::io::Result<Option<u32>> {
     // Re-validate (like `acquire`) so a separator/traversal name cannot reach
     // `lock_path` through this pub(crate) helper, even if a caller skips the

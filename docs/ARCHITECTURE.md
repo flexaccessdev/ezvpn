@@ -266,7 +266,7 @@ When both `network` and `network6` are configured, each client normally receives
 |----------|------------|---------------------|------------|
 | Linux | `/dev/net/tun` | `ip route add` | CAP_NET_ADMIN or root |
 | macOS | `utunX` | `route add` | root |
-| Windows | `wintun.dll` | `netsh interface route` | Administrator |
+| Windows | `wintun.dll` | `netsh interface route` (VPN routes); `NetTCPIP` PowerShell cmdlets `Find-NetRoute`/`New-NetRoute` (underlay bypass host routes) | Administrator |
 
 ### Security Model
 

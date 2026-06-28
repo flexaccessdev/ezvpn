@@ -64,6 +64,9 @@ pub const QUIC_DATAGRAM_BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 /// so iroh's buffer is only this large when those sysctls are at least this
 /// value. We cannot read the applied size back (iroh owns the socket), so the
 /// startup check warns when the sysctl would clamp it.
+// Only the Linux startup check (`warn_if_socket_buffer_capped`) reads this, since
+// the `net.core.*_max` clamp it guards against is Linux-specific.
+#[cfg(target_os = "linux")]
 pub const IROH_SOCKET_BUFFER_REQUEST: usize = 7 << 20; // 7 MiB
 
 /// Initial QUIC path MTU (UDP payload bytes) before MTU discovery completes.

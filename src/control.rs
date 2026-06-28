@@ -18,7 +18,11 @@
 //! socket, or connection refused) treats the instance as not running.
 
 use crate::error::{VpnError, VpnResult};
-use crate::runtime::{LockRole, runtime_base_name, runtime_dir, validate_instance_name};
+use crate::runtime::{LockRole, runtime_base_name, validate_instance_name};
+// `runtime_dir` only feeds the Unix-domain-socket path; the Windows control path
+// uses named pipes (`pipe_name`), so the import is Unix-only.
+#[cfg(unix)]
+use crate::runtime::runtime_dir;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -710,11 +714,17 @@ fn print_client_text(c: &ClientStatus) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only `unique_instance` (Unix-only) uses these.
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A per-call, filesystem-safe instance name (`[A-Za-z0-9_]`). Including the
     /// PID and a process-local counter keeps lock files and sockets from
     /// colliding with other tests, leftover files, or a concurrent `cargo test`.
+    ///
+    /// Only the Unix-domain-socket roundtrip tests use this, so it is Unix-only
+    /// to avoid an unused-function warning on Windows.
+    #[cfg(unix)]
     fn unique_instance(prefix: &str) -> String {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -801,6 +811,8 @@ mod tests {
         assert!(snap.connection.is_none());
     }
 
+    // Exercises `socket_path`, which only exists on Unix; the Windows control
+    // path addresses instances by named pipe (`pipe_name`) instead.
     #[cfg(unix)]
     #[test]
     fn socket_paths_differ_by_role_and_instance() {
@@ -816,6 +828,9 @@ mod tests {
         );
     }
 
+    // The full listener/query roundtrip is exercised over a Unix domain socket;
+    // the Windows named-pipe control path is not covered here.
+    #[cfg(unix)]
     #[tokio::test]
     async fn listener_serves_a_snapshot_to_a_querier() {
         let instance = unique_instance("listener");
@@ -876,6 +891,10 @@ mod tests {
         );
     }
 
+    // Relies on the live listener/probe roundtrip over the Unix domain socket
+    // (`spawn_status_listener` + the `list_instances` probe); the Windows
+    // named-pipe control path is not covered here.
+    #[cfg(unix)]
     #[tokio::test]
     async fn list_instances_includes_a_running_client() {
         use crate::runtime::VpnLock;
@@ -905,6 +924,9 @@ mod tests {
         drop(_lock);
     }
 
+    // Drives the probe by writing directly to the instance's Unix-domain-socket
+    // file (`socket_path`) to simulate a malformed response; the Windows
+    // named-pipe control path is not covered here.
     #[cfg(unix)]
     #[tokio::test]
     async fn list_instances_distinguishes_probe_error_from_stale_lock() {
