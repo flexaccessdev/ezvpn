@@ -260,7 +260,7 @@ machine-readable output.
 | `--no-auto-reconnect` | Disable reconnect |
 | `--max-reconnect-attempts <N>` | Limit reconnect attempts |
 | `--instance <NAME>` | Instance name for lock and status socket scope; default `default` |
-| `--daemon` | Fork into the background on Unix; logs to `<runtime_dir>/ezvpn-client-<instance>.log` |
+| `--daemon` | Fork into the background on Unix; logs to `<log_dir>/ezvpn-client-<instance>.log` |
 
 With `--daemon`, the client validates its config and paths before forking, so
 startup errors are still reported in the foreground. Stop a daemonized Unix
@@ -297,9 +297,13 @@ Each running instance exposes a local control socket next to its lock file:
 - Unix: Unix domain socket
 - Windows: named pipe
 
-The runtime directory is machine-global: `/run/ezvpn` on Linux,
-`/var/run/ezvpn` on macOS, and `%ProgramData%\ezvpn` on Windows. Override it
-with `EZVPN_RUNTIME_DIR`.
+The runtime directory holds ephemeral state (lock files and control sockets)
+and is machine-global: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
+`%ProgramData%\ezvpn` on Windows. Override it with `EZVPN_RUNTIME_DIR`.
+
+The daemon log is kept separately in the persistent log directory: `/var/log/ezvpn`
+on Linux and macOS, and `%ProgramData%\ezvpn\logs` on Windows. Override it with
+`EZVPN_LOG_DIR`.
 
 Run `status` and `list` as root/Administrator so they resolve the same runtime
 directory as the tunnel process. On Unix, run `stop` the same way. `client list`

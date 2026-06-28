@@ -18,17 +18,20 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-/// Directory for runtime files (lock files, control sockets, the daemon log).
+/// Directory for runtime files (lock files and control sockets).
 ///
 /// A **fixed, machine-global, root-owned** directory per platform — `ezvpn`
 /// runs as root (the tunnel creates a TUN device and edits the routing table),
-/// so a per-host location is both reachable by every subcommand and immune to
-/// the environment differences (`sudo` strips `XDG_RUNTIME_DIR`, systemd sets a
-/// different one) that previously made `status`/`stop` look in the wrong place.
+/// so a per-host location is reachable by every subcommand and resolves to the
+/// same place no matter how the process was started, so `status`/`stop` always
+/// find the running instance.
 ///
-/// Defaults: `/run/ezvpn` on Linux (falling back to `/var/run/ezvpn`),
-/// `/var/run/ezvpn` on macOS, and `%ProgramData%\ezvpn` on Windows (lock
-/// files only; control sockets there are named pipes in a global namespace).
+/// Holds only ephemeral runtime state — `/run` is tmpfs and cleared on reboot.
+/// Persistent files such as the daemon log live in [`log_dir`] instead.
+///
+/// Defaults: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
+/// `%ProgramData%\ezvpn` on Windows (lock files only; control sockets there
+/// are named pipes in a global namespace).
 /// Override with the `EZVPN_RUNTIME_DIR` environment variable (e.g. for
 /// containers, tests, or a rootless deployment).
 #[cfg(not(test))]
@@ -61,13 +64,9 @@ pub(crate) fn runtime_dir() -> PathBuf {
 /// temp dir instead.
 #[cfg(all(not(test), target_os = "linux"))]
 fn platform_runtime_dir() -> PathBuf {
-    // /run is tmpfs on modern systems; /var/run is the legacy location (a
-    // symlink to /run almost everywhere). Prefer whichever base exists.
-    if std::path::Path::new("/run").is_dir() {
-        PathBuf::from("/run/ezvpn")
-    } else {
-        PathBuf::from("/var/run/ezvpn")
-    }
+    // /run is the FHS-canonical runtime location (tmpfs, present on every
+    // modern Linux); /var/run is just a deprecated symlink to it.
+    PathBuf::from("/run/ezvpn")
 }
 
 #[cfg(all(not(test), target_os = "macos"))]
@@ -84,12 +83,49 @@ fn platform_runtime_dir() -> PathBuf {
     base.join("ezvpn")
 }
 
-/// Ensure the runtime directory exists, creating it owner-only (`0700` on Unix)
-/// on first creation. Returns the directory path. Called from write paths (lock
-/// acquisition, daemon log setup); read-only queries (`status`/`list`) do not
-/// create it.
-pub(crate) fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
-    let dir = runtime_dir();
+/// Directory for the daemon log file.
+///
+/// Kept separate from [`runtime_dir`]: logs are persistent diagnostic output
+/// and belong in the system log location, not on the tmpfs runtime dir (which
+/// is cleared on reboot). The path is absolute so it survives the daemon's
+/// `chdir("/")`.
+///
+/// Defaults: `/var/log/ezvpn` on Linux and macOS, and `%ProgramData%\ezvpn\logs`
+/// on Windows. Override with the `EZVPN_LOG_DIR` environment variable.
+#[cfg(not(test))]
+pub(crate) fn log_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("EZVPN_LOG_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    platform_log_dir()
+}
+
+/// Test build: reuse the isolated per-process temp dir so the suite neither
+/// touches a real `/var/log` nor needs root.
+#[cfg(test)]
+pub(crate) fn log_dir() -> PathBuf {
+    runtime_dir()
+}
+
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+fn platform_log_dir() -> PathBuf {
+    PathBuf::from("/var/log/ezvpn")
+}
+
+#[cfg(all(not(test), target_os = "windows"))]
+fn platform_log_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("ezvpn").join("logs")
+}
+
+/// Create `dir` owner-only (`0700` on Unix) if it does not already exist,
+/// returning the path. Backs [`ensure_runtime_dir`] and [`ensure_log_dir`].
+fn ensure_dir(dir: PathBuf) -> std::io::Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -104,6 +140,20 @@ pub(crate) fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
     #[cfg(not(unix))]
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Ensure the runtime directory exists, creating it owner-only (`0700` on Unix)
+/// on first creation. Returns the directory path. Called from write paths (lock
+/// acquisition); read-only queries (`status`/`list`) do not create it.
+pub(crate) fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
+    ensure_dir(runtime_dir())
+}
+
+/// Ensure the log directory exists, creating it owner-only (`0700` on Unix) on
+/// first creation. Returns the directory path. Called when setting up the
+/// daemon log.
+pub(crate) fn ensure_log_dir() -> std::io::Result<PathBuf> {
+    ensure_dir(log_dir())
 }
 
 /// Which single-instance role a lock guards.

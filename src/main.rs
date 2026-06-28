@@ -205,7 +205,7 @@ enum ClientAction {
         instance: String,
 
         /// Run in the background as a daemon (Unix only). Logs are written to
-        /// <runtime_dir>/ezvpn-client-<instance>.log.
+        /// <log_dir>/ezvpn-client-<instance>.log.
         #[arg(long)]
         daemon: bool,
     },
@@ -308,10 +308,10 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
         .map_err(Into::into)
 }
 
-/// Default daemon log-file path for a client instance (absolute; in the runtime
+/// Default daemon log-file path for a client instance (absolute; in the log
 /// dir, so it survives the daemon's `chdir("/")`).
 fn client_log_path(instance: &str) -> PathBuf {
-    lock::runtime_dir().join(format!(
+    lock::log_dir().join(format!(
         "{}.log",
         lock::runtime_base_name(LockRole::Client, instance)
     ))
@@ -556,8 +556,8 @@ fn canonicalize_client_paths(resolved: &mut ResolvedVpnClientConfig) -> Result<(
 /// stdout/stderr to `log_path`; the parent process exits inside `start()`.
 #[cfg(unix)]
 fn daemonize_client(log_path: &Path) -> Result<()> {
-    // The log lives in the runtime dir, which may not exist on first run.
-    lock::ensure_runtime_dir().context("creating runtime directory for daemon log")?;
+    // The log lives in the log dir, which may not exist on first run.
+    lock::ensure_log_dir().context("creating log directory for daemon log")?;
     let out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
