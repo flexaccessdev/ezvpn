@@ -7,12 +7,6 @@ QUIC connections. Clients dial the server by its stable iroh `EndpointId`, so
 they do not need the server's current IP address and the server does not need
 open inbound ports. Relay fallback is used when a direct path is unavailable.
 
-> [!IMPORTANT]
-> `ezvpn` is a server-centered access tunnel. It is not a site-to-site network
-> joiner, and it intentionally does not provide client-to-client connectivity.
-> The server drops client-to-client packets in userspace before they reach the
-> TUN device.
-
 > [!WARNING]
 > While `ezvpn` remains in the `0.0.x` series, there is no backward
 > compatibility between versions. Regenerate server keys and refresh configs on
@@ -45,11 +39,20 @@ Use `ezvpn` when you need:
 - Cross-platform VPN connectivity on Linux, macOS, and Windows
 - A WireGuard/OpenVPN alternative over iroh transport
 
-Do not use it for site-to-site routing between two LANs or for direct
-client-to-client traffic. Within the VPN address pool, a client can reach only
-the server VPN gateway; packets to other client-assigned VPN IPs are dropped.
-Routes can still forward non-VPN destinations through the server, subject to
-the server host's routing, forwarding/NAT, and firewall rules.
+`ezvpn` is a server-centered access tunnel, not a site-to-site network joiner,
+and it intentionally does not provide client-to-client connectivity. Within the
+VPN address pool a client can reach only the server VPN gateway; packets to
+other client-assigned VPN IPs are dropped in userspace before they reach the TUN
+device. Routes can still forward non-VPN destinations through the server,
+subject to the server host's routing, forwarding/NAT, and firewall rules.
+
+Ruling out client-to-client traffic is deliberate: it sidesteps the IP-conflict
+pain point of conventional VPNs, which need sophisticated state management to
+keep each client's assigned address stable so peers can reliably address one
+another. Here every client only ever talks to the server gateway, so assigned
+IPs carry no such guarantee and the whole class of stale-IP and address-collision
+bookkeeping disappears. So do not use `ezvpn` for site-to-site routing between
+two LANs or for direct client-to-client traffic.
 
 ## Installation
 
@@ -260,7 +263,7 @@ machine-readable output.
 | `--no-auto-reconnect` | Disable reconnect |
 | `--max-reconnect-attempts <N>` | Limit reconnect attempts |
 | `--instance <NAME>` | Instance name for lock and status socket scope; default `default` |
-| `--daemon` | Fork into the background on Unix; logs to `<runtime_dir>/ezvpn-client-<instance>.log` |
+| `--daemon` | Fork into the background on Unix; logs to `<log_dir>/ezvpn-client-<instance>.log` |
 
 With `--daemon`, the client validates its config and paths before forking, so
 startup errors are still reported in the foreground. Stop a daemonized Unix
@@ -297,9 +300,16 @@ Each running instance exposes a local control socket next to its lock file:
 - Unix: Unix domain socket
 - Windows: named pipe
 
-The runtime directory is machine-global: `/run/ezvpn` on Linux,
-`/var/run/ezvpn` on macOS, and `%ProgramData%\ezvpn` on Windows. Override it
-with `EZVPN_RUNTIME_DIR`.
+The runtime directory holds ephemeral state (lock files and control sockets)
+and is machine-global: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
+`%ProgramData%\ezvpn` on Windows. Override it with `EZVPN_RUNTIME_DIR`.
+
+The daemon log is kept separately in the persistent log directory: `/var/log/ezvpn`
+on Linux and macOS, and `%ProgramData%\ezvpn\logs` on Windows. Override it with
+`EZVPN_LOG_DIR`. The log is size-capped: at 10 MiB it rotates to a single
+`<name>.log.1` backup (replacing any previous one), so disk use stays bounded at
+roughly 20 MiB per instance. Override the cap (in bytes) with
+`EZVPN_LOG_MAX_BYTES`.
 
 Run `status` and `list` as root/Administrator so they resolve the same runtime
 directory as the tunnel process. On Unix, run `stop` the same way. `client list`

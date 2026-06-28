@@ -7,8 +7,14 @@ and log capture.
 
 For a quick background run without a service manager, `client start --daemon`
 (Unix only) forks into the background and logs to
-`<runtime_dir>/ezvpn-client-<instance>.log`. Stop it with the **same**
-`--instance` it was started with, e.g.:
+`<log_dir>/ezvpn-client-<instance>.log` — the persistent log directory
+(`/var/log/ezvpn` on Linux and macOS), created owner-only on first run and
+overridable with `EZVPN_LOG_DIR`. This log is size-capped: it rotates to a
+single `<name>.log.1` backup at 10 MiB (override the cap in bytes with
+`EZVPN_LOG_MAX_BYTES`), bounding disk use at ~20 MiB per instance. (Under a
+service manager the foreground form is used instead, and the
+service manager handles log capture and rotation — see below.) Stop it with the
+**same** `--instance` it was started with, e.g.:
 
 ```bash
 sudo ezvpn client start --daemon -c /etc/ezvpn/work.toml --instance work
@@ -28,19 +34,21 @@ the fixed `default` instance for `server status` / `server list`.
 
 ## A note on the runtime directory (`status` / `list` / Unix `stop`)
 
-`ezvpn` keeps its per-instance lock file, control socket, and (with
-`--daemon`) log file in a **fixed, machine-global runtime directory**:
-`/run/ezvpn` on Linux (falling back to `/var/run/ezvpn`),
-`/var/run/ezvpn` on macOS, and `%ProgramData%\ezvpn` on Windows. It is
-created (owner-only) on first run.
+`ezvpn` keeps its per-instance lock file and control socket in a **fixed,
+machine-global runtime directory**: `/run/ezvpn` on Linux, `/var/run/ezvpn` on
+macOS, and `%ProgramData%\ezvpn` on Windows. It is created on first run
+(owner-only, `0700`, on Unix). This directory holds only ephemeral state — on
+Linux `/run` is tmpfs and cleared on reboot. (The
+`--daemon` log file is kept separately under the persistent log directory; see
+above. The service-manager setups below run in the foreground and capture logs
+via the service manager, so they don't use it.)
 
-Because the location is fixed and the daemon runs as root, `status` / `list`
-and Unix `stop` resolve the same place no matter how the service was started —
-no `XDG_RUNTIME_DIR` pinning is needed. Run `status` / `list` elevated
-(`sudo` or Administrator), and run Unix `stop` with `sudo`. Set
-`EZVPN_RUNTIME_DIR` only if you need a non-default location (e.g. containers or
-a rootless deployment); if you do, set it identically for the service and for
-the commands you type by hand.
+Because the runtime location is fixed and the daemon runs as root, `status` /
+`list` and Unix `stop` resolve the same place no matter how the service was
+started. Run `status` / `list` elevated (`sudo` or Administrator), and run Unix
+`stop` with `sudo`. Set `EZVPN_RUNTIME_DIR` only if you need a non-default
+location (e.g. containers or a rootless deployment); if you do, set it
+identically for the service and for the commands you type by hand.
 
 ---
 
