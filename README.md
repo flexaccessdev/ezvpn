@@ -63,6 +63,10 @@ curl -sSL https://andrewtheguy.github.io/ezvpn/install.sh | sudo bash
 
 ### Windows
 
+Run from an **elevated** (Administrator) PowerShell — the installer places the
+binary systemwide in `%ProgramData%\ezvpn` (the same location used for config and
+runtime files) and updates the machine `PATH`:
+
 ```powershell
 irm https://andrewtheguy.github.io/ezvpn/install.ps1 | iex
 ```
@@ -72,8 +76,8 @@ Windows also requires `wintun.dll` from the official WireGuard project:
 
 1. Download and extract the WinTun zip.
 2. Copy `wintun/bin/amd64/wintun.dll` to either the same directory as
-   `ezvpn.exe` (default: `%LOCALAPPDATA%\Programs\ezvpn\`) or a directory in
-   your system `PATH`.
+   `ezvpn.exe` (default: `%ProgramData%\ezvpn\`) or a directory in your system
+   `PATH`.
 3. Run `ezvpn.exe` as Administrator.
 
 If you see `Failed to create TUN device: LoadLibraryExW failed`, the DLL is

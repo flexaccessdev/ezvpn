@@ -3,10 +3,12 @@
 # ezvpn installer for Windows
 # Downloads latest binary from: https://github.com/andrewtheguy/ezvpn/releases
 #
-# Usage: .\install.ps1 [RELEASE_TAG] [-Admin] [-PreRelease]
+# Usage: .\install.ps1 [RELEASE_TAG] [-PreRelease] [-DownloadOnly]
 # Or set $env:RELEASE_TAG environment variable
 #
-# Note: VPN mode requires Administrator privileges to run (creates TUN devices)
+# Installs systemwide to %ProgramData%\ezvpn — run from an elevated (Administrator)
+# PowerShell. VPN mode also requires Administrator privileges to run (creates TUN
+# devices).
 # The wintun.dll driver must be downloaded separately from https://www.wintun.net/ (official WireGuard project)
 
 param(
@@ -14,14 +16,12 @@ param(
     [string]$ReleaseTag,
 
     [Parameter()]
-    [switch]$Admin,
-
-    [Parameter()]
     [switch]$PreRelease,
 
     [Parameter()]
     [switch]$DownloadOnly
 )
+# Note: installs systemwide to %ProgramData%\ezvpn; run elevated (Administrator).
 
 $ErrorActionPreference = "Stop"
 
@@ -282,7 +282,11 @@ function Install-Binary {
     $url = "$BaseUrl/$BinaryName"
     $tempDir = Join-Path $env:TEMP "ezvpn-install-$(Get-Random)"
     $tempBinary = Join-Path $tempDir $BinaryName
-    $installDir = Join-Path $env:LOCALAPPDATA "Programs\ezvpn"
+    # Install systemwide, alongside the config and runtime/lock files the binary
+    # reads from %ProgramData%\ezvpn (resolved the same way the app resolves them;
+    # fall back to the C:\ProgramData literal only if the env var is unset).
+    $programData = if ($env:ProgramData) { $env:ProgramData } else { "C:\ProgramData" }
+    $installDir = Join-Path $programData "ezvpn"
     $finalPath = Join-Path $installDir "ezvpn.exe"
 
     try {
@@ -322,22 +326,24 @@ function Install-Binary {
 
         Print-Info "Binary installed successfully to $finalPath"
 
-        # Add to PATH if not already there (case-insensitive exact match)
-        $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+        # Add to the systemwide (Machine) PATH if not already there
+        # (case-insensitive exact match). Machine scope matches the systemwide
+        # install location and requires the elevation this installer enforces.
+        $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
         $normalizedInstallDir = $installDir.TrimEnd('\', '/')
         $currentPaths = @()
-        if ($userPath) {
-            $currentPaths = $userPath -split ';' | ForEach-Object { $_.Trim().TrimEnd('\', '/') } | Where-Object { $_ -ne '' }
+        if ($machinePath) {
+            $currentPaths = $machinePath -split ';' | ForEach-Object { $_.Trim().TrimEnd('\', '/') } | Where-Object { $_ -ne '' }
         }
         $isInPath = $currentPaths -contains $normalizedInstallDir
 
         if (-not $isInPath) {
-            Print-Warn "$installDir is not in your PATH"
-            Print-Warn "Adding to user PATH..."
+            Print-Warn "$installDir is not in the system PATH"
+            Print-Warn "Adding to machine PATH..."
 
             try {
-                $newPath = if ($userPath) { "$userPath;$installDir" } else { $installDir }
-                [System.Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+                $newPath = if ($machinePath) { "$machinePath;$installDir" } else { $installDir }
+                [System.Environment]::SetEnvironmentVariable("Path", $newPath, "Machine")
                 Print-Info "Added to PATH. You may need to restart your terminal for changes to take effect."
             }
             catch {
@@ -346,7 +352,7 @@ function Install-Binary {
             }
         }
         else {
-            Print-Info "$installDir is already in your PATH"
+            Print-Info "$installDir is already in the system PATH"
         }
 
         Print-Warn ""
@@ -375,10 +381,11 @@ Usage: .\install.ps1 [OPTIONS] [RELEASE_TAG]
 
 Download and install ezvpn binary
 
+Installs systemwide to %ProgramData%\ezvpn (run from an elevated PowerShell).
+
 Options:
-  -DownloadOnly  Download binary to current directory without installing
+  -DownloadOnly  Download binary to current directory without installing (no elevation needed)
   -PreRelease    Use latest prerelease instead of latest stable release
-  -Admin         Allow installation with administrator privileges (not recommended)
   -h, --help     Show this help message
 
 Arguments:
@@ -388,17 +395,17 @@ Environment variables:
   `$env:RELEASE_TAG    Alternative way to specify release tag
 
 Examples:
-  .\install.ps1                              # Install latest release
+  .\install.ps1                              # Install latest release (run elevated)
   .\install.ps1 20251210172710               # Install specific release
   .\install.ps1 -PreRelease                  # Install latest prerelease
   .\install.ps1 -DownloadOnly                # Download latest to current directory
   .\install.ps1 -DownloadOnly 20251210172710 # Download specific release
-  .\install.ps1 -Admin                       # Allow admin installation (not recommended)
   `$env:RELEASE_TAG='latest'; .\install.ps1  # Use environment variable
 
 Supported platforms: Windows (amd64)
 
-Note: VPN mode requires Administrator privileges to run (creates TUN devices).
+Note: installs systemwide to %ProgramData%\ezvpn; VPN mode also requires
+Administrator privileges to run (creates TUN devices).
 
 IMPORTANT: You must manually download and install the WinTun driver:
   1. Download wintun.zip from https://www.wintun.net/ (official WireGuard project)
@@ -409,28 +416,20 @@ If you see 'Failed to create TUN device: LoadLibraryExW failed', wintun.dll is m
 "@
 }
 
-# Check if running with administrator privileges
+# Require administrator privileges. A systemwide install writes the binary to
+# %ProgramData%\ezvpn and updates the machine PATH, both of which need elevation
+# — and ezvpn itself must run elevated to manage the TUN device.
 function Test-AdminPrivileges {
-    param([bool]$AllowAdmin)
-
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-    if ($isAdmin) {
-        if (-not $AllowAdmin) {
-            Print-Error "Installation as administrator is not allowed without explicit override."
-            Print-Error "Running as administrator can cause permission issues and is not recommended."
-            Print-Error ""
-            Print-Error "To proceed anyway, run with the -Admin flag:"
-            Print-Error "  .\install.ps1 -Admin"
-            Print-Error ""
-            Print-Error "Recommended: Run this installer as a regular user instead."
-            exit 1
-        }
-        else {
-            Print-Warn "Running as administrator with explicit override (-Admin flag)."
-            Print-Warn "This is not recommended and may cause permission issues."
-        }
+    if (-not $isAdmin) {
+        Print-Error "Administrator privileges are required to install systemwide to %ProgramData%\ezvpn."
+        Print-Error ""
+        Print-Error "Re-run this installer from an elevated (Administrator) PowerShell."
+        Print-Error ""
+        Print-Error "To download the binary without installing (no elevation needed), use -DownloadOnly."
+        exit 1
     }
 }
 
@@ -518,7 +517,7 @@ function Main {
     }
 
     if (-not $DownloadOnly) {
-        Test-AdminPrivileges -AllowAdmin:$Admin
+        Test-AdminPrivileges
     }
 
     Start-Installation -Tag $tag -DownloadOnly:$DownloadOnly
