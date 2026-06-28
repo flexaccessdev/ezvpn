@@ -1342,11 +1342,16 @@ impl BypassRouteManager {
 
     /// Update bypass routes based on a new set of required IP addresses.
     ///
-    /// - Adds routes for new addresses first
-    /// - Removes routes for addresses no longer needed only after successful adds
-    ///
-    /// If any new route cannot be added, no removals are performed so existing
-    /// underlay reachability is preserved.
+    /// Add-only: a bypass route, once installed, is kept until the manager is
+    /// dropped on connection close (each guard's `Drop` removes its route). iroh
+    /// flaps an underlay peer in and out of successive path snapshots, so
+    /// removing a route the instant a peer drops from one snapshot caused
+    /// add/remove churn — between cycles the peer was self-captured into the VPN
+    /// tunnel (its address falls within a VPN route prefix), which broke the very
+    /// direct path the bypass exists to protect. A bypass route only pins one
+    /// iroh peer's underlay address (the server's transport address) off the
+    /// tunnel, so keeping a no-longer-listed one for the rest of the session is
+    /// harmless; never tearing it down mid-session is what keeps the path stable.
     async fn update(&mut self, required_ips: HashSet<IpAddr>) {
         // Only bypass iroh peer IPs that a VPN route would otherwise capture.
         // An IP outside every VPN route prefix is already routed correctly by
@@ -1398,23 +1403,10 @@ impl BypassRouteManager {
             }
         }
 
-        // Commit staged additions now that all new routes succeeded.
+        // Commit staged additions now that all new routes succeeded. Routes are
+        // never removed here (see the method doc) — only when the manager drops.
         for (ip, guard) in staged_guards {
             self.active_routes.insert(ip, guard);
-        }
-
-        // Remove routes for addresses no longer in the required set.
-        let to_remove: Vec<IpAddr> = self
-            .active_routes
-            .keys()
-            .filter(|ip| !required_ips.contains(ip))
-            .copied()
-            .collect();
-
-        for ip in to_remove {
-            log::info!("Removing stale bypass route for {}", ip);
-            self.active_routes.remove(&ip);
-            // Guard is dropped here, which removes the route
         }
     }
 
