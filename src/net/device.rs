@@ -767,12 +767,10 @@ impl TunWriter {
 /// - Linux iproute2: "RTNETLINK answers: File exists"
 /// - macOS route: "route: writing to routing socket: File exists"
 /// - Windows netsh: "The object already exists" or "Element already exists"
+/// - Windows PowerShell (New-NetRoute): "...already exists"
 fn is_already_exists_error(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
-    lower.contains("file exists")
-        || lower.contains("eexist")
-        || lower.contains("object already exists")
-        || lower.contains("element already exists")
+    lower.contains("file exists") || lower.contains("eexist") || lower.contains("already exists")
 }
 
 // ============================================================================
@@ -1720,6 +1718,9 @@ struct BypassRouteInfo {
     /// Raw gateway string with scope ID preserved (e.g., "fe80::1%en0").
     /// Used on macOS where link-local addresses need the scope.
     gateway_str: Option<String>,
+    /// Interface index of the resolving interface. Set on Windows (used to pin
+    /// the host route via `New-NetRoute -InterfaceIndex`); `None` elsewhere.
+    if_index: Option<u32>,
 }
 
 /// The system's default-route next hop for one address family, captured while
@@ -1739,6 +1740,9 @@ pub struct UnderlayGateway {
     gateway: Option<IpAddr>,
     /// Raw gateway string with scope ID preserved (e.g. `fe80::1%en0`).
     gateway_str: Option<String>,
+    /// Interface index of the default-route interface. Set on Windows; `None`
+    /// elsewhere.
+    if_index: Option<u32>,
 }
 
 /// Query the system's default-route gateway for one address family.
@@ -1775,6 +1779,7 @@ pub async fn query_default_gateway(is_ipv6: bool) -> VpnResult<UnderlayGateway> 
         device: info.device,
         gateway: info.gateway,
         gateway_str: info.gateway_str,
+        if_index: None,
     })
 }
 
@@ -1805,15 +1810,61 @@ pub async fn query_default_gateway(is_ipv6: bool) -> VpnResult<UnderlayGateway> 
         device: info.device,
         gateway: info.gateway,
         gateway_str: info.gateway_str,
+        if_index: None,
     })
 }
 
-/// Query the system's default-route gateway (Windows stub).
+/// Query the system's default-route gateway for one address family (Windows).
+///
+/// Picks the active default route (`0.0.0.0/0` / `::/0`) with the lowest
+/// *effective* metric (route metric + interface metric), matching the kernel's
+/// route selection.
 #[cfg(target_os = "windows")]
-pub async fn query_default_gateway(_is_ipv6: bool) -> VpnResult<UnderlayGateway> {
-    Err(VpnError::tun_device(
-        "Default gateway query not yet implemented on Windows",
-    ))
+pub async fn query_default_gateway(is_ipv6: bool) -> VpnResult<UnderlayGateway> {
+    let (family, prefix) = if is_ipv6 {
+        ("IPv6", "::/0")
+    } else {
+        ("IPv4", "0.0.0.0/0")
+    };
+
+    let script = format!(
+        concat!(
+            "$ErrorActionPreference='Stop'; ",
+            "$r = Get-NetRoute -DestinationPrefix '{prefix}' -AddressFamily {family} ",
+            "-PolicyStore ActiveStore | Select-Object InterfaceIndex,InterfaceAlias,NextHop,",
+            "@{{n='Eff';e={{ $_.RouteMetric + ((Get-NetIPInterface -InterfaceIndex ",
+            "$_.InterfaceIndex -AddressFamily {family} -PolicyStore ActiveStore).InterfaceMetric ",
+            "| Select-Object -First 1) }}}} | Sort-Object Eff | Select-Object -First 1; ",
+            "if ($null -eq $r) {{ throw 'no default route' }}; ",
+            "($r.InterfaceIndex,$r.NextHop,$r.InterfaceAlias) -join [char]9"
+        ),
+        prefix = prefix,
+        family = family
+    );
+
+    let output = run_powershell(&script).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(VpnError::tun_device(format!(
+            "Failed to query default route: {}",
+            detail
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_windows_route_line(&stdout)?;
+    Ok(UnderlayGateway {
+        device: parsed.alias,
+        gateway: parsed.next_hop,
+        gateway_str: parsed.next_hop.map(|g| g.to_string()),
+        if_index: Some(parsed.if_index),
+    })
 }
 
 /// Query the system's default-route gateway (unsupported platforms).
@@ -1957,6 +2008,7 @@ fn parse_linux_route_get(output: &str, peer_ip: IpAddr) -> VpnResult<BypassRoute
         device,
         gateway,
         gateway_str,
+        if_index: None,
     })
 }
 
@@ -2038,16 +2090,167 @@ fn parse_macos_route_get(output: &str, peer_ip: IpAddr) -> VpnResult<BypassRoute
         device,
         gateway,
         gateway_str,
+        if_index: None,
     })
 }
 
-/// Query the current route for a given IP address (Windows stub).
+// ============================================================================
+// Windows route detection / host-route management (PowerShell NetTCPIP)
+// ============================================================================
+//
+// Windows has no direct `route get <ip>` equivalent, so we drive the in-box
+// `NetTCPIP` PowerShell cmdlets (present on every Windows 8+/Server 2012+, run
+// here via the always-present Windows PowerShell 5.1, resolved by absolute
+// `System32` path rather than `PATH` so a shadowing PowerShell 7 install never
+// shadows it — see `windows_powershell_path`):
+//
+// - `Find-NetRoute -RemoteIPAddress <ip>` runs the kernel's route selection
+//   (longest-prefix + source selection) and returns the chosen `NextHop` and
+//   `InterfaceIndex` for an arbitrary destination — exactly the per-IP lookup
+//   `query_route_for_ip` needs.
+// - `Get-NetRoute -DestinationPrefix 0.0.0.0/0` (or `::/0`), sorted by effective
+//   metric (route metric + interface metric), gives the default-route next hop
+//   captured by `query_default_gateway` before VPN routes are installed.
+// - `New-NetRoute` / `Remove-NetRoute` with `-PolicyStore ActiveStore` add and
+//   remove the per-IP `/32`(`/128`) host route (non-persistent, matching the
+//   `store=active` semantics used by the netsh routes elsewhere).
+//
+// Queries are read-only and need no elevation; only add/remove require the
+// elevation the app already holds to manage the TUN. Scripts are kept free of
+// double quotes and backticks (output uses `-join [char]9`) so they pass cleanly
+// through `Command` as a single argument without Windows quote-escaping hazards.
+// All interpolated values are `IpAddr`/`u32`/static literals, so the
+// single-quoted PowerShell strings cannot be broken out of.
+
+/// Absolute path to the in-box Windows PowerShell 5.1 executable.
+///
+/// Resolving by bare name (`powershell`) goes through `PATH`, which on many
+/// machines is shadowed by PowerShell 7 (`pwsh.exe` symlinked/copied as
+/// `powershell.exe`), a Microsoft Store alias, or another shim. The NetTCPIP
+/// scripts here are written for, and verified against, the always-present
+/// Windows PowerShell 5.1, so we pin to its fixed location under the real
+/// `System32` directory.
+///
+/// `System32` is resolved via the Known Folders API
+/// (`SHGetKnownFolderPath(FOLDERID_System)`) — the same authoritative source
+/// used for `%ProgramData%` — which follows the real install drive and cannot
+/// be redirected by a spoofed `%SystemRoot%`. The `%SystemRoot%` env var, then
+/// the `C:\Windows` literal, are last-ditch fallbacks only reached if that call
+/// fails. The returned path is the native-bitness `System32`; a 64-bit process
+/// reaches `powershell.exe` directly and a 32-bit process is filesystem-
+/// redirected to the matching `SysWOW64` copy, both of which ship NetTCPIP.
 #[cfg(target_os = "windows")]
-async fn query_route_for_ip(_ip: IpAddr) -> VpnResult<BypassRouteInfo> {
-    // Windows route querying is more complex; for now return an error
-    Err(VpnError::tun_device(
-        "Bypass route detection not yet implemented on Windows",
-    ))
+fn windows_powershell_path() -> std::path::PathBuf {
+    let system32 = known_folders::get_known_folder_path(known_folders::KnownFolder::System)
+        .unwrap_or_else(|| {
+            let system_root =
+                std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+            std::path::Path::new(&system_root).join("System32")
+        });
+    system32.join(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// Run a PowerShell script via the in-box `powershell.exe` (async).
+#[cfg(target_os = "windows")]
+async fn run_powershell(script: &str) -> VpnResult<std::process::Output> {
+    Command::new(windows_powershell_path())
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .await
+        .map_err(|e| VpnError::tun_device_with_source("Failed to execute PowerShell", e))
+}
+
+/// Run a PowerShell script via the in-box `powershell.exe` (blocking, for Drop).
+#[cfg(target_os = "windows")]
+fn run_powershell_sync(script: &str) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(windows_powershell_path())
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+}
+
+/// Parse a next-hop string from PowerShell, mapping the unspecified address
+/// (`0.0.0.0` / `::`, emitted for on-link routes) to `None` so callers treat it
+/// as "no gateway" and refuse the link-scope host route.
+#[cfg(target_os = "windows")]
+fn parse_windows_next_hop(s: &str) -> Option<IpAddr> {
+    let ip: IpAddr = s.parse().ok()?;
+    if ip.is_unspecified() { None } else { Some(ip) }
+}
+
+/// Parsed `<InterfaceIndex>\t<NextHop>\t<InterfaceAlias>` route line.
+#[cfg(target_os = "windows")]
+struct WindowsRouteLine {
+    if_index: u32,
+    next_hop: Option<IpAddr>,
+    alias: String,
+}
+
+/// Parse the single tab-delimited line emitted by the route-query scripts.
+#[cfg(target_os = "windows")]
+fn parse_windows_route_line(stdout: &str) -> VpnResult<WindowsRouteLine> {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| VpnError::tun_device("PowerShell route query returned no output"))?;
+
+    let mut parts = line.splitn(3, '\t');
+    let idx_str = parts.next().unwrap_or("").trim();
+    let next_hop_str = parts.next().unwrap_or("").trim();
+    let alias = parts.next().unwrap_or("").trim().to_string();
+
+    let if_index: u32 = idx_str.parse().map_err(|_| {
+        VpnError::tun_device(format!(
+            "Unexpected interface index in route query output: {:?}",
+            idx_str
+        ))
+    })?;
+
+    Ok(WindowsRouteLine {
+        if_index,
+        next_hop: parse_windows_next_hop(next_hop_str),
+        alias,
+    })
+}
+
+/// Query the current route for a given IP address (Windows).
+#[cfg(target_os = "windows")]
+async fn query_route_for_ip(ip: IpAddr) -> VpnResult<BypassRouteInfo> {
+    let script = format!(
+        concat!(
+            "$ErrorActionPreference='Stop'; ",
+            "$r = Find-NetRoute -RemoteIPAddress '{ip}' ",
+            "| Where-Object {{ $null -ne $_.NextHop }} | Select-Object -First 1; ",
+            "if ($null -eq $r) {{ throw 'no route found for {ip}' }}; ",
+            "($r.InterfaceIndex,$r.NextHop,$r.InterfaceAlias) -join [char]9"
+        ),
+        ip = ip
+    );
+
+    let output = run_powershell(&script).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(VpnError::tun_device(format!(
+            "Failed to query route for {}: {}",
+            ip, detail
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_windows_route_line(&stdout)?;
+    Ok(BypassRouteInfo {
+        peer_ip: ip,
+        device: parsed.alias,
+        gateway: parsed.next_hop,
+        gateway_str: parsed.next_hop.map(|g| g.to_string()),
+        if_index: Some(parsed.if_index),
+    })
 }
 
 /// Query the current route for a given IP address (unsupported platforms).
@@ -2108,6 +2311,7 @@ pub async fn add_bypass_route(
                     device: fb.device.clone(),
                     gateway: fb.gateway,
                     gateway_str: fb.gateway_str.clone(),
+                    if_index: fb.if_index,
                 };
             }
             _ => {
@@ -2148,6 +2352,7 @@ pub async fn add_bypass_route(
         device: route_info.device,
         gateway: route_info.gateway,
         gateway_str: route_info.gateway_str,
+        if_index: route_info.if_index,
         // Only remove the route on drop if this process actually created it; a
         // pre-existing route belongs to the system and must be left intact.
         owned: outcome == RouteAddOutcome::Added,
@@ -2270,12 +2475,71 @@ async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutc
     )))
 }
 
-/// Implementation of adding a bypass route (Windows stub).
+/// Implementation of adding a bypass route (Windows).
 #[cfg(target_os = "windows")]
-async fn add_bypass_route_impl(_info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
-    Err(VpnError::tun_device(
-        "Bypass route not yet implemented on Windows",
-    ))
+async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
+    let prefix = if info.peer_ip.is_ipv4() { 32 } else { 128 };
+
+    // `add_bypass_route` guarantees a gateway is present; refuse the link-scope
+    // form, which would black-hole a remote underlay address.
+    let Some(gw) = info.gateway else {
+        return Err(VpnError::tun_device(format!(
+            "Refusing link-scope bypass route for {} (no gateway)",
+            info.peer_ip
+        )));
+    };
+    let Some(if_index) = info.if_index else {
+        return Err(VpnError::tun_device(format!(
+            "Refusing bypass route for {} (no interface index resolved)",
+            info.peer_ip
+        )));
+    };
+
+    let script = format!(
+        concat!(
+            "$ErrorActionPreference='Stop'; ",
+            "New-NetRoute -DestinationPrefix '{ip}/{prefix}' -InterfaceIndex {idx} ",
+            "-NextHop '{gw}' -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"
+        ),
+        ip = info.peer_ip,
+        prefix = prefix,
+        idx = if_index,
+        gw = gw
+    );
+
+    let output = run_powershell(&script).await?;
+    if output.status.success() {
+        log::info!(
+            "Added bypass route {}/{} via if {} gw {}",
+            info.peer_ip,
+            prefix,
+            if_index,
+            gw
+        );
+        return Ok(RouteAddOutcome::Added);
+    }
+
+    // PowerShell errors land on stderr; check both for the idempotent case.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if is_already_exists_error(&stderr) || is_already_exists_error(&stdout) {
+        log::warn!(
+            "Bypass route {}/{} already exists (treating as success)",
+            info.peer_ip,
+            prefix
+        );
+        return Ok(RouteAddOutcome::AlreadyExisted);
+    }
+
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        stderr.trim().to_string()
+    };
+    Err(VpnError::tun_device(format!(
+        "Failed to add bypass route {}/{}: {}",
+        info.peer_ip, prefix, detail
+    )))
 }
 
 /// Implementation of adding a bypass route (unsupported platforms).
@@ -2293,6 +2557,10 @@ pub struct BypassRouteGuard {
     gateway: Option<IpAddr>,
     /// Raw gateway string with scope ID preserved (e.g., "fe80::1%en0").
     gateway_str: Option<String>,
+    /// Interface index of the resolving interface. Set on Windows (used to
+    /// target `Remove-NetRoute -InterfaceIndex`); `None` elsewhere.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    if_index: Option<u32>,
     /// True only when this process added the route, so dropping must remove it.
     /// A pre-existing route is left untouched on drop.
     owned: bool,
@@ -2313,6 +2581,7 @@ impl Drop for BypassRouteGuard {
             &self.device,
             self.gateway,
             self.gateway_str.as_deref(),
+            self.if_index,
         );
     }
 }
@@ -2324,6 +2593,7 @@ fn remove_bypass_route_sync(
     device: &str,
     gateway: Option<IpAddr>,
     _gateway_str: Option<&str>,
+    _if_index: Option<u32>,
 ) {
     let host_route = if peer_ip.is_ipv4() {
         format!("{}/32", peer_ip)
@@ -2368,6 +2638,7 @@ fn remove_bypass_route_sync(
     _device: &str,
     _gateway: Option<IpAddr>,
     gateway_str: Option<&str>,
+    _if_index: Option<u32>,
 ) {
     let mut args: Vec<String> = vec!["delete".to_string()];
 
@@ -2402,20 +2673,60 @@ fn remove_bypass_route_sync(
     }
 }
 
-/// Remove a bypass route (Windows stub, blocking).
+/// Remove a bypass route (Windows, blocking).
 #[cfg(target_os = "windows")]
 fn remove_bypass_route_sync(
     peer_ip: IpAddr,
-    device: &str,
+    _device: &str,
     gateway: Option<IpAddr>,
     _gateway_str: Option<&str>,
+    if_index: Option<u32>,
 ) {
-    log::debug!(
-        "Bypass route removal not implemented on Windows (peer: {}, device: {}, gateway: {:?})",
-        peer_ip,
-        device,
-        gateway
+    let prefix = if peer_ip.is_ipv4() { 32 } else { 128 };
+
+    let Some(if_index) = if_index else {
+        log::warn!(
+            "Cannot remove bypass route for {}/{} (no interface index recorded)",
+            peer_ip,
+            prefix
+        );
+        return;
+    };
+
+    // Include the next hop when known so we target the exact route we added.
+    let mut script = format!(
+        "$ErrorActionPreference='Stop'; \
+         Remove-NetRoute -DestinationPrefix '{}/{}' -InterfaceIndex {}",
+        peer_ip, prefix, if_index
     );
+    if let Some(gw) = gateway {
+        script.push_str(&format!(" -NextHop '{}'", gw));
+    }
+    script.push_str(" -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop | Out-Null");
+
+    match run_powershell_sync(&script) {
+        Ok(output) if output.status.success() => {
+            log::info!("Removed bypass route {}/{}", peer_ip, prefix);
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                stderr.trim().to_string()
+            };
+            log::warn!(
+                "Failed to remove bypass route {}/{}: {}",
+                peer_ip,
+                prefix,
+                detail
+            );
+        }
+        Err(e) => {
+            log::warn!("Failed to execute PowerShell route delete: {}", e);
+        }
+    }
 }
 
 /// Remove a bypass route (unsupported platforms, blocking).
@@ -2425,6 +2736,7 @@ fn remove_bypass_route_sync(
     _device: &str,
     _gateway: Option<IpAddr>,
     _gateway_str: Option<&str>,
+    _if_index: Option<u32>,
 ) {
     // Not implemented
 }

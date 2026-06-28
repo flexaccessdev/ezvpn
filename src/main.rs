@@ -108,13 +108,16 @@ enum ServerAction {
     /// Start the VPN server (accepts connections and assigns IPs).
     ///
     /// Requires a config file. Use -c to specify a path or --default-config for
-    /// ~/.config/ezvpn/vpn_server.toml. See vpn_server.toml.example for format.
+    /// vpn_server.toml in the system config dir (/etc/ezvpn on Linux,
+    /// /usr/local/etc/ezvpn on macOS, %ProgramData%\ezvpn on Windows). See
+    /// vpn_server.toml.example for format.
     Start {
         /// Config file path (required unless --default-config is used)
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
 
-        /// Use default config path (~/.config/ezvpn/vpn_server.toml)
+        /// Use vpn_server.toml in the system config dir (/etc/ezvpn,
+        /// /usr/local/etc/ezvpn on macOS, %ProgramData%\ezvpn on Windows)
         #[arg(long)]
         default_config: bool,
     },
@@ -142,7 +145,8 @@ enum ClientAction {
         #[arg(short = 'c', long)]
         config: Option<PathBuf>,
 
-        /// Use default config path (~/.config/ezvpn/vpn_client.toml)
+        /// Use vpn_client.toml in the system config dir (/etc/ezvpn,
+        /// /usr/local/etc/ezvpn on macOS, %ProgramData%\ezvpn on Windows)
         #[arg(long)]
         default_config: bool,
 
@@ -435,7 +439,9 @@ async fn run_async(command: Command) -> Result<()> {
             if config.is_none() && !default_config {
                 anyhow::bail!(
                     "VPN server requires a config file.\n\
-                     Use -c <FILE> or --default-config (~/.config/ezvpn/vpn_server.toml)\n\
+                     Use -c <FILE> or --default-config (vpn_server.toml in the system \
+                     config dir: /etc/ezvpn, /usr/local/etc/ezvpn on macOS, \
+                     %ProgramData%\\ezvpn on Windows)\n\
                      See vpn_server.toml.example for format."
                 );
             }

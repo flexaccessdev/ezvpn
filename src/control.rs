@@ -18,7 +18,11 @@
 //! socket, or connection refused) treats the instance as not running.
 
 use crate::error::{VpnError, VpnResult};
-use crate::runtime::{LockRole, runtime_base_name, runtime_dir, validate_instance_name};
+use crate::runtime::{LockRole, runtime_base_name, validate_instance_name};
+// `runtime_dir` only feeds the Unix-domain-socket path; the Windows control path
+// uses named pipes (`pipe_name`), so the import is Unix-only.
+#[cfg(unix)]
+use crate::runtime::runtime_dir;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -386,19 +390,42 @@ where
     {
         use tokio::net::windows::named_pipe::ServerOptions;
         let name = pipe_name(role, instance);
+
+        // Create the first instance synchronously, before returning the guard, so
+        // the pipe exists the moment the caller can observe the listener. If we
+        // deferred this to the spawned task, a client that connected in the gap
+        // before the task ran would see the pipe missing and treat the instance
+        // as not running. `first_pipe_instance(true)` also rejects a name already
+        // owned by another process (the instance lock makes us the sole owner).
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .map_err(|e| VpnError::config_with_source("Failed to create control pipe", e))?;
         log::debug!("Status control pipe listening: {name}");
 
         let task = tokio::spawn(async move {
             loop {
-                let mut server = match ServerOptions::new().create(&name) {
-                    Ok(s) => s,
+                // Wait for a client to connect to the current instance.
+                if let Err(e) = server.connect().await {
+                    log::warn!("Status control pipe connect failed: {e}");
+                    break;
+                }
+                let mut connected = server;
+
+                // Create the next instance before serving so a new client can
+                // connect while this one is served (and so the pipe never briefly
+                // disappears between connections).
+                match ServerOptions::new().create(&name) {
+                    Ok(next) => {
+                        server = next;
+                        serve_one(&mut connected, provider.as_ref()).await;
+                    }
                     Err(e) => {
+                        // Serve the client we already accepted, then stop.
+                        serve_one(&mut connected, provider.as_ref()).await;
                         log::warn!("Status control pipe create failed: {e}");
                         break;
                     }
-                };
-                if server.connect().await.is_ok() {
-                    serve_one(&mut server, provider.as_ref()).await;
                 }
             }
         });
@@ -801,6 +828,8 @@ mod tests {
         assert!(snap.connection.is_none());
     }
 
+    // Exercises `socket_path`, which only exists on Unix; the Windows control
+    // path addresses instances by named pipe (`pipe_name`) instead.
     #[cfg(unix)]
     #[test]
     fn socket_paths_differ_by_role_and_instance() {
@@ -816,6 +845,32 @@ mod tests {
         );
     }
 
+    // Windows counterpart to `socket_paths_differ_by_role_and_instance`: the
+    // named-pipe name must be unique per (role, instance).
+    #[cfg(windows)]
+    #[test]
+    fn pipe_names_differ_by_role_and_instance() {
+        // Different roles, same instance: distinct pipes.
+        assert_ne!(
+            pipe_name(LockRole::Server, "default"),
+            pipe_name(LockRole::Client, "default")
+        );
+        // Same role, different instances: distinct pipes.
+        assert_ne!(
+            pipe_name(LockRole::Client, "alpha"),
+            pipe_name(LockRole::Client, "beta")
+        );
+    }
+
+    // Unix-only because of the final assertion: dropping the guard must make the
+    // instance immediately unreachable. On Unix that is synchronous (the guard
+    // removes the socket file in `Drop`), so the next query connects to nothing
+    // and returns `None`. On Windows, teardown aborts the listener task
+    // asynchronously, so an immediate query can still connect to the not-yet-
+    // closed pipe instance and then block until the read timeout. The live
+    // create/connect/serve/read pipe roundtrip is covered on Windows by
+    // `list_instances_includes_a_running_client`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn listener_serves_a_snapshot_to_a_querier() {
         let instance = unique_instance("listener");
@@ -876,6 +931,8 @@ mod tests {
         );
     }
 
+    // Drives the live listener/probe roundtrip (`spawn_status_listener` + the
+    // `list_instances` probe) on both transports (Unix socket / Windows pipe).
     #[tokio::test]
     async fn list_instances_includes_a_running_client() {
         use crate::runtime::VpnLock;
@@ -905,6 +962,9 @@ mod tests {
         drop(_lock);
     }
 
+    // Drives the probe by writing directly to the instance's Unix-domain-socket
+    // file (`socket_path`) to simulate a malformed response; the Windows
+    // named-pipe control path is not covered here.
     #[cfg(unix)]
     #[tokio::test]
     async fn list_instances_distinguishes_probe_error_from_stale_lock() {

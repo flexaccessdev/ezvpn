@@ -435,30 +435,21 @@ fn load_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
         .with_context(|| format!("Failed to parse config file: {}", path.display()))
 }
 
-fn default_vpn_server_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| {
-        home.join(".config")
-            .join("ezvpn")
-            .join("vpn_server.toml")
-    })
+/// Default config path: the machine-global system config directory (see
+/// [`crate::runtime::config_dir`]), not a per-user home directory — `ezvpn` runs
+/// as root/LocalSystem.
+fn default_vpn_server_config_path() -> PathBuf {
+    crate::runtime::config_dir().join("vpn_server.toml")
 }
 
-fn default_vpn_client_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| {
-        home.join(".config")
-            .join("ezvpn")
-            .join("vpn_client.toml")
-    })
+fn default_vpn_client_config_path() -> PathBuf {
+    crate::runtime::config_dir().join("vpn_client.toml")
 }
 
 pub fn load_vpn_server_config(path: Option<&Path>) -> Result<VpnServerConfig> {
     let config_path = match path {
         Some(p) => expand_tilde(p),
-        None => default_vpn_server_config_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not resolve default config path. Use -c to specify a config file."
-            )
-        })?,
+        None => default_vpn_server_config_path(),
     };
     load_config(&config_path)
 }
@@ -466,11 +457,7 @@ pub fn load_vpn_server_config(path: Option<&Path>) -> Result<VpnServerConfig> {
 pub fn load_vpn_client_config(path: Option<&Path>) -> Result<VpnClientConfig> {
     let config_path = match path {
         Some(p) => expand_tilde(p),
-        None => default_vpn_client_config_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not resolve default config path. Use -c to specify a config file."
-            )
-        })?,
+        None => default_vpn_client_config_path(),
     };
     load_config(&config_path)
 }

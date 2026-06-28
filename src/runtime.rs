@@ -84,11 +84,7 @@ fn platform_runtime_dir() -> PathBuf {
 
 #[cfg(all(not(test), target_os = "windows"))]
 fn platform_runtime_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramData")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("ezvpn")
+    program_data_dir().join("ezvpn")
 }
 
 /// Directory for the daemon log file.
@@ -125,11 +121,66 @@ fn platform_log_dir() -> PathBuf {
 
 #[cfg(all(not(test), target_os = "windows"))]
 fn platform_log_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramData")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("ezvpn").join("logs")
+    program_data_dir().join("ezvpn").join("logs")
+}
+
+/// Machine-global `ProgramData` base directory (Windows).
+///
+/// `ProgramData` is shared by all users (not a per-user profile location),
+/// which is what a LocalSystem service wants. Resolution order:
+///   1. the `%ProgramData%` env var (the documented override, present on every
+///      normal install and already pointing at the real install drive), then
+///   2. the Known Folders API (`SHGetKnownFolderPath(FOLDERID_ProgramData)`),
+///      which is authoritative in stripped service environments where the env
+///      var may be absent — and, like the env var, follows the actual install
+///      drive instead of assuming `C:\`.
+///
+/// The final `C:\ProgramData` literal is a last-ditch fallback only reached if
+/// both the env var is unset *and* the shell32 call fails.
+#[cfg(all(not(test), target_os = "windows"))]
+fn program_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("ProgramData").filter(|s| !s.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    known_folders::get_known_folder_path(known_folders::KnownFolder::ProgramData)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+}
+
+/// System-wide configuration directory — the default location for the
+/// server/client TOML config files when neither `-c` nor `--default-config`'s
+/// explicit path is given.
+///
+/// Machine-global on every platform (not a per-user home directory): `ezvpn`
+/// runs as root/LocalSystem, so its config belongs in the system location where
+/// every subcommand resolves the same place regardless of which user invokes it.
+///
+/// Defaults: `/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, and
+/// `%ProgramData%\ezvpn` on Windows.
+#[cfg(not(test))]
+pub(crate) fn config_dir() -> PathBuf {
+    platform_config_dir()
+}
+
+/// Test build: isolate to the same writable per-process temp dir as the other
+/// path helpers so the suite neither reads a real `/etc` nor needs root.
+#[cfg(test)]
+pub(crate) fn config_dir() -> PathBuf {
+    runtime_dir()
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn platform_config_dir() -> PathBuf {
+    PathBuf::from("/etc/ezvpn")
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn platform_config_dir() -> PathBuf {
+    PathBuf::from("/usr/local/etc/ezvpn")
+}
+
+#[cfg(all(not(test), target_os = "windows"))]
+fn platform_config_dir() -> PathBuf {
+    program_data_dir().join("ezvpn")
 }
 
 /// Names of the directory-override environment variables, checked by
@@ -192,6 +243,10 @@ pub(crate) fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
 /// Ensure the log directory exists, creating it owner-only (`0700` on Unix) on
 /// first creation. Returns the directory path. Called when setting up the
 /// daemon log.
+///
+/// Only the Unix daemonization path creates the log dir up front, so this is
+/// Unix-only; elsewhere `log_dir` is resolved without pre-creating it.
+#[cfg(unix)]
 pub(crate) fn ensure_log_dir() -> std::io::Result<PathBuf> {
     ensure_dir(log_dir())
 }
@@ -371,6 +426,10 @@ impl VpnLock {
 ///
 /// Returns `Ok(None)` if no lock file exists (instance never started) or its
 /// contents aren't a valid PID. Used by `client stop` to signal the process.
+///
+/// `client stop` signals via `SIGTERM`, which only exists on Unix, so this
+/// PID-reading helper is Unix-only.
+#[cfg(unix)]
 pub(crate) fn read_instance_pid(role: LockRole, instance: &str) -> std::io::Result<Option<u32>> {
     // Re-validate (like `acquire`) so a separator/traversal name cannot reach
     // `lock_path` through this pub(crate) helper, even if a caller skips the

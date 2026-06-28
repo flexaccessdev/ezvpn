@@ -230,7 +230,7 @@ precedence over client config file values.
 | Option | Description |
 |--------|-------------|
 | `-c, --config <FILE>` | Server config path |
-| `--default-config` | Use `~/.config/ezvpn/vpn_server.toml` |
+| `--default-config` | Use `vpn_server.toml` in the system config dir (`/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, `%ProgramData%\ezvpn` on Windows) |
 
 `ezvpn server status` prints the running server's uptime, mode, connected
 clients with assigned IPs and iroh paths, and packet counters. Add `--json` for
@@ -246,7 +246,7 @@ machine-readable output.
 | Option | Description |
 |--------|-------------|
 | `-c, --config <FILE>` | Client config path |
-| `--default-config` | Use `~/.config/ezvpn/vpn_client.toml` |
+| `--default-config` | Use `vpn_client.toml` in the system config dir (`/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, `%ProgramData%\ezvpn` on Windows) |
 | `-n, --server-node-id <ID>` | VPN server `EndpointId` |
 | `--auth-token <TOKEN>` | Authentication token |
 | `--auth-token-file <PATH>` | Read auth token from file |
@@ -301,6 +301,13 @@ The runtime directory holds ephemeral state (lock files and control sockets)
 and is machine-global: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
 `%ProgramData%\ezvpn` on Windows. Override it with `EZVPN_RUNTIME_DIR`.
 
+`--default-config` reads its TOML from the machine-global system config
+directory — `/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, and
+`%ProgramData%\ezvpn` on Windows — not a per-user home directory, since `ezvpn`
+runs as root/LocalSystem. On Windows the `%ProgramData%` location is resolved
+via the Known Folders API, so it follows the actual install drive rather than
+assuming `C:\`.
+
 On Unix, the daemon log is kept separately in the persistent log directory:
 `/var/log/ezvpn` on Linux and macOS. Override it with `EZVPN_LOG_DIR`. The log
 is size-capped: at 10 MiB it rotates to a single `<name>.log.1` backup
@@ -346,11 +353,12 @@ sudo ezvpn client start \
 
 Default routes are installed as split half-routes (`0.0.0.0/1` +
 `128.0.0.0/1`, and `::/1` + `8000::/1`) so the system default route is not
-removed. On Linux and macOS, `ezvpn` also installs host-specific bypass routes
-for iroh underlay addresses that would otherwise be captured by VPN routes.
-That automatic bypass is not implemented on Windows yet; on Windows, avoid
-full-tunnel routes unless you add equivalent host routes yourself or know the
-server/relay underlay addresses are not captured.
+removed. On Linux, macOS, and Windows, `ezvpn` also installs host-specific
+bypass routes for iroh underlay addresses that would otherwise be captured by
+VPN routes, so full-tunnel routes keep the underlay path to the server/relay
+off the tunnel automatically. On Windows the underlay next hop is resolved with
+the in-box `NetTCPIP` PowerShell cmdlets (`Find-NetRoute` / `Get-NetRoute`) and
+the host route is pinned with `New-NetRoute`.
 
 ## Protocol, MTU, and GSO
 

@@ -3,6 +3,10 @@
 # Usage: ezvpn server start -c vpn_server.toml
 #        ezvpn server start --default-config
 #
+# --default-config reads vpn_server.toml from the machine-global system config
+# directory: /etc/ezvpn on Linux, /usr/local/etc/ezvpn on macOS, and
+# %ProgramData%\ezvpn on Windows.
+#
 # Server runtime settings are read from this config file. The server CLI only
 # selects the config path (-c or --default-config).
 #

@@ -3,6 +3,10 @@
 # Usage: ezvpn client start -c vpn_client.toml
 #        ezvpn client start --default-config
 #
+# --default-config reads vpn_client.toml from the machine-global system config
+# directory: /etc/ezvpn on Linux, /usr/local/etc/ezvpn on macOS, and
+# %ProgramData%\ezvpn on Windows.
+#
 # CLI arguments take precedence over config file values.
 #
 # Config is grouped by purpose:
@@ -42,7 +46,7 @@ auth_token = "<YOUR_AUTH_TOKEN>"  # Replace with real token from generate-auth-t
 
 # Or use a file containing the token (one token, # comments allowed)
 # NOTE: Use either auth_token OR auth_token_file, not both.
-# auth_token_file = "~/.config/ezvpn/vpn-token.txt"
+# auth_token_file = "/etc/ezvpn/vpn-token.txt"  # %ProgramData%\ezvpn\... on Windows
 
 [network]
 # ============================================================================
@@ -105,7 +109,7 @@ server_node_id = "changeme"
 alpn_token = "<YOUR_ALPN_TOKEN>"  # Paste the exact token supplied by the server admin
 
 # Or use a file containing the token (one token, # comments allowed)
-# alpn_token_file = "~/.config/ezvpn/vpn-alpn-token.txt"
+# alpn_token_file = "/etc/ezvpn/vpn-alpn-token.txt"  # %ProgramData%\ezvpn\... on Windows
 
 # ============================================================================
 # Performance Tuning

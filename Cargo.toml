@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -38,6 +38,12 @@ url = "2"
 # maintained drop-in fork of the unmaintained `daemonize` crate.
 [target.'cfg(unix)'.dependencies]
 daemonix = "0.1"
+
+# Windows-only: resolve %ProgramData% via the Known Folders API
+# (SHGetKnownFolderPath) so the runtime/log dirs follow the real install drive
+# instead of assuming C:\ when the env var is missing.
+[target.'cfg(windows)'.dependencies]
+known-folders = "1"
 
 [dev-dependencies]
 mock_instant = "0.5"
