@@ -268,6 +268,34 @@ When both `network` and `network6` are configured, each client normally receives
 | macOS | `utunX` | `route add` | root |
 | Windows | `wintun.dll` | `netsh interface route` (VPN routes); `NetTCPIP` PowerShell cmdlets `Find-NetRoute`/`New-NetRoute` (underlay bypass host routes) | Administrator |
 
+### Underlay Bypass Routes
+
+iroh's QUIC transport may reach the server (or a relay) over a public address
+that happens to fall inside one of the client's routed VPN prefixes — most
+commonly the server's public IPv6 when a broad IPv6 CIDR is routed. Without
+intervention the VPN route would capture the transport's own underlay packets
+and feed them back into the tunnel, deadlocking the connection. To prevent this,
+`ezvpn` installs a host-specific (`/32`/`/128`) **bypass route** for each such
+peer address, pinned to the underlay default gateway captured before the VPN
+routes were installed (`BypassRouteManager` in `tunnel/client.rs`).
+
+**The bypass manager is add-only.** A bypass route, once installed, is kept until
+the connection closes (each route guard's `Drop` removes it). It is deliberately
+*not* removed when iroh drops the peer from a path snapshot: iroh flaps underlay
+peers in and out of successive snapshots, so removing on first absence caused
+add/remove churn, and between removals the address was self-captured into the
+tunnel — the exact failure the bypass exists to prevent. A bypass route only
+pins one peer's underlay address (the server's transport address) off the
+tunnel, so keeping a no-longer-listed one for the session is harmless.
+
+**Caveat (user-visible).** As a consequence, the public address used for tunnel
+transport is reachable only over the underlay, not through the VPN, while the
+client is connected. If the same host also exposes resources meant to be reached
+*through* the tunnel, those must be addressed by their **VPN-internal IP** (the
+in-subnet server/peer address, e.g. `10.x` / `fd11:…`, or another address within
+the routed CIDR) — not by the public address that doubles as the tunnel underlay
+endpoint. This is documented for end users in the README "Routing" section.
+
 ### Security Model
 
 ```mermaid
