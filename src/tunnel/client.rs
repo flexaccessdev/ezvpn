@@ -1474,16 +1474,15 @@ async fn run_bypass_route_manager(
 
     while let Some(paths) = stream.next().await {
         log::debug!("Connection paths changed: {:?}", paths);
-        let result = collect_addresses_from_paths(&endpoint, &paths).await;
+        let ips = collect_addresses_from_paths(&endpoint, &paths).await;
 
-        // Skip update if we should preserve existing routes (e.g., no paths yet or DNS failure)
-        // to avoid disconnecting the relay during transient outages
-        if result.preserve_routes {
-            log::debug!("Bypass route update skipped: no paths yet or DNS resolution failed");
-            continue;
-        }
-
-        manager.update(result.ips).await;
+        // Apply whatever resolved this snapshot. `update` is add-only and
+        // best-effort, so an empty set (no paths yet, or only a relay that failed
+        // to resolve) is a harmless no-op, and any address missing this round —
+        // e.g. a relay still failing DNS — is retried on the next snapshot. A
+        // relay failure must NOT suppress the direct path addresses collected
+        // alongside it; they are concrete IPs that need no DNS.
+        manager.update(ips).await;
     }
 
     log::debug!("Bypass route manager task ending (connection closed)");
@@ -1523,33 +1522,52 @@ async fn collect_relay_ips(endpoint: &Endpoint, relay_urls: &[String]) -> HashSe
     ips
 }
 
-/// Result of collecting addresses from active connection paths.
-struct CollectAddressesResult {
-    /// Set of unique IP addresses that need bypass routes.
-    ips: HashSet<IpAddr>,
-    /// Whether to preserve existing routes rather than updating.
-    preserve_routes: bool,
+/// One iroh path's contribution to the bypass set, after relay DNS resolution.
+enum PathBypassAddrs {
+    /// A direct path: its concrete underlay IP (needs no DNS).
+    Direct(IpAddr),
+    /// A relay path that resolved to these IPs (possibly empty).
+    Relay(Vec<IpAddr>),
+    /// A relay path whose DNS resolution failed; contributes nothing this round
+    /// and is retried on a later snapshot.
+    RelayUnresolved,
 }
 
-/// Extract IP addresses from the active iroh paths that need bypass routes.
+/// Fold per-path resolution outcomes into the set of IPs to bypass.
 ///
-/// Returns a set of unique IP addresses (deduplicated from socket addresses)
-/// and a flag indicating whether DNS resolution failed.
-async fn collect_addresses_from_paths(
-    endpoint: &Endpoint,
-    paths: &PathList<'_>,
-) -> CollectAddressesResult {
+/// A `RelayUnresolved` entry contributes nothing — and crucially does **not**
+/// suppress the `Direct` addresses, which are concrete IPs needing no DNS. This
+/// is the fix for a relay's transient DNS failure blocking the bypass of a
+/// co-present direct path: previously any relay failure flagged the whole
+/// snapshot as "preserve" and skipped the update, so a direct endpoint that only
+/// briefly appeared in the path set (while relay DNS was failing) was never
+/// pinned, then flapped out.
+fn fold_bypass_addrs(entries: impl IntoIterator<Item = PathBypassAddrs>) -> HashSet<IpAddr> {
     let mut ips = HashSet::new();
-    let mut preserve_routes = false;
-
-    if paths.is_empty() {
-        log::debug!("iroh connection has no paths yet; preserving existing bypass routes");
-        preserve_routes = true;
-        return CollectAddressesResult {
-            ips,
-            preserve_routes,
-        };
+    for entry in entries {
+        match entry {
+            PathBypassAddrs::Direct(ip) => {
+                ips.insert(ip);
+            }
+            PathBypassAddrs::Relay(addrs) => {
+                ips.extend(addrs);
+            }
+            PathBypassAddrs::RelayUnresolved => {}
+        }
     }
+    ips
+}
+
+/// Extract the iroh transport IP addresses from the active paths that need
+/// bypass routes: every direct path's IP, plus the resolved IPs of each relay.
+///
+/// A relay whose DNS resolution fails is simply omitted (and retried on a later
+/// snapshot); its failure does not suppress the direct addresses collected here.
+/// The caller's `update` is add-only, so applying a partial set never removes or
+/// disconnects anything — an empty result (no paths yet, or only an unresolved
+/// relay) is a harmless no-op.
+async fn collect_addresses_from_paths(endpoint: &Endpoint, paths: &PathList<'_>) -> HashSet<IpAddr> {
+    let mut entries = Vec::new();
 
     for path in paths.iter() {
         let selected = if path.is_selected() {
@@ -1561,34 +1579,22 @@ async fn collect_addresses_from_paths(
         match remote {
             TransportAddr::Ip(addr) => {
                 log::debug!("iroh path{} direct {}", selected, addr);
-                ips.insert(addr.ip());
+                entries.push(PathBypassAddrs::Direct(addr.ip()));
             }
             TransportAddr::Relay(relay_url) => {
                 log::debug!("iroh path{} relay {}", selected, relay_url);
                 match resolve_relay_url(endpoint, relay_url).await {
-                    Ok(addrs) => {
-                        for addr in addrs {
-                            ips.insert(addr.ip());
-                        }
-                    }
-                    Err(()) => {
-                        preserve_routes = true;
-                    }
+                    Ok(addrs) => entries.push(PathBypassAddrs::Relay(
+                        addrs.into_iter().map(|addr| addr.ip()).collect(),
+                    )),
+                    Err(()) => entries.push(PathBypassAddrs::RelayUnresolved),
                 }
             }
             _ => log::debug!("iroh path{} unknown {:?}", selected, remote),
         }
     }
 
-    if ips.is_empty() {
-        log::warn!("No usable iroh transport addresses found; preserving existing bypass routes");
-        preserve_routes = true;
-    }
-
-    CollectAddressesResult {
-        ips,
-        preserve_routes,
-    }
+    fold_bypass_addrs(entries)
 }
 
 /// Resolve a relay URL to socket addresses using the endpoint's DNS resolver.
@@ -1598,7 +1604,8 @@ async fn collect_addresses_from_paths(
 ///
 /// Returns:
 /// - `Ok(addresses)` on successful resolution (may be empty if host has no addresses)
-/// - `Err(())` if DNS resolution failed (caller should preserve existing routes)
+/// - `Err(())` if DNS resolution failed (caller skips this relay and retries it
+///   on a later path snapshot; other addresses in the snapshot are unaffected)
 async fn resolve_relay_url(
     endpoint: &Endpoint,
     relay_url: &RelayUrl,
@@ -1815,6 +1822,42 @@ mod tests {
         mgr.update(HashSet::from([pinned])).await;
         assert_eq!(mgr.active_routes.len(), 1);
         assert!(mgr.active_routes.contains_key(&pinned));
+    }
+
+    /// Regression: a relay whose DNS resolution failed in a snapshot must not
+    /// suppress the direct path address collected alongside it. A relay DNS
+    /// failure used to flag the whole snapshot for "preserve" and skip the
+    /// update, so a direct endpoint that only briefly appeared in the path set
+    /// (while relay DNS was failing) was never pinned, then flapped out —
+    /// leaving a full-tunnel direct transport endpoint unbypassed.
+    #[test]
+    fn relay_resolution_failure_does_not_drop_direct_addr() {
+        let direct: IpAddr = "2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8".parse().unwrap();
+        let ips = fold_bypass_addrs([
+            PathBypassAddrs::Direct(direct),
+            PathBypassAddrs::RelayUnresolved,
+        ]);
+        assert!(
+            ips.contains(&direct),
+            "direct address dropped because a co-present relay failed to resolve"
+        );
+        assert_eq!(ips.len(), 1);
+    }
+
+    /// The fold unions direct addresses with the IPs of relays that resolved,
+    /// and silently skips relays that did not.
+    #[test]
+    fn fold_unions_direct_and_resolved_relays_skipping_failures() {
+        let direct: IpAddr = "2600::1".parse().unwrap();
+        let relay_a: IpAddr = "5.78.69.43".parse().unwrap();
+        let relay_b: IpAddr = "2a01:4ff:f0:b1b3::1".parse().unwrap();
+        let ips = fold_bypass_addrs([
+            PathBypassAddrs::Direct(direct),
+            PathBypassAddrs::Relay(vec![relay_a]),
+            PathBypassAddrs::RelayUnresolved,
+            PathBypassAddrs::Relay(vec![relay_b]),
+        ]);
+        assert_eq!(ips, HashSet::from([direct, relay_a, relay_b]));
     }
 
     #[test]
