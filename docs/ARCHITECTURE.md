@@ -170,16 +170,15 @@ The VPN mode sends raw IP packets directly over iroh's unreliable QUIC datagrams
 
 **Device ID Generation:**
 
-The `device_id` is generated at startup with `rand::rng().random::<u64>()`. It is a random session identifier, not an authentication secret; security relies on the ALPN knock token, the server's iroh endpoint identity, and the configured auth token.
+The `device_id` is generated at startup with `rand::rng().random::<u64>()`. It is a random session identifier, not an authentication secret; security relies on the server's iroh endpoint identity and the configured auth token.
 
 **Security Considerations:**
 
 The `device_id` is used **purely for session tracking** within an already-authenticated iroh connection—it is NOT used for access control. Security relies on:
-1. the required ALPN token being embedded in the negotiated ALPN value
-2. iroh's cryptographic server `EndpointId` authentication and QUIC/TLS encryption
-3. Auth token validation
+1. iroh's cryptographic server `EndpointId` authentication and QUIC/TLS encryption
+2. Auth token validation
 
-Clients are keyed by `(EndpointId, device_id)`, so an attacker cannot hijack a session by guessing a `device_id` without also possessing the victim's iroh private key and valid shared credentials.
+Clients are keyed by `(EndpointId, device_id)`, so an attacker cannot hijack a session by guessing a `device_id` without also possessing the victim's iroh private key and a valid auth token.
 
 **Collision Handling:**
 
@@ -426,8 +425,8 @@ server built with this feature to bypass direct server addresses in a full tunne
 ### Security Model
 
 The security model is private-resource access, not anonymity. Server identity,
-the ALPN knock token, auth tokens, and QUIC/TLS encryption protect the tunnel
-from unauthorized peers and keep VPN payloads confidential from iroh relays.
+auth tokens, and QUIC/TLS encryption protect the tunnel from unauthorized peers
+and keep VPN payloads confidential from iroh relays.
 Relays and discovery services may still see metadata such as participating
 endpoints, timing, volume, and relay use when they are involved.
 
@@ -459,7 +458,7 @@ graph TB
 
 There are two independent version numbers, checked at two different layers:
 
-- **ALPN/token-format version** — the advertised ALPN is `ezvpn/4/<token>`, where `4` is the ALPN/token-format version and `<token>` is the pre-shared ALPN "knock" token. A peer whose ALPN does not match (wrong version segment or wrong token) is rejected during QUIC ALPN negotiation, before any application streams are opened.
+- **ALPN/format version** — the advertised ALPN is the fixed value `ezvpn/4`, where `4` is the ALPN/format version. A peer whose ALPN does not match exactly (e.g. a different version segment, or an older token-bearing `ezvpn/4/<token>`) is rejected during QUIC ALPN negotiation, before any application streams are opened. It carries no embedded secret; access control rests on the server's iroh endpoint identity and the auth token.
 - **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `3`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation.
 
 ### Client Isolation

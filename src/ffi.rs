@@ -23,7 +23,6 @@
 //! ```json
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
-//!   "alpn_token": "<shared ALPN knock token>",
 //!   "auth_token": "<optional ezvpn auth token>",
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_only": false,
@@ -57,7 +56,6 @@ use serde::Deserialize;
 
 use crate::error::VpnResult;
 use crate::tunnel::ios::{IosConfig, IosSession};
-use crate::tunnel::signaling::build_vpn_alpn;
 
 /// Opaque handle owned by the Swift side. Created by [`ezvpn_connect`], freed by
 /// [`ezvpn_stop`].
@@ -72,7 +70,6 @@ pub struct EzvpnHandle {
 #[derive(Deserialize)]
 struct FfiConfig {
     server_node_id: String,
-    alpn_token: String,
     #[serde(default)]
     auth_token: Option<String>,
     #[serde(default)]
@@ -171,7 +168,6 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
 
     let ios_config = IosConfig {
         server_node_id: cfg.server_node_id,
-        alpn: build_vpn_alpn(&cfg.alpn_token),
         auth_token: cfg.auth_token,
         relay_urls: cfg.relay_urls,
         relay_only: cfg.relay_only,

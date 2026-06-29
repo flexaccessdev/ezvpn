@@ -39,7 +39,7 @@ underlay path to the server and relay infrastructure outside the VPN route.
 - Full subnet routing, not just single-port forwarding
 - End-to-end encryption via QUIC/TLS 1.3 through iroh
 - NAT traversal with relay fallback
-- Token-based authentication plus a required ALPN "knock" token
+- Token-based authentication over iroh's cryptographic endpoint identity
 - Optional dual-stack VPN operation with IPv4, IPv6, or both
 - Optional split tunneling through repeatable `--route` and `--route6`
 - Auto-reconnect using QUIC keep-alive and idle-timeout health checks
@@ -157,20 +157,16 @@ ezvpn generate-server-key --output ./vpn-server.key
 
 AUTH_TOKEN=$(ezvpn generate-auth-token)
 echo "$AUTH_TOKEN"
-
-ALPN_TOKEN=$(ezvpn generate-alpn-token)
-echo "$ALPN_TOKEN"
 ```
 
-Token formats:
+Token format:
 
 - Auth token: exactly 47 characters, `v` followed by 46 Base64URL characters
   with no padding.
-- ALPN token: exactly 14 Base64URL characters with no prefix and no padding.
 
-The auth token identifies authorized clients. The ALPN token is a shared
-pre-handshake secret embedded in the iroh ALPN value; it must match on the
-server and every client.
+The auth token identifies authorized clients. The tunnel also negotiates a
+fixed ALPN over iroh's QUIC handshake, so a peer that does not speak the ezvpn
+protocol is rejected before any stream is opened.
 
 ### 2. Create Server Config
 
@@ -187,7 +183,6 @@ auth_tokens = ["<YOUR_AUTH_TOKEN>"]
 
 [iroh]
 secret_file = "./vpn-server.key"
-alpn_token = "<YOUR_ALPN_TOKEN>"
 ```
 
 Config notes:
@@ -195,8 +190,8 @@ Config notes:
 - `[network]` defines VPN addressing. At least one of `network` (IPv4) or
   `network6` (IPv6) is required.
 - `[auth]` defines accepted client auth tokens.
-- `[iroh]` defines server identity, ALPN token, relay/discovery settings, and
-  optional QUIC transport tuning.
+- `[iroh]` defines server identity, relay/discovery settings, and optional QUIC
+  transport tuning.
 - Top-level keys control server runtime behavior such as buffering,
   backpressure, and spoofing checks.
 - `secret_file` is required for a stable server `EndpointId`.
@@ -220,8 +215,7 @@ ezvpn show-server-id --secret-file ./vpn-server.key
 ```bash
 sudo ezvpn client start \
   --server-node-id <SERVER_ENDPOINT_ID> \
-  --auth-token "$AUTH_TOKEN" \
-  --alpn-token "$ALPN_TOKEN"
+  --auth-token "$AUTH_TOKEN"
 ```
 
 ### 5. Verify Connectivity
@@ -249,8 +243,8 @@ Server-side settings are authoritative for VPN network parameters:
 - The server dictates QUIC transport tuning from `[iroh.transport]`, including
   congestion controller and receive/send windows.
 
-Clients configure their server identity, auth token, ALPN token, routes, relay
-and discovery settings, and reconnect behavior. Client CLI arguments take
+Clients configure their server identity, auth token, routes, relay and
+discovery settings, and reconnect behavior. Client CLI arguments take
 precedence over client config file values.
 
 ## CLI Reference
@@ -282,8 +276,6 @@ machine-readable output.
 | `-n, --server-node-id <ID>` | VPN server `EndpointId` |
 | `--auth-token <TOKEN>` | Authentication token |
 | `--auth-token-file <PATH>` | Read auth token from file |
-| `--alpn-token <TOKEN>` | ALPN token; must match the server |
-| `--alpn-token-file <PATH>` | Read ALPN token from file |
 | `--route <CIDR>` | Additional IPv4 route through the VPN; repeatable |
 | `--route6 <CIDR>` | Additional IPv6 route through the VPN; repeatable |
 | `--relay-url <URL>` | Custom relay URL; repeatable |
@@ -367,7 +359,6 @@ Split tunnel example:
 sudo ezvpn client start \
   --server-node-id <SERVER_ENDPOINT_ID> \
   --auth-token "$AUTH_TOKEN" \
-  --alpn-token "$ALPN_TOKEN" \
   --route 192.168.1.0/24 \
   --route 172.16.0.0/12
 ```
@@ -378,7 +369,6 @@ Full tunnel example:
 sudo ezvpn client start \
   --server-node-id <SERVER_ENDPOINT_ID> \
   --auth-token "$AUTH_TOKEN" \
-  --alpn-token "$ALPN_TOKEN" \
   --route 0.0.0.0/0 \
   --route6 ::/0
 ```

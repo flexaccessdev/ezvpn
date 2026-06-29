@@ -194,25 +194,6 @@ auth_tokens = ["<YOUR_AUTH_TOKEN>"]  # Replace with real token from generate-aut
 secret_file = "./vpn-server.key"
 
 # ============================================================================
-# ALPN Token (REQUIRED)
-# ============================================================================
-# A single shared "knock" secret embedded into the iroh ALPN protocol value
-# (ezvpn/4/<alpn_token>). It is negotiated during the QUIC handshake, so a
-# peer that doesn't present the matching token fails to connect BEFORE any
-# stream is opened or the per-client auth token is checked. This keeps
-# unauthorized peers and noise off the server entirely.
-#
-# The SAME alpn_token must be configured on the server and every client.
-# Token format: exactly 14 Base64URL chars (no prefix, no padding).
-# Generate with: ezvpn generate-alpn-token
-#
-# NOTE: Use either alpn_token OR alpn_token_file, not both.
-alpn_token = "<YOUR_ALPN_TOKEN>"  # Replace with real token from generate-alpn-token
-
-# Or use a file containing the token (one token, # comments allowed)
-# alpn_token_file = "./vpn-alpn-token.txt"
-
-# ============================================================================
 # Relay and Discovery (Optional)
 # ============================================================================
 

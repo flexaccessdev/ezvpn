@@ -96,22 +96,6 @@ auth_token = "<YOUR_AUTH_TOKEN>"  # Replace with real token from generate-auth-t
 server_node_id = "changeme"
 
 # ============================================================================
-# ALPN Token (REQUIRED)
-# ============================================================================
-# A shared "knock" secret embedded into the iroh ALPN protocol value. It must
-# match the server's alpn_token exactly, or the connection fails at the QUIC
-# handshake before authentication. The server admin generates and supplies this
-# token; copy it here exactly as provided (do not generate your own).
-# Token format: exactly 14 Base64URL chars (no prefix, no padding).
-#
-# NOTE: Use either alpn_token OR alpn_token_file, not both.
-# CLI equivalents: --alpn-token / --alpn-token-file (take precedence).
-alpn_token = "<YOUR_ALPN_TOKEN>"  # Paste the exact token supplied by the server admin
-
-# Or use a file containing the token (one token, # comments allowed)
-# alpn_token_file = "/etc/ezvpn/vpn-alpn-token.txt"  # %ProgramData%\ezvpn\... on Windows
-
-# ============================================================================
 # Performance Tuning
 # ============================================================================
 

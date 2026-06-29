@@ -89,8 +89,6 @@ pub struct ServerAuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct VpnServerIrohConfig {
     pub secret_file: Option<PathBuf>,
-    pub alpn_token: Option<String>,
-    pub alpn_token_file: Option<PathBuf>,
     #[serde(default)]
     pub transport: TransportTuning,
     pub relay_urls: Option<Vec<String>>,
@@ -118,8 +116,6 @@ pub struct ClientAuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct VpnClientIrohConfig {
     pub server_node_id: Option<String>,
-    pub alpn_token: Option<String>,
-    pub alpn_token_file: Option<PathBuf>,
     pub relay_urls: Option<Vec<String>>,
     pub dns_server: Option<String>,
 }
@@ -353,10 +349,6 @@ impl VpnServerConfig {
             anyhow::bail!("[auth] Use only one of 'auth_tokens' or 'auth_tokens_file'.");
         }
 
-        if iroh.alpn_token.is_some() && iroh.alpn_token_file.is_some() {
-            anyhow::bail!("[iroh] Use only one of 'alpn_token' or 'alpn_token_file'.");
-        }
-
         validate_vpn_networks(
             self.network.network.as_deref(),
             self.network.server_ip.as_deref(),
@@ -393,10 +385,6 @@ impl VpnClientConfig {
 
         if self.auth.auth_token.is_some() && self.auth.auth_token_file.is_some() {
             anyhow::bail!("[auth] Use only one of 'auth_token' or 'auth_token_file'.");
-        }
-
-        if iroh.alpn_token.is_some() && iroh.alpn_token_file.is_some() {
-            anyhow::bail!("[iroh] Use only one of 'alpn_token' or 'alpn_token_file'.");
         }
 
         if let Some(ref routes) = self.network.routes {
@@ -485,8 +473,6 @@ pub struct ResolvedVpnServerConfig {
     pub dns_server: Option<String>,
     pub auth_tokens: Vec<String>,
     pub auth_tokens_file: Option<PathBuf>,
-    pub alpn_token: Option<String>,
-    pub alpn_token_file: Option<PathBuf>,
     pub drop_on_full: bool,
     pub client_channel_size: usize,
     pub tun_writer_channel_size: usize,
@@ -528,12 +514,6 @@ impl ResolvedVpnServerConfig {
             );
         }
 
-        if iroh.alpn_token.is_some() && iroh.alpn_token_file.is_some() {
-            anyhow::bail!(
-                "[iroh] Cannot specify both alpn_token and alpn_token_file. Use exactly one source."
-            );
-        }
-
         let client_channel_size = cfg
             .client_channel_size
             .unwrap_or(DEFAULT_CLIENT_CHANNEL_SIZE);
@@ -558,8 +538,6 @@ impl ResolvedVpnServerConfig {
             dns_server: iroh.dns_server.clone(),
             auth_tokens: auth.auth_tokens.clone().unwrap_or_default(),
             auth_tokens_file: auth.auth_tokens_file.clone(),
-            alpn_token: iroh.alpn_token.clone(),
-            alpn_token_file: iroh.alpn_token_file.clone(),
             drop_on_full: cfg.drop_on_full,
             client_channel_size,
             tun_writer_channel_size,
@@ -574,8 +552,6 @@ pub struct ResolvedVpnClientConfig {
     pub server_node_id: String,
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
-    pub alpn_token: Option<String>,
-    pub alpn_token_file: Option<PathBuf>,
     pub routes: Vec<String>,
     pub routes6: Vec<String>,
     pub relay_urls: Vec<String>,
@@ -589,8 +565,6 @@ pub struct VpnClientConfigBuilder {
     server_node_id: Option<String>,
     auth_token: Option<String>,
     auth_token_file: Option<PathBuf>,
-    alpn_token: Option<String>,
-    alpn_token_file: Option<PathBuf>,
     routes: Option<Vec<String>>,
     routes6: Option<Vec<String>>,
     relay_urls: Option<Vec<String>>,
@@ -616,12 +590,6 @@ impl VpnClientConfigBuilder {
             if let Some(iroh) = cfg.iroh.as_ref() {
                 if iroh.server_node_id.is_some() {
                     self.server_node_id = iroh.server_node_id.clone();
-                }
-                if iroh.alpn_token.is_some() {
-                    self.alpn_token = iroh.alpn_token.clone();
-                }
-                if iroh.alpn_token_file.is_some() {
-                    self.alpn_token_file = iroh.alpn_token_file.clone();
                 }
                 if iroh.relay_urls.is_some() {
                     self.relay_urls = iroh.relay_urls.clone();
@@ -658,8 +626,6 @@ impl VpnClientConfigBuilder {
         server_node_id: Option<String>,
         auth_token: Option<String>,
         auth_token_file: Option<PathBuf>,
-        alpn_token: Option<String>,
-        alpn_token_file: Option<PathBuf>,
         routes: Vec<String>,
         routes6: Vec<String>,
         relay_urls: Vec<String>,
@@ -675,12 +641,6 @@ impl VpnClientConfigBuilder {
         }
         if auth_token_file.is_some() {
             self.auth_token_file = auth_token_file;
-        }
-        if alpn_token.is_some() {
-            self.alpn_token = alpn_token;
-        }
-        if alpn_token_file.is_some() {
-            self.alpn_token_file = alpn_token_file;
         }
         if !routes.is_empty() {
             self.routes = Some(routes);
@@ -727,18 +687,10 @@ impl VpnClientConfigBuilder {
             );
         }
 
-        if self.alpn_token.is_some() && self.alpn_token_file.is_some() {
-            anyhow::bail!(
-                "Cannot specify both alpn_token and alpn_token_file. Use one source for the ALPN token."
-            );
-        }
-
         Ok(ResolvedVpnClientConfig {
             server_node_id,
             auth_token: self.auth_token,
             auth_token_file: self.auth_token_file,
-            alpn_token: self.alpn_token,
-            alpn_token_file: self.alpn_token_file,
             routes,
             routes6,
             relay_urls: self.relay_urls.unwrap_or_default(),
@@ -965,7 +917,6 @@ recieve_window = 1048576
         assert_eq!(config.network.network.as_deref(), Some("10.0.0.0/24"));
         assert!(config.auth.auth_tokens.is_some());
         assert!(config.iroh.as_ref().unwrap().secret_file.is_some());
-        assert!(config.iroh.as_ref().unwrap().alpn_token.is_some());
     }
 
     #[test]
@@ -978,6 +929,5 @@ recieve_window = 1048576
             .expect("client example must pass validation");
         assert!(config.auth.auth_token.is_some());
         assert!(config.iroh.as_ref().unwrap().server_node_id.is_some());
-        assert!(config.iroh.as_ref().unwrap().alpn_token.is_some());
     }
 }

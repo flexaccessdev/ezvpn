@@ -45,14 +45,13 @@ use crate::tunnel::client::{
     ServerInfo, collect_local_iroh_udp_ports, overlapping_underlay_excludes, perform_handshake,
     run_tunnel,
 };
+use crate::tunnel::signaling::VPN_ALPN;
 
 /// Connection parameters supplied by the iOS app (built from the FFI JSON).
 #[derive(Debug, Clone, Default)]
 pub struct IosConfig {
     /// Server's iroh endpoint id (node id), as a string.
     pub server_node_id: String,
-    /// Pre-built ALPN value (`ezvpn/<ver>/<token>`).
-    pub alpn: Vec<u8>,
     /// Optional ezvpn auth token.
     pub auth_token: Option<String>,
     /// Relay URL hints. When empty, iroh uses its default relay map.
@@ -130,7 +129,7 @@ impl IosSession {
         }
 
         let connection = endpoint
-            .connect(addr, cfg.alpn.as_slice())
+            .connect(addr, VPN_ALPN)
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to connect to server: {e}")))?;
 

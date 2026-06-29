@@ -27,7 +27,6 @@ use ezvpn::runtime::LockRole;
 use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
 // Runtime config types (different from the TOML config types in config::file_config)
 use ezvpn::config::{VpnClientConfig, VpnServerConfig};
-use ezvpn::tunnel::signaling::build_vpn_alpn;
 use ezvpn::tunnel::{VpnClient, VpnServer};
 
 #[derive(Parser)]
@@ -80,16 +79,6 @@ enum Command {
     /// Tokens are shared with clients for authentication (like API keys).
     /// Server configures accepted tokens via [auth] auth_tokens or auth_tokens_file.
     GenerateAuthToken {
-        /// Number of tokens to generate (default: 1)
-        #[arg(short, long, default_value = "1")]
-        count: usize,
-    },
-    /// Generate an ALPN token (shared pre-handshake "knock" secret)
-    ///
-    /// The same ALPN token must be configured on the server and every client.
-    /// It is embedded into the iroh ALPN value, so a peer that doesn't know it
-    /// fails to connect at the QUIC handshake before any stream is opened.
-    GenerateAlpnToken {
         /// Number of tokens to generate (default: 1)
         #[arg(short, long, default_value = "1")]
         count: usize,
@@ -164,14 +153,6 @@ enum ClientAction {
         /// Path to file containing authentication token
         #[arg(long)]
         auth_token_file: Option<PathBuf>,
-
-        /// ALPN token (shared pre-handshake "knock" secret; must match the server)
-        #[arg(long)]
-        alpn_token: Option<String>,
-
-        /// Path to file containing the ALPN token
-        #[arg(long)]
-        alpn_token_file: Option<PathBuf>,
 
         /// Additional IPv4 route CIDRs through the VPN (optional, repeatable).
         /// The VPN subnet is always routed by default.
@@ -265,26 +246,6 @@ fn resolve_client_config(
     }
 }
 
-/// Resolve and validate the required ALPN token from an inline value or a file.
-///
-/// The ALPN token is a shared pre-handshake "knock" secret that must match on
-/// the server and every client. Exactly one source must be provided.
-fn resolve_alpn_token(inline: Option<&str>, file: Option<&Path>) -> Result<String> {
-    if let Some(token) = inline {
-        auth::validate_alpn_token(token).context("Invalid ALPN token")?;
-        Ok(token.to_string())
-    } else if let Some(path) = file {
-        auth::load_alpn_token_from_file(path).context("Failed to load ALPN token from file")
-    } else {
-        anyhow::bail!(
-            "An ALPN token is required.\n\
-             Generate one with: ezvpn generate-alpn-token\n\
-             Then set 'alpn_token' (or 'alpn_token_file') in the config file, \
-             or pass --alpn-token / --alpn-token-file (client)."
-        );
-    }
-}
-
 /// Log the binary name and version at tunnel startup (server/client only).
 fn log_version() {
     log::info!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -340,8 +301,6 @@ fn main() -> Result<()> {
                     dns_server,
                     auth_token,
                     auth_token_file,
-                    alpn_token,
-                    alpn_token_file,
                     routes,
                     routes6,
                     auto_reconnect,
@@ -360,8 +319,6 @@ fn main() -> Result<()> {
                 dns_server,
                 auth_token,
                 auth_token_file,
-                alpn_token,
-                alpn_token_file,
                 routes,
                 routes6,
                 auto_reconnect,
@@ -403,14 +360,6 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::GenerateAlpnToken { count } => {
-            init_logger();
-            for _ in 0..count {
-                println!("{}", auth::generate_alpn_token());
-            }
-            Ok(())
-        }
-
         // Everything else is async but never daemonizes: run on a fresh runtime.
         command => {
             init_logger();
@@ -476,8 +425,7 @@ async fn run_async(command: Command) -> Result<()> {
         }
         | Command::GenerateServerKey { .. }
         | Command::ShowServerId { .. }
-        | Command::GenerateAuthToken { .. }
-        | Command::GenerateAlpnToken { .. } => {
+        | Command::GenerateAuthToken { .. } => {
             unreachable!("dispatched synchronously in main()")
         }
     }
@@ -494,8 +442,6 @@ fn prepare_client_start(
     dns_server: Option<String>,
     auth_token: Option<String>,
     auth_token_file: Option<PathBuf>,
-    alpn_token: Option<String>,
-    alpn_token_file: Option<PathBuf>,
     routes: Vec<String>,
     routes6: Vec<String>,
     auto_reconnect: bool,
@@ -529,8 +475,6 @@ fn prepare_client_start(
             server_node_id,
             auth_token,
             auth_token_file.map(|p| expand_tilde(&p)),
-            alpn_token,
-            alpn_token_file.map(|p| expand_tilde(&p)),
             routes,
             routes6,
             relay_urls,
@@ -545,10 +489,7 @@ fn prepare_client_start(
 /// absolute paths (the daemon does `chdir("/")`). Errors are reported in the
 /// foreground before the fork.
 fn canonicalize_client_paths(resolved: &mut ResolvedVpnClientConfig) -> Result<()> {
-    for (field, slot) in [
-        ("auth token file", &mut resolved.auth_token_file),
-        ("ALPN token file", &mut resolved.alpn_token_file),
-    ] {
+    for (field, slot) in [("auth token file", &mut resolved.auth_token_file)] {
         if let Some(path) = slot.as_ref() {
             let abs = std::fs::canonicalize(path)
                 .with_context(|| format!("resolving {field} {}", path.display()))?;
@@ -873,13 +814,6 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
 
     log::info!("Loaded {} authentication token(s)", valid_tokens.len());
 
-    // Load and validate the ALPN token (required - the pre-handshake "knock" secret)
-    let alpn_token = resolve_alpn_token(
-        resolved.alpn_token.as_deref(),
-        resolved.alpn_token_file.as_deref(),
-    )?;
-    let alpn = build_vpn_alpn(&alpn_token);
-
     // Load secret key for persistent iroh identity (required for server)
     let secret_key = if let Some(ref path) = resolved.secret_file {
         load_secret(path).context("Failed to load secret key")?
@@ -916,7 +850,6 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         false, // relay_only - direct P2P preferred for VPN performance
         Some(secret_key),
         resolved.dns_server.as_deref(),
-        &alpn,
         &resolved.transport,
     )
     .await
@@ -924,7 +857,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
 
     log::info!("VPN Server Node ID: {}", endpoint.id());
     log::info!(
-        "Clients connect with: ezvpn client start --server-node-id {} --auth-token <TOKEN> --alpn-token <ALPN_TOKEN>",
+        "Clients connect with: ezvpn client start --server-node-id {} --auth-token <TOKEN>",
         endpoint.id()
     );
 
@@ -986,18 +919,10 @@ async fn run_vpn_client(
         }
     }
 
-    // Resolve and validate the ALPN token (required), then build the ALPN value
-    let alpn_token = resolve_alpn_token(
-        resolved.alpn_token.as_deref(),
-        resolved.alpn_token_file.as_deref(),
-    )?;
-    let alpn = build_vpn_alpn(&alpn_token);
-
     // Create VPN client config
     let config = VpnClientConfig {
         server_node_id: resolved.server_node_id.clone(),
         auth_token: Some(token),
-        alpn,
         routes: parsed_routes,
         routes6: parsed_routes6,
     };

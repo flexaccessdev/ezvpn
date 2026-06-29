@@ -30,7 +30,7 @@ use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::{TcpGroTable, VirtioNetHdr, materialize_offload_into};
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
 use crate::tunnel::signaling::{
-    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse, WireTransport,
+    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse, WireTransport,
     parse_ip_packet_v2, read_message, write_message,
 };
 use crate::transport::build_quic_transport_config;
@@ -328,7 +328,7 @@ impl VpnClient {
         // endpoint defaults). The server dictates the effective transport
         // settings in the handshake response.
         let connection = endpoint
-            .connect(endpoint_addr.clone(), self.config.alpn.as_slice())
+            .connect(endpoint_addr.clone(), VPN_ALPN)
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to connect to server: {}", e)))?;
 
@@ -359,7 +359,7 @@ impl VpnClient {
             let connection = endpoint
                 .connect_with_opts(
                     endpoint_addr,
-                    self.config.alpn.as_slice(),
+                    VPN_ALPN,
                     ConnectOptions::new().with_transport_config(transport_config),
                 )
                 .await

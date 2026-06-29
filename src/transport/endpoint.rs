@@ -2,6 +2,7 @@
 
 use crate::config::file_config::TransportTuning;
 use crate::transport::build_quic_transport_config;
+use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use iroh::{
@@ -190,7 +191,6 @@ pub async fn create_server_endpoint(
     relay_only: bool,
     secret: Option<SecretKey>,
     dns_server: Option<&str>,
-    alpn: &[u8],
     transport_tuning: &TransportTuning,
 ) -> Result<Endpoint> {
     let relay_mode = parse_relay_mode(relay_urls)?;
@@ -204,7 +204,7 @@ pub async fn create_server_endpoint(
         secret.as_ref(),
         transport_tuning,
     )?
-    .alpns(vec![alpn.to_vec()]);
+    .alpns(vec![VPN_ALPN.to_vec()]);
 
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);

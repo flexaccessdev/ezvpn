@@ -260,12 +260,6 @@ pub struct VpnClientConfig {
     /// Authentication token (ezvpn auth-token format: `v` + Base64URL payload).
     pub auth_token: Option<String>,
 
-    /// Pre-built ALPN protocol value (`ezvpn/4/{alpn_token}`) used to dial
-    /// the server. Built once from the resolved ALPN token via
-    /// [`crate::tunnel::signaling::build_vpn_alpn`].
-    #[serde(default)]
-    pub alpn: Vec<u8>,
-
     /// IPv4 routes to send through the VPN (CIDRs), e.g., 0.0.0.0/0 for full tunnel.
     /// Optional: with no routes configured, only the assigned VPN addresses are reachable.
     #[serde(default)]

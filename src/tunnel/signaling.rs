@@ -16,21 +16,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// VPN protocol version.
 pub const VPN_PROTOCOL_VERSION: u16 = 3;
 
-/// Build the ALPN protocol identifier with an embedded pre-shared ALPN token.
+/// Fixed ALPN protocol identifier for the VPN tunnel.
 ///
-/// The ALPN acts as a lightweight "port knock" — connections from peers that
-/// don't know the token fail at the QUIC handshake level, before any
-/// application streams are opened.
+/// A peer whose advertised ALPN does not match this exact value is rejected
+/// during QUIC ALPN negotiation, before any application streams are opened.
 ///
-/// The `4` is the ALPN/token-format version, not the wire-protocol version
-/// ([`VPN_PROTOCOL_VERSION`]). It was bumped from `3` to `4` when the embedded
-/// token was added: pre-token peers advertised the bare `ezvpn/3` ALPN, so
-/// bumping the segment means their ALPN no longer matches and QUIC negotiation
-/// rejects them before the handshake (the token-format change is, by itself,
-/// incompatible regardless of the wire protocol).
-pub fn build_vpn_alpn(alpn_token: &str) -> Vec<u8> {
-    format!("ezvpn/4/{}", alpn_token).into_bytes()
-}
+/// The `4` is the ALPN/format version, not the wire-protocol version
+/// ([`VPN_PROTOCOL_VERSION`]). It is independent of the wire protocol: a peer
+/// advertising a different ALPN segment (e.g. the older bare `ezvpn/3`, or the
+/// token-bearing `ezvpn/4/<token>` used by earlier builds) no longer matches and
+/// QUIC negotiation rejects it before the handshake.
+pub const VPN_ALPN: &[u8] = b"ezvpn/4";
 
 /// VPN handshake request from client to server.
 ///
