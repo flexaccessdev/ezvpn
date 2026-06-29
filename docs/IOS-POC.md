@@ -28,9 +28,7 @@ In scope:
 Out of scope (by design):
 
 - **Full tunnel** (`0.0.0.0/0` / `::/0`) — never offered on iOS.
-- **App Store / TestFlight** preparation, persistent identity, and background
-  reconnect polish. The iroh identity is ephemeral per session, so the server
-  may assign a different VPN IP on each connect.
+- **App Store / TestFlight** preparation and background reconnect polish.
 
 ## How it reuses the core
 
