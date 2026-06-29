@@ -4,8 +4,8 @@
 //!
 //! 1. [`ezvpn_connect`] — parse the JSON config, create an iroh endpoint,
 //!    connect, and handshake. Returns an opaque handle and writes the assigned
-//!    IPv4 network config (as JSON) to the caller's buffer so the extension can
-//!    build `NEPacketTunnelNetworkSettings`.
+//!    network config (IPv4 and/or IPv6, as JSON) to the caller's buffer so the
+//!    extension can build `NEPacketTunnelNetworkSettings`.
 //! 2. [`ezvpn_run`] — hand back the `utun` fd (obtained after applying the
 //!    network settings); spawns the datagram loop on the embedded runtime.
 //! 3. [`ezvpn_stop`] — abort the loop, close the endpoint, free the handle.
@@ -16,24 +16,40 @@
 //!
 //! ## Config JSON (input to `ezvpn_connect`)
 //!
+//! `routes`/`routes6` are the split-tunnel prefixes; they drive the
+//! overlapping-server-address bypass. `auth_token` may be null; `relay_urls`,
+//! `relay_only`, `routes`, and `routes6` are all optional.
+//!
 //! ```json
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
 //!   "alpn_token": "<shared ALPN knock token>",
 //!   "auth_token": "<optional ezvpn auth token>",
 //!   "relay_urls": ["https://relay.example/"],
-//!   "relay_only": false
+//!   "relay_only": false,
+//!   "routes": ["10.0.0.0/8"],
+//!   "routes6": ["fd00::/8"]
 //! }
 //! ```
 //!
 //! ## Result JSON (output of `ezvpn_connect` on success)
 //!
+//! Per-family fields are `null` when that family was not assigned (IPv4-only,
+//! IPv6-only, or dual-stack). `excluded_routes`/`excluded_routes6` are the
+//! server underlay host routes (`/32` / `/128`) the extension must exclude from
+//! the tunnel.
+//!
 //! ```json
-//! { "assigned_ip": "10.0.0.2", "netmask": "255.255.255.0",
-//!   "gateway": "10.0.0.1", "mtu": 1400 }
+//! {
+//!   "assigned_ip": "10.0.0.2", "netmask": "255.255.255.0", "gateway": "10.0.0.1",
+//!   "assigned_ip6": "fd00::2", "prefix_len6": 64, "gateway6": "fd00::1",
+//!   "mtu": 1400,
+//!   "excluded_routes": ["192.168.1.5/32"], "excluded_routes6": []
+//! }
 //! ```
 
 use std::ffi::{CStr, c_char, c_int};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -71,20 +87,15 @@ struct FfiConfig {
     routes6: Vec<String>,
 }
 
-/// Parse CIDR strings into typed prefixes, skipping (and logging) malformed ones.
-fn parse_routes<T>(raw: &[String], label: &str) -> Vec<T>
+/// Parse CIDR strings into typed prefixes, failing on the first malformed entry
+/// so a typo in `routes`/`routes6` is rejected before tunnel setup.
+fn parse_routes<T>(raw: &[String], label: &str) -> Result<Vec<T>, String>
 where
     T: std::str::FromStr,
     <T as std::str::FromStr>::Err: std::fmt::Display,
 {
     raw.iter()
-        .filter_map(|s| match s.parse::<T>() {
-            Ok(net) => Some(net),
-            Err(e) => {
-                log::warn!("skipping invalid {label} '{s}': {e}");
-                None
-            }
-        })
+        .map(|s| s.parse::<T>().map_err(|e| format!("invalid {label} '{s}': {e}")))
         .collect()
 }
 
@@ -107,6 +118,9 @@ pub extern "C" fn ezvpn_init_logging() {
 ///
 /// Returns a non-null handle on success and writes the network-config JSON to
 /// `out_buf`. On failure returns null and writes the error message to `out_buf`.
+/// If `out_buf` is too small to hold the full network-config JSON, that is
+/// treated as a failure (null is returned and no handle is leaked); the caller
+/// should retry with a larger buffer.
 ///
 /// # Safety
 /// - `config_json` must be a valid, NUL-terminated UTF-8 C string.
@@ -133,8 +147,16 @@ pub unsafe extern "C" fn ezvpn_connect(
 
     match connect_inner(json) {
         Ok((handle, result_json)) => {
-            write_cstr(out_buf, out_len, &result_json);
-            Box::into_raw(Box::new(handle))
+            // Refuse to hand back a handle if the network-config JSON did not fit:
+            // a truncated config is unparseable, and silently succeeding would
+            // strand the connection. The caller must retry with a larger buffer.
+            if write_cstr(out_buf, out_len, &result_json) {
+                Box::into_raw(Box::new(handle))
+            } else {
+                drop(handle);
+                write_cstr(out_buf, out_len, "out_buf too small for network-config JSON");
+                ptr::null_mut()
+            }
         }
         Err(msg) => {
             write_cstr(out_buf, out_len, &msg);
@@ -153,8 +175,8 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
         auth_token: cfg.auth_token,
         relay_urls: cfg.relay_urls,
         relay_only: cfg.relay_only,
-        routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route"),
-        routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route"),
+        routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route")?,
+        routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -198,13 +220,16 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
 /// Start the tunnel data loop on `tun_fd` (the extension's `utun` fd).
 ///
 /// Spawns the loop on the embedded runtime and returns immediately: `0` on
-/// success, `-1` on error (null handle, no pending session, or already running).
+/// success, `-1` on error (null handle, no pending session, fd dup failure, or
+/// already running).
 ///
-/// The runtime keeps a `dup` of `tun_fd`, so the caller may close its own copy.
+/// This `dup`s `tun_fd` **synchronously before returning**, so the caller may
+/// close its own copy as soon as `ezvpn_run` returns — there is no race with the
+/// spawned task picking the fd up.
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`ezvpn_connect`] and not yet
-/// passed to [`ezvpn_stop`].
+/// passed to [`ezvpn_stop`]. `tun_fd` must be a valid open file descriptor.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ezvpn_run(handle: *mut EzvpnHandle, tun_fd: c_int) -> c_int {
     if handle.is_null() {
@@ -214,9 +239,27 @@ pub unsafe extern "C" fn ezvpn_run(handle: *mut EzvpnHandle, tun_fd: c_int) -> c
     let Some(session) = handle.session.take() else {
         return -1;
     };
-    let task = handle
-        .runtime
-        .spawn(async move { session.run(tun_fd).await });
+
+    // Take our own owned dup now, on the caller's thread, so the library holds a
+    // valid fd regardless of when the caller closes its copy. The dup is moved
+    // into the task and closed when the tunnel ends.
+    let owned_fd = match unsafe { BorrowedFd::borrow_raw(tun_fd) }.try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(e) => {
+            log::error!("ezvpn_run: failed to dup utun fd: {e}");
+            // Put the session back so the handle can still be stopped/freed.
+            handle.session = Some(session);
+            return -1;
+        }
+    };
+
+    let task = handle.runtime.spawn(async move {
+        // `owned_fd` is owned by this task and closed when it ends; `run` dups it
+        // again into the TunDevice, so our copy outlives that internal dup setup.
+        let result = session.run(owned_fd.as_raw_fd()).await;
+        drop(owned_fd);
+        result
+    });
     handle.task = Some(task);
     0
 }
@@ -244,10 +287,11 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
     // `handle` (Box) drops here, freeing the allocation.
 }
 
-/// Write `s` (truncated to fit, always NUL-terminated) into the caller buffer.
-fn write_cstr(buf: *mut c_char, len: usize, s: &str) {
+/// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if
+/// the full string fit, `false` if it was truncated or the buffer was unusable.
+fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
     if buf.is_null() || len == 0 {
-        return;
+        return false;
     }
     let bytes = s.as_bytes();
     // Reserve one byte for the trailing NUL.
@@ -256,4 +300,5 @@ fn write_cstr(buf: *mut c_char, len: usize, s: &str) {
         ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, copy);
         *buf.add(copy) = 0;
     }
+    copy == bytes.len()
 }
