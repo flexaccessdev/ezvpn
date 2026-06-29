@@ -6,18 +6,22 @@
 //! - does **not** create a `utun` or configure routes/IP/MTU — the extension
 //!   owns that via `NEPacketTunnelNetworkSettings`, then hands us the tunnel's
 //!   `utun` fd;
-//! - does **not** install underlay-bypass routes — the iOS MVP is an IPv4
-//!   **private** split tunnel, so the iroh underlay (server public address +
-//!   relays) never falls inside a routed prefix and cannot self-capture;
+//! - does **not** install OS bypass routes itself. Instead [`IosSession::connect`]
+//!   computes the server underlay addresses that overlap a routed prefix (via
+//!   [`crate::tunnel::client::overlapping_underlay_excludes`]) and
+//!   [`IosSession::network_config`] returns them as host routes (`/32` / `/128`)
+//!   for the extension to apply as `excludedRoutes`. Full tunnel is out of scope,
+//!   so the *public* iroh underlay (relays, public server addresses) never needs
+//!   bypassing — only an overlapping private/ULA server address does;
 //! - does **not** take the single-instance lock or open a control socket.
 //!
 //! It reuses the portable data plane wholesale: the same handshake
 //! ([`crate::tunnel::client::perform_handshake`]) and datagram loop
 //! ([`crate::tunnel::client::run_tunnel`]).
 //!
-//! The flow is two-phase because the extension needs the server-assigned IPv4
-//! address and MTU to build its network settings *before* it can produce the
-//! `utun` fd:
+//! The flow is two-phase because the extension needs the server-assigned
+//! addresses (IPv4 and/or IPv6), MTU, and excluded routes to build its network
+//! settings *before* it can produce the `utun` fd:
 //!
 //! 1. [`IosSession::connect`] — create an iroh endpoint, connect, handshake.
 //! 2. read [`IosSession::network_config`], apply it as
@@ -193,9 +197,11 @@ impl IosSession {
     /// Drive the tunnel over the extension-provided `utun` fd until it ends
     /// (peer close, idle timeout, or a fatal I/O error). Consumes the session.
     ///
-    /// No bypass-route manager and no server-address publisher channel: a
-    /// private split tunnel needs neither (see module docs), so both
-    /// `run_tunnel` hooks are passed as `None`.
+    /// The two `run_tunnel` bypass hooks are `None`: the dynamic in-data-path
+    /// bypass-route manager and server-address publisher channel are not used.
+    /// Overlapping server underlay addresses are instead excluded statically, up
+    /// front, by the extension's `NEPacketTunnelNetworkSettings` (computed in
+    /// [`Self::connect`], see module docs).
     pub async fn run(self, tun_fd: RawFd) -> VpnResult<()> {
         let tun = TunDevice::from_raw_fd(tun_fd, self.server_info.mtu)?;
 
