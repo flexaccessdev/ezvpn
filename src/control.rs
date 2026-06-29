@@ -1,10 +1,10 @@
-//! Local control socket for querying a running server/client's status.
+//! Local control endpoint for querying a running server/client's status.
 //!
-//! A running VPN server or client exposes a small JSON-over-local-socket
-//! endpoint. The `status` subcommand connects to it, reads a one-shot snapshot,
-//! and prints it. The single-instance lock (`crate::runtime`) guarantees at most
-//! one instance per (role, instance name), so the socket lives at a fixed path
-//! — derived from the role and instance name — next to the lock file.
+//! A running VPN server or client exposes a small local JSON endpoint. The
+//! `status` subcommand connects to it, reads a one-shot snapshot, and prints it.
+//! The single-instance lock (`crate::runtime`) guarantees at most one instance
+//! per (role, instance name), so the endpoint name is derived from that same
+//! role/instance pair.
 //!
 //! # Transport
 //!

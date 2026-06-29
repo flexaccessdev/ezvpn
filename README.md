@@ -316,14 +316,16 @@ sudo ezvpn client start -c home.toml
 sudo ezvpn client status --instance work
 ```
 
-Each running instance exposes a local control socket next to its lock file:
+Each running instance exposes a local control endpoint derived from the same
+role/instance name as its lock file:
 
-- Unix: Unix domain socket
-- Windows: named pipe
+- Unix: Unix domain socket in the runtime directory
+- Windows: named pipe in the global pipe namespace
 
-The runtime directory holds ephemeral state (lock files and control sockets)
-and is machine-global: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
-`%ProgramData%\ezvpn` on Windows. Override it with `EZVPN_RUNTIME_DIR`.
+The runtime directory is machine-global: `/run/ezvpn` on Linux,
+`/var/run/ezvpn` on macOS, and `%ProgramData%\ezvpn` on Windows. It holds lock
+files on every platform and Unix control sockets on Linux/macOS. Override it
+with `EZVPN_RUNTIME_DIR`.
 
 `--default-config` reads its TOML from the machine-global system config
 directory — `/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, and
@@ -340,10 +342,10 @@ instance. Override the cap (in bytes) with
 `EZVPN_LOG_MAX_BYTES`.
 
 Run `status` and `list` as root/Administrator so they resolve the same runtime
-directory as the tunnel process. On Unix, run `stop` the same way. `client list`
-discovers instances by lock file and probes each control socket; stopped clients
-may briefly show as `not responding (stale lock)` until the lock file is reused
-or removed.
+directory and control endpoint names as the tunnel process. On Unix, run `stop`
+the same way. `client list` discovers instances by lock file and probes each
+control endpoint; stopped clients may briefly show as
+`not responding (stale lock)` until the lock file is reused or removed.
 
 ## Routing
 

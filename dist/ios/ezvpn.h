@@ -39,8 +39,8 @@ void ezvpn_init_logging(void);
  * Connect to the server and perform the handshake.
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
- *   {"server_node_id":"<id>","alpn_token":"<token>",
- *    "auth_token":null,"relay_urls":[],"relay_only":false,
+ *   {"server_node_id":"<id>","auth_token":null,
+ *    "relay_urls":[],"relay_only":false,
  *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"]}
  *   routes/routes6 are the split-tunnel prefixes; they are used to compute which
  *   server underlay addresses overlap and must be excluded from the tunnel.

@@ -34,17 +34,19 @@ the fixed `default` instance for `server status` / `server list`.
 
 ## A note on the runtime directory (`status` / `list` / Unix `stop`)
 
-`ezvpn` keeps its per-instance lock file and control socket in a **fixed,
-machine-global runtime directory**: `/run/ezvpn` on Linux, `/var/run/ezvpn` on
-macOS, and `%ProgramData%\ezvpn` on Windows. It is created on first run
-(owner-only, `0700`, on Unix). This directory holds only ephemeral state — on
-Linux `/run` is tmpfs and cleared on reboot. (The
+`ezvpn` keeps its per-instance lock file in a **fixed, machine-global runtime
+directory**: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
+`%ProgramData%\ezvpn` on Windows. Unix control sockets also live in that
+runtime directory; Windows uses global named pipes such as
+`\\.\pipe\ezvpn-client-work`. The directory is created on first run
+(owner-only, `0700`, on Unix). It holds runtime state — on Linux `/run` is
+tmpfs and cleared on reboot. (The
 `--daemon` log file is kept separately under the persistent log directory; see
 above. The service-manager setups below run in the foreground and capture logs
 via the service manager, so they don't use it.)
 
-Because the runtime location is fixed and the daemon runs as root, `status` /
-`list` and Unix `stop` resolve the same place no matter how the service was
+Because the runtime location and control endpoint names are fixed, `status` /
+`list` and Unix `stop` resolve the same instance no matter how the service was
 started. Run `status` / `list` elevated (`sudo` or Administrator), and run Unix
 `stop` with `sudo`. Set `EZVPN_RUNTIME_DIR` only if you need a non-default
 location (e.g. containers or a rootless deployment); if you do, set it
@@ -247,7 +249,7 @@ choices are [NSSM](https://nssm.cc/) and
 Install and manage one service per instance (run from an elevated PowerShell):
 
 ```powershell
-$exe = "C:\Program Files\ezvpn\ezvpn.exe"
+$exe = "$env:ProgramData\ezvpn\ezvpn.exe"
 
 nssm install ezvpn-work $exe client start -c "C:\ProgramData\ezvpn\work.toml" --instance work
 
@@ -279,7 +281,7 @@ For a single client, use the `default` instance — omit `--instance` when
 creating the service and when querying it:
 
 ```powershell
-$exe = "C:\Program Files\ezvpn\ezvpn.exe"
+$exe = "$env:ProgramData\ezvpn\ezvpn.exe"
 
 # no --instance: this is the "default" instance
 nssm install ezvpn $exe client start -c "C:\ProgramData\ezvpn\vpn_client.toml"
@@ -316,7 +318,8 @@ clean log capture, so a service wrapper is preferred for production.
 ## Multiple instances
 
 On every platform, each running client is identified by `--instance <NAME>`
-(default `default`) and gets its own lock file and control socket. Because all
-instances share the one fixed runtime directory, `ezvpn client list` shows them
-together. Lock files are left behind on exit, so a stopped instance may briefly
-show as `not responding (stale lock)` until its lock is reused.
+(default `default`) and gets its own lock file and control endpoint. Because all
+instances share the one fixed runtime directory for lock discovery,
+`ezvpn client list` shows them together. Lock files are left behind on exit, so
+a stopped instance may briefly show as `not responding (stale lock)` until its
+lock is reused.

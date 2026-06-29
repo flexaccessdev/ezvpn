@@ -1,9 +1,10 @@
 //! Runtime filesystem layout and single-instance locking.
 //!
-//! Owns the per-platform locations `ezvpn` uses at runtime — the ephemeral
-//! runtime directory ([`runtime_dir`], for lock files and control sockets) and
-//! the persistent log directory ([`log_dir`]) — plus instance-name validation
-//! and the file-based single-instance lock ([`VpnLock`]).
+//! Owns the per-platform locations `ezvpn` uses at runtime — the runtime
+//! directory ([`runtime_dir`], for lock files and Unix control sockets) and the
+//! persistent log directory ([`log_dir`]) — plus instance-name validation and
+//! the file-based single-instance lock ([`VpnLock`]). Windows control endpoints
+//! are named pipes in the global pipe namespace.
 //!
 //! The lock ensures only one VPN instance runs at a time per (role, instance
 //! name) to prevent routing conflicts and TUN device issues. The client and
@@ -25,7 +26,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Directory for runtime files (lock files and control sockets).
+/// Directory for runtime files.
 ///
 /// A **fixed, machine-global, root-owned** directory per platform — `ezvpn`
 /// runs as root (the tunnel creates a TUN device and edits the routing table),
@@ -33,11 +34,12 @@ use std::path::{Path, PathBuf};
 /// same place no matter how the process was started, so `status`/`stop` always
 /// find the running instance.
 ///
-/// Holds only ephemeral runtime state — `/run` is tmpfs and cleared on reboot.
-/// Persistent files such as the daemon log live in [`log_dir`] instead.
+/// Holds lock files on every platform and Unix control sockets on Linux/macOS.
+/// `/run` is tmpfs and cleared on reboot; persistent files such as the daemon
+/// log live in [`log_dir`] instead.
 ///
 /// Defaults: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
-/// `%ProgramData%\ezvpn` on Windows (lock files only; control sockets there
+/// `%ProgramData%\ezvpn` on Windows (lock files only; Windows control endpoints
 /// are named pipes in a global namespace).
 /// Override with the `EZVPN_RUNTIME_DIR` environment variable (e.g. for
 /// containers, tests, or a rootless deployment); it must be an absolute path
