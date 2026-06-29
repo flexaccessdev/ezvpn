@@ -1202,6 +1202,17 @@ impl VpnServer {
             (None, None) => unreachable!(),
         };
 
+        // Seed the client's bypass routes at onboarding: hand it our candidate
+        // underlay addresses now (reliable handshake stream) so it can pin any a
+        // VPN route would capture immediately, rather than waiting for the first
+        // periodic data-path publication (`run_server_addr_publisher`). The client
+        // filters to VPN-covered IPs and only ever adds, so publishing the full
+        // set — including private/LAN addresses — is safe.
+        let mut server_addrs: Vec<IpAddr> = endpoint.addr().ip_addrs().map(|sa| sa.ip()).collect();
+        server_addrs.sort_unstable();
+        server_addrs.dedup();
+        let response = response.with_server_addrs(server_addrs);
+
         write_message(send, &response.encode()?).await?;
         if let Err(e) = send.finish() {
             log::debug!("Failed to finish handshake stream: {}", e);

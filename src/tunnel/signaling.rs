@@ -175,6 +175,14 @@ pub struct VpnHandshakeResponse {
     /// Rejection reason (if not accepted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
+    /// Server's candidate iroh underlay addresses (`endpoint.addr().ip_addrs()`),
+    /// delivered in the handshake so the client can install bypass routes for any
+    /// a VPN route would capture *at onboarding* — without waiting for the first
+    /// periodic data-path publication (see [`ServerAddrsMsg`]). Ongoing changes
+    /// still arrive via that publication. Empty/absent when the server has not yet
+    /// discovered any (or is an older build): the client falls back to publishing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_addrs: Vec<IpAddr>,
 }
 
 impl VpnHandshakeResponse {
@@ -221,6 +229,7 @@ impl VpnHandshakeResponse {
             network6: None,
             server_ip6: None,
             reject_reason: None,
+            server_addrs: Vec::new(),
         }
     }
 
@@ -250,6 +259,7 @@ impl VpnHandshakeResponse {
             network6: Some(network6),
             server_ip6: Some(server_ip6),
             reject_reason: None,
+            server_addrs: Vec::new(),
         }
     }
 
@@ -277,6 +287,7 @@ impl VpnHandshakeResponse {
             network6: Some(network6),
             server_ip6: Some(server_ip6),
             reject_reason: None,
+            server_addrs: Vec::new(),
         }
     }
 
@@ -298,7 +309,17 @@ impl VpnHandshakeResponse {
             network6: None,
             server_ip6: None,
             reject_reason: Some(reason.into()),
+            server_addrs: Vec::new(),
         }
+    }
+
+    /// Attach the server's candidate underlay addresses to an accepted response.
+    ///
+    /// Builder-style so the per-family constructors stay unchanged; a no-op on a
+    /// rejected response (the client ignores everything but `reject_reason`).
+    pub fn with_server_addrs(mut self, server_addrs: Vec<IpAddr>) -> Self {
+        self.server_addrs = server_addrs;
+        self
     }
 
     /// Encode to bytes for transmission.
@@ -621,6 +642,30 @@ mod tests {
         assert_eq!(decoded.network6, Some(network6));
         assert_eq!(decoded.server_ip6, Some(server_ip6));
         assert_eq!(decoded.reject_reason, None);
+        assert!(decoded.server_addrs.is_empty());
+    }
+
+    #[test]
+    fn test_response_server_addrs_roundtrip() {
+        let addrs = vec![
+            "44.230.20.120".parse::<IpAddr>().expect("parse v4"),
+            "2600:1f13:adc:a0b1:feb9:cb56:f64e:b6f8"
+                .parse::<IpAddr>()
+                .expect("parse v6"),
+        ];
+        let response = VpnHandshakeResponse::accepted(
+            "10.0.0.2".parse().expect("parse IPv4"),
+            "10.0.0.0/24".parse().expect("parse network"),
+            "10.0.0.1".parse().expect("parse server ip"),
+            false,
+            WireTransport::default(),
+            1440,
+        )
+        .with_server_addrs(addrs.clone());
+
+        let encoded = response.encode().expect("encode response");
+        let decoded = VpnHandshakeResponse::decode(&encoded).expect("decode response");
+        assert_eq!(decoded.server_addrs, addrs);
     }
 
     #[test]
@@ -677,6 +722,7 @@ mod tests {
             network6: None,
             server_ip6: None,
             reject_reason: None,
+            server_addrs: Vec::new(),
         };
 
         assert!(!response.is_valid());

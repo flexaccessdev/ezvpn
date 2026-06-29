@@ -128,6 +128,11 @@ pub struct ServerInfo {
     pub transport: WireTransport,
     /// MTU dictated by the server for the client TUN device.
     pub mtu: u16,
+    /// Server's candidate iroh underlay addresses, delivered in the handshake so
+    /// the client can bypass-route any a VPN route would capture at onboarding
+    /// (rather than waiting for the first periodic data-path publication). Empty
+    /// when the server has not yet discovered any, or is an older build.
+    pub server_addrs: Vec<IpAddr>,
 }
 
 /// Network parameters that define the client's TUN device and routing identity.
@@ -420,12 +425,14 @@ impl VpnClient {
         // Create TUN device
         let tun_device = self.create_tun_device(&server_info)?;
 
-        // Bootstrap the iroh relay bypasses BEFORE adding VPN routes: the relay
-        // set is known up front, so the relay fallback path is protected the
-        // moment VPN routes go in, with no blocking wait on path discovery.
-        // This also spawns an event-driven task that adds a bypass for the
-        // server's direct underlay path once iroh selects it; until then traffic
-        // rides the already-bypassed relay, so VPN routes never black-hole iroh.
+        // Bootstrap the iroh bypasses BEFORE adding VPN routes: the relay set is
+        // known up front and the server's candidate underlay addresses arrived in
+        // the handshake, so both the relay fallback and the server's direct path
+        // are protected the moment VPN routes go in — no blocking wait on path
+        // discovery, and no 30s gap until the first periodic publish. The spawned
+        // task then applies the server's ongoing published address sets; until any
+        // address lands, traffic rides the already-bypassed relay, so VPN routes
+        // never black-hole iroh.
         let will_add_routes = (server_info.assigned_ip.is_some() && !self.config.routes.is_empty())
             || (server_info.assigned_ip6.is_some() && !self.config.routes6.is_empty());
         // Hold the bypass-manager task in an abort-on-drop guard: route
@@ -437,7 +444,12 @@ impl VpnClient {
             Option<mpsc::Sender<HashSet<IpAddr>>>,
         ) = if will_add_routes {
             let handles = self
-                .add_iroh_bypass_routes(endpoint, tun_device.name(), relay_urls)
+                .add_iroh_bypass_routes(
+                    endpoint,
+                    tun_device.name(),
+                    relay_urls,
+                    &server_info.server_addrs,
+                )
                 .await;
             (
                 Some(AbortOnDropTask::new(handles.task)),
@@ -683,6 +695,7 @@ impl VpnClient {
             server_gso_enabled: response.server_gso_enabled,
             transport: response.transport,
             mtu: response.mtu,
+            server_addrs: response.server_addrs,
         })
     }
 
@@ -748,6 +761,7 @@ impl VpnClient {
         endpoint: &Endpoint,
         vpn_tun_name: &str,
         relay_urls: &[String],
+        initial_server_addrs: &[IpAddr],
     ) -> BypassRouteHandles {
         // Bypass routes are only needed for iroh peer IPs that a VPN route would
         // otherwise capture, so hand the manager the prefixes about to be installed.
@@ -779,13 +793,17 @@ impl VpnClient {
             underlay_gw6,
         );
 
-        // Eagerly bypass every relay IP (both families) before the caller installs
-        // VPN routes. `update` filters to addresses actually covered by a VPN route.
-        // This is the one-time bootstrap; from here on the only source of new
-        // bypass routes is the address set the server publishes over the data path.
-        let relay_ips = collect_relay_ips(endpoint, relay_urls).await;
-        if !relay_ips.is_empty() {
-            manager.update(relay_ips).await;
+        // Eagerly bypass the bootstrap set before the caller installs VPN routes:
+        // every relay IP (both families), plus the server's candidate underlay
+        // addresses carried in the handshake response. Seeding the server's
+        // addresses here means a direct server address a VPN route would capture
+        // is pinned at onboarding, instead of waiting for the first periodic
+        // data-path publication. `update` filters to addresses actually covered by
+        // a VPN route, so publishing extra (e.g. private/LAN) addresses is safe.
+        let mut bootstrap_ips = collect_relay_ips(endpoint, relay_urls).await;
+        bootstrap_ips.extend(initial_server_addrs.iter().copied());
+        if !bootstrap_ips.is_empty() {
+            manager.update(bootstrap_ips).await;
         }
 
         // Channel feeding the manager the set the server periodically publishes
@@ -1895,6 +1913,7 @@ mod tests {
             server_gso_enabled: true,
             transport: WireTransport::default(),
             mtu: 1280,
+            server_addrs: Vec::new(),
         }
     }
 

@@ -294,14 +294,16 @@ to bypass from exactly two sources:
    the default relay map) for both families and pins each address a VPN route
    would capture. This guarantees the relay fallback path survives route
    installation, with no startup race to wait on (`add_iroh_bypass_routes`).
-2. **Server-published candidate addresses (ongoing, server-driven).** The server
-   publishes its own candidate underlay addresses (`endpoint.addr().ip_addrs()`)
-   to each client over the data path — once on connect, every
+2. **Server-published candidate addresses (server-driven).** The server's own
+   candidate underlay addresses (`endpoint.addr().ip_addrs()`) reach the client
+   in the handshake response (seeded into the manager at onboarding, before VPN
+   routes go in) and then ongoing over the data path — every
    `SERVER_ADDR_PUBLISH_INTERVAL` (30s) for loss tolerance, and promptly whenever
    `Endpoint::watch_addr()` reports a change. The client merges each set into the
    manager. These addresses are authoritative: they need no DNS and no
    path-selection race, so they pre-empt the self-capture of a server address
-   iroh has discovered but not yet selected for the active path.
+   iroh has discovered but not yet selected for the active path. See "Server
+   Address Publication" below.
 
 The client deliberately does **not** watch iroh's per-connection path snapshots
 to discover addresses. That watch was unreliable — it blocked on inline relay
@@ -370,15 +372,25 @@ instead. This is documented for end users in the README "Routing" section.
 
 The server is the authoritative source of its own underlay addresses, so it
 publishes them to each connected client instead of having the client guess from
-iroh path snapshots. A small server → client message (`ServerAddrsMsg`, data
-datagram type `0x01`) carries the candidate IP set from `endpoint.addr()`. A
-per-connection task (`run_server_addr_publisher`) sends it once immediately on
-connect, then every `SERVER_ADDR_PUBLISH_INTERVAL` (30s) as a loss-tolerance
-floor, and promptly on any `Endpoint::watch_addr()` change. It rides the same
-unreliable datagram path as IP traffic and self-terminates when the connection
-closes. The client feeds each received set into its bypass manager (add-only,
-filtered to VPN-covered IPs); a dropped publication is recovered by the next
-tick.
+iroh path snapshots. The candidate IP set comes from `endpoint.addr()` and
+reaches the client two ways:
+
+- **At onboarding, in the handshake response** (`VpnHandshakeResponse.server_addrs`,
+  reliable bi-stream). The client seeds these into its bypass manager during
+  setup — alongside the eager relay bootstrap, before VPN routes are installed —
+  so a direct server address that a VPN route would capture is pinned
+  immediately, with no wait for the first periodic publication.
+- **Ongoing, over the data path** (`ServerAddrsMsg`, datagram type `0x01`). A
+  per-connection task (`run_server_addr_publisher`) sends it once immediately on
+  connect, then every `SERVER_ADDR_PUBLISH_INTERVAL` (30s) as a loss-tolerance
+  floor, and promptly on any `Endpoint::watch_addr()` change. It rides the same
+  unreliable datagram path as IP traffic and self-terminates when the connection
+  closes.
+
+The client feeds every received set (handshake or datagram) into its bypass
+manager (add-only, filtered to VPN-covered IPs); a dropped publication is
+recovered by the next tick, and addresses discovered after onboarding arrive via
+the datagram path.
 
 The feature is wire-compatible and needs no protocol-version bump: the message
 is a new datagram *type*, and a peer that does not understand `0x01` simply drops
