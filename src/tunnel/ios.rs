@@ -25,11 +25,11 @@
 //! 3. [`IosSession::run`] — drive the tunnel over that fd until it ends.
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
@@ -38,11 +38,12 @@ use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
 use crate::transport::endpoint::create_client_endpoint;
 use crate::tunnel::client::{
-    ServerInfo, collect_local_iroh_udp_ports, perform_handshake, run_tunnel,
+    ServerInfo, collect_local_iroh_udp_ports, overlapping_underlay_excludes, perform_handshake,
+    run_tunnel,
 };
 
 /// Connection parameters supplied by the iOS app (built from the FFI JSON).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct IosConfig {
     /// Server's iroh endpoint id (node id), as a string.
     pub server_node_id: String,
@@ -54,19 +55,39 @@ pub struct IosConfig {
     pub relay_urls: Vec<String>,
     /// Force relay-only transport (skip hole punching). Usually false.
     pub relay_only: bool,
+    /// IPv4 prefixes routed through the tunnel (the split-tunnel `includedRoutes`).
+    /// Used to compute which server underlay addresses overlap and must be
+    /// bypassed.
+    pub routes: Vec<Ipv4Net>,
+    /// IPv6 prefixes routed through the tunnel.
+    pub routes6: Vec<Ipv6Net>,
 }
 
-/// The IPv4 parameters the extension needs for `NEPacketTunnelNetworkSettings`.
-#[derive(Debug, Clone, Copy)]
+/// The network parameters the extension needs for `NEPacketTunnelNetworkSettings`.
+///
+/// Each family is optional, mirroring the server's assignment: IPv4-only,
+/// IPv6-only, or dual-stack.
+#[derive(Debug, Clone)]
 pub struct IosNetworkConfig {
-    /// Assigned client VPN address.
-    pub assigned_ip: Ipv4Addr,
-    /// Subnet mask for the assigned address.
-    pub netmask: Ipv4Addr,
-    /// VPN gateway (server's in-subnet address).
-    pub gateway: Ipv4Addr,
+    /// Assigned client VPN IPv4 address.
+    pub assigned_ip: Option<Ipv4Addr>,
+    /// Subnet mask for the assigned IPv4 address.
+    pub netmask: Option<Ipv4Addr>,
+    /// VPN IPv4 gateway (server's in-subnet address).
+    pub gateway: Option<Ipv4Addr>,
+    /// Assigned client VPN IPv6 address.
+    pub assigned_ip6: Option<Ipv6Addr>,
+    /// Prefix length for the assigned IPv6 address.
+    pub prefix_len6: Option<u8>,
+    /// VPN IPv6 gateway (server's in-subnet address).
+    pub gateway6: Option<Ipv6Addr>,
     /// Server-dictated tunnel MTU.
     pub mtu: u16,
+    /// IPv4 server underlay addresses (`/32`) to exclude from the tunnel because
+    /// they overlap a routed prefix (would otherwise self-capture).
+    pub excluded_routes: Vec<String>,
+    /// IPv6 server underlay addresses (`/128`) to exclude, same reason.
+    pub excluded_routes6: Vec<String>,
 }
 
 /// A connected, handshaked-but-not-yet-running iOS tunnel session.
@@ -74,6 +95,11 @@ pub struct IosSession {
     endpoint: Endpoint,
     connection: Connection,
     server_info: ServerInfo,
+    /// IPv4 server underlay `/32`s overlapping a routed prefix (computed at
+    /// connect from the handshake's `server_addrs`).
+    excluded_routes: Vec<String>,
+    /// IPv6 server underlay `/128`s overlapping a routed prefix.
+    excluded_routes6: Vec<String>,
 }
 
 impl IosSession {
@@ -110,20 +136,31 @@ impl IosSession {
         let server_info =
             perform_handshake(&connection, device_id, cfg.auth_token.as_deref()).await?;
 
-        // The MVP is IPv4-only split tunnel; require an IPv4 assignment.
-        if server_info.assigned_ip.is_none() {
-            return Err(VpnError::Signaling(
-                "iOS MVP requires an IPv4 assignment, but the server returned none \
-                 (IPv6-only server?)"
-                    .into(),
-            ));
+        // `perform_handshake` already guarantees at least one family was
+        // assigned, so IPv4-only, IPv6-only, and dual-stack all pass here.
+
+        // Compute the underlay bypass set: server candidate addresses that fall
+        // within a routed prefix and would otherwise self-capture. Applied by
+        // the extension as `excludedRoutes` (see module docs).
+        let (excluded_routes, excluded_routes6) =
+            overlapping_underlay_excludes(&server_info.server_addrs, &cfg.routes, &cfg.routes6);
+        if !excluded_routes.is_empty() || !excluded_routes6.is_empty() {
+            log::info!(
+                "Bypassing overlapping server underlay addresses (reachable only off-tunnel; \
+                 reach the server through the tunnel via its VPN gateway IP): v4={:?} v6={:?}",
+                excluded_routes,
+                excluded_routes6
+            );
         }
 
         log::info!(
-            "iOS handshake OK: ip={:?} net={:?} gw={:?} mtu={}",
+            "iOS handshake OK: ip={:?} net={:?} gw={:?} ip6={:?} net6={:?} gw6={:?} mtu={}",
             server_info.assigned_ip,
             server_info.network,
             server_info.server_ip,
+            server_info.assigned_ip6,
+            server_info.network6,
+            server_info.server_ip6,
             server_info.mtu
         );
 
@@ -131,28 +168,25 @@ impl IosSession {
             endpoint,
             connection,
             server_info,
+            excluded_routes,
+            excluded_routes6,
         })
     }
 
-    /// The IPv4 network parameters for the extension's tunnel settings.
+    /// The network parameters for the extension's tunnel settings, for whichever
+    /// families the server assigned (IPv4, IPv6, or both).
     pub fn network_config(&self) -> VpnResult<IosNetworkConfig> {
-        let assigned_ip = self
-            .server_info
-            .assigned_ip
-            .ok_or_else(|| VpnError::Signaling("missing assigned IPv4".into()))?;
-        let network: Ipv4Net = self
-            .server_info
-            .network
-            .ok_or_else(|| VpnError::Signaling("missing IPv4 network".into()))?;
-        let gateway = self
-            .server_info
-            .server_ip
-            .ok_or_else(|| VpnError::Signaling("missing IPv4 gateway".into()))?;
+        let info = &self.server_info;
         Ok(IosNetworkConfig {
-            assigned_ip,
-            netmask: network.netmask(),
-            gateway,
-            mtu: self.server_info.mtu,
+            assigned_ip: info.assigned_ip,
+            netmask: info.network.map(|n| n.netmask()),
+            gateway: info.server_ip,
+            assigned_ip6: info.assigned_ip6,
+            prefix_len6: info.network6.map(|n| n.prefix_len()),
+            gateway6: info.server_ip6,
+            mtu: info.mtu,
+            excluded_routes: self.excluded_routes.clone(),
+            excluded_routes6: self.excluded_routes6.clone(),
         })
     }
 

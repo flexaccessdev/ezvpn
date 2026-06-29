@@ -40,11 +40,16 @@ void ezvpn_init_logging(void);
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","alpn_token":"<token>",
- *    "auth_token":null,"relay_urls":[],"relay_only":false}
+ *    "auth_token":null,"relay_urls":[],"relay_only":false,
+ *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"]}
+ *   routes/routes6 are the split-tunnel prefixes; they are used to compute which
+ *   server underlay addresses overlap and must be excluded from the tunnel.
  * out_buf/out_len : caller buffer. On success receives the network-config JSON
- *   {"assigned_ip":"10.0.0.2","netmask":"255.255.255.0",
- *    "gateway":"10.0.0.1","mtu":1400}; on failure receives an error message.
- *   Always NUL-terminated (truncated to fit).
+ *   (per-family fields are null when that family was not assigned):
+ *   {"assigned_ip":"10.0.0.2","netmask":"255.255.255.0","gateway":"10.0.0.1",
+ *    "assigned_ip6":"fd00::2","prefix_len6":64,"gateway6":"fd00::1","mtu":1400,
+ *    "excluded_routes":["192.168.1.5/32"],"excluded_routes6":[]}
+ *   On failure receives an error message. Always NUL-terminated (truncated to fit).
  *
  * Returns a non-NULL handle on success, NULL on failure.
  */

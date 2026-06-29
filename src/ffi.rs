@@ -36,6 +36,7 @@
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr;
 
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 use crate::error::VpnResult;
@@ -62,6 +63,29 @@ struct FfiConfig {
     relay_urls: Vec<String>,
     #[serde(default)]
     relay_only: bool,
+    /// IPv4 routed prefixes (CIDR strings); used for overlap-bypass computation.
+    #[serde(default)]
+    routes: Vec<String>,
+    /// IPv6 routed prefixes (CIDR strings).
+    #[serde(default)]
+    routes6: Vec<String>,
+}
+
+/// Parse CIDR strings into typed prefixes, skipping (and logging) malformed ones.
+fn parse_routes<T>(raw: &[String], label: &str) -> Vec<T>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    raw.iter()
+        .filter_map(|s| match s.parse::<T>() {
+            Ok(net) => Some(net),
+            Err(e) => {
+                log::warn!("skipping invalid {label} '{s}': {e}");
+                None
+            }
+        })
+        .collect()
 }
 
 /// Initialize logging. Safe to call multiple times; subsequent calls are no-ops.
@@ -129,6 +153,8 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
         auth_token: cfg.auth_token,
         relay_urls: cfg.relay_urls,
         relay_only: cfg.relay_only,
+        routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route"),
+        routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route"),
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -144,11 +170,18 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
         .network_config()
         .map_err(|e| format!("network config unavailable: {e}"))?;
 
+    // Optional fields serialize to JSON `null` when a family was not assigned,
+    // letting the extension detect IPv4-only / IPv6-only / dual-stack.
     let result_json = serde_json::json!({
-        "assigned_ip": net.assigned_ip.to_string(),
-        "netmask": net.netmask.to_string(),
-        "gateway": net.gateway.to_string(),
+        "assigned_ip": net.assigned_ip.map(|x| x.to_string()),
+        "netmask": net.netmask.map(|x| x.to_string()),
+        "gateway": net.gateway.map(|x| x.to_string()),
+        "assigned_ip6": net.assigned_ip6.map(|x| x.to_string()),
+        "prefix_len6": net.prefix_len6,
+        "gateway6": net.gateway6.map(|x| x.to_string()),
         "mtu": net.mtu,
+        "excluded_routes": net.excluded_routes,
+        "excluded_routes6": net.excluded_routes6,
     })
     .to_string();
 

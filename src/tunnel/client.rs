@@ -1788,6 +1788,36 @@ pub(crate) fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> 
     endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
 }
 
+/// Server underlay addresses in `server_addrs` that fall within a routed prefix,
+/// as host CIDRs. In a split tunnel these would self-capture (the tunnel would
+/// route iroh's own transport packets to the server back into itself); on iOS
+/// they are applied as `excludedRoutes` so the OS keeps them on the underlay.
+///
+/// Returns `(IPv4 /32 strings, IPv6 /128 strings)`. Uses the same
+/// `ipnet::contains` membership test as the desktop `BypassRouteManager`. The
+/// relay set is deliberately ignored: full tunnel is out of scope on iOS, so a
+/// public relay address never overlaps the private routed prefixes.
+///
+/// Only the iOS connect path consumes this (desktop uses `BypassRouteManager`),
+/// so it is dead code on non-iOS builds outside the unit tests.
+#[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
+pub(crate) fn overlapping_underlay_excludes(
+    server_addrs: &[IpAddr],
+    routes4: &[Ipv4Net],
+    routes6: &[Ipv6Net],
+) -> (Vec<String>, Vec<String>) {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for ip in server_addrs {
+        match ip {
+            IpAddr::V4(a) if routes4.iter().any(|n| n.contains(a)) => v4.push(format!("{a}/32")),
+            IpAddr::V6(a) if routes6.iter().any(|n| n.contains(a)) => v6.push(format!("{a}/128")),
+            _ => {}
+        }
+    }
+    (v4, v6)
+}
+
 /// Return true if packet is UDP and either source/destination port matches a blocked port.
 #[inline]
 fn packet_has_local_iroh_udp_port(packet: &[u8], blocked_ports: &HashSet<u16>) -> bool {
@@ -1845,6 +1875,45 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+
+    #[test]
+    fn overlapping_excludes_keeps_only_routed_underlay_addresses() {
+        let server_addrs: Vec<IpAddr> = [
+            "192.168.1.5",        // private v4, inside routed prefix -> excluded
+            "44.230.20.120",      // public v4, outside routes      -> dropped
+            "fd12::5",            // ULA v6, inside routed prefix    -> excluded
+            "2606:4700::1",       // public v6, outside routes       -> dropped
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let routes4: Vec<Ipv4Net> = vec!["192.168.0.0/16".parse().unwrap()];
+        let routes6: Vec<Ipv6Net> = vec!["fd12::/16".parse().unwrap()];
+
+        let (v4, v6) = overlapping_underlay_excludes(&server_addrs, &routes4, &routes6);
+        assert_eq!(v4, vec!["192.168.1.5/32".to_string()]);
+        assert_eq!(v6, vec!["fd12::5/128".to_string()]);
+    }
+
+    #[test]
+    fn overlapping_excludes_empty_when_no_routes_or_no_overlap() {
+        let server_addrs: Vec<IpAddr> =
+            ["192.168.1.5", "fd12::5"].iter().map(|s| s.parse().unwrap()).collect();
+
+        // No routes at all.
+        assert_eq!(
+            overlapping_underlay_excludes(&server_addrs, &[], &[]),
+            (Vec::new(), Vec::new())
+        );
+
+        // Routes that don't contain the server addresses.
+        let routes4: Vec<Ipv4Net> = vec!["10.0.0.0/8".parse().unwrap()];
+        let routes6: Vec<Ipv6Net> = vec!["fd99::/16".parse().unwrap()];
+        assert_eq!(
+            overlapping_underlay_excludes(&server_addrs, &routes4, &routes6),
+            (Vec::new(), Vec::new())
+        );
+    }
 
     fn bypass_manager(routes4: &[&str], routes6: &[&str]) -> BypassRouteManager {
         BypassRouteManager::new(
