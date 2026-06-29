@@ -39,6 +39,7 @@ pub const DEFAULT_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 /// Server-only configuration: the server applies it to its own endpoint and
 /// dictates the resolved values to clients during the handshake.
 #[derive(Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TransportTuning {
     #[serde(default)]
     pub congestion_controller: CongestionController,
@@ -59,18 +60,12 @@ impl TransportTuning {
     }
 }
 
-/// Shared VPN iroh configuration fields (used by both server and client).
-#[derive(Deserialize, Default, Clone)]
-pub struct IrohSharedConfig {
-    pub relay_urls: Option<Vec<String>>,
-    pub dns_server: Option<String>,
-}
-
 /// VPN network configuration (server-assigned addressing). `[network]` section.
 ///
 /// These describe the VPN tunnel itself, not the iroh transport, so they live
 /// outside `[iroh]`.
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerNetworkConfig {
     pub network: Option<String>,
     pub server_ip: Option<String>,
@@ -83,6 +78,7 @@ pub struct ServerNetworkConfig {
 
 /// VPN client authentication tokens accepted by the server. `[auth]` section.
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerAuthConfig {
     pub auth_tokens: Option<Vec<String>>,
     pub auth_tokens_file: Option<PathBuf>,
@@ -90,18 +86,20 @@ pub struct ServerAuthConfig {
 
 /// iroh transport and identity configuration (server). `[iroh]` section.
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct VpnServerIrohConfig {
     pub secret_file: Option<PathBuf>,
     pub alpn_token: Option<String>,
     pub alpn_token_file: Option<PathBuf>,
     #[serde(default)]
     pub transport: TransportTuning,
-    #[serde(flatten)]
-    pub shared: IrohSharedConfig,
+    pub relay_urls: Option<Vec<String>>,
+    pub dns_server: Option<String>,
 }
 
 /// VPN routes the client installs once connected. `[network]` section.
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClientNetworkConfig {
     pub routes: Option<Vec<String>>,
     pub routes6: Option<Vec<String>>,
@@ -109,6 +107,7 @@ pub struct ClientNetworkConfig {
 
 /// Client authentication token presented to the server. `[auth]` section.
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClientAuthConfig {
     pub auth_token: Option<String>,
     pub auth_token_file: Option<PathBuf>,
@@ -116,15 +115,17 @@ pub struct ClientAuthConfig {
 
 /// iroh transport and identity configuration (client). `[iroh]` section.
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct VpnClientIrohConfig {
     pub server_node_id: Option<String>,
     pub alpn_token: Option<String>,
     pub alpn_token_file: Option<PathBuf>,
-    #[serde(flatten)]
-    pub shared: IrohSharedConfig,
+    pub relay_urls: Option<Vec<String>>,
+    pub dns_server: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct VpnServerConfig {
     pub role: Option<Role>,
     #[serde(default)]
@@ -141,6 +142,7 @@ pub struct VpnServerConfig {
 }
 
 #[derive(Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct VpnClientConfig {
     pub role: Option<Role>,
     #[serde(default)]
@@ -544,8 +546,8 @@ impl ResolvedVpnServerConfig {
             ip6_strategy: net.ip6_strategy,
             mtu,
             secret_file: iroh.secret_file.clone(),
-            relay_urls: iroh.shared.relay_urls.clone().unwrap_or_default(),
-            dns_server: iroh.shared.dns_server.clone(),
+            relay_urls: iroh.relay_urls.clone().unwrap_or_default(),
+            dns_server: iroh.dns_server.clone(),
             auth_tokens: auth.auth_tokens.clone().unwrap_or_default(),
             auth_tokens_file: auth.auth_tokens_file.clone(),
             alpn_token: iroh.alpn_token.clone(),
@@ -613,11 +615,11 @@ impl VpnClientConfigBuilder {
                 if iroh.alpn_token_file.is_some() {
                     self.alpn_token_file = iroh.alpn_token_file.clone();
                 }
-                if iroh.shared.relay_urls.is_some() {
-                    self.relay_urls = iroh.shared.relay_urls.clone();
+                if iroh.relay_urls.is_some() {
+                    self.relay_urls = iroh.relay_urls.clone();
                 }
-                if iroh.shared.dns_server.is_some() {
-                    self.dns_server = iroh.shared.dns_server.clone();
+                if iroh.dns_server.is_some() {
+                    self.dns_server = iroh.dns_server.clone();
                 }
             }
             if cfg.auth.auth_token.is_some() {
@@ -856,10 +858,10 @@ dns_server = "none"
         assert_eq!(config.auth.auth_token.as_deref(), Some("token"));
         let iroh = config.iroh.as_ref().unwrap();
         assert_eq!(
-            iroh.shared.relay_urls.as_deref(),
+            iroh.relay_urls.as_deref(),
             Some(&["https://relay.example.com".to_string()][..])
         );
-        assert_eq!(iroh.shared.dns_server.as_deref(), Some("none"));
+        assert_eq!(iroh.dns_server.as_deref(), Some("none"));
 
         let resolved = VpnClientConfigBuilder::new()
             .apply_defaults()
@@ -868,6 +870,79 @@ dns_server = "none"
             .unwrap();
         assert_eq!(resolved.relay_urls, ["https://relay.example.com"]);
         assert_eq!(resolved.dns_server.as_deref(), Some("none"));
+    }
+
+    /// A typo in a top-level key must be rejected, not silently ignored.
+    #[test]
+    fn test_unknown_top_level_key_rejected() {
+        let err = toml::from_str::<VpnClientConfig>(
+            r#"
+role = "vpnclient"
+auto_reconnnect = true
+"#,
+        )
+        .err()
+        .expect("typo'd top-level key must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field"), "unexpected error: {msg}");
+        assert!(msg.contains("auto_reconnnect"), "unexpected error: {msg}");
+    }
+
+    /// A typo in the `[iroh]` section must be rejected (e.g. `relay_url` instead
+    /// of `relay_urls`) — this section used to flatten shared fields, which
+    /// blocked `deny_unknown_fields`.
+    #[test]
+    fn test_unknown_iroh_key_rejected() {
+        let err = toml::from_str::<VpnClientConfig>(
+            r#"
+role = "vpnclient"
+
+[iroh]
+server_node_id = "x"
+relay_url = ["https://relay.example.com"]
+"#,
+        )
+        .err()
+        .expect("typo'd [iroh] key must be rejected");
+        assert!(
+            err.to_string().contains("relay_url"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A typo in a `[network]` key (`route` instead of `routes`) must be rejected.
+    #[test]
+    fn test_unknown_network_key_rejected() {
+        let err = toml::from_str::<VpnClientConfig>(
+            r#"
+role = "vpnclient"
+
+[network]
+route = ["10.0.0.0/8"]
+"#,
+        )
+        .err()
+        .expect("typo'd [network] key must be rejected");
+        assert!(err.to_string().contains("route"), "unexpected error: {err}");
+    }
+
+    /// Server-side: a typo under `[iroh.transport]` must be rejected too.
+    #[test]
+    fn test_unknown_transport_key_rejected() {
+        let err = toml::from_str::<VpnServerConfig>(
+            r#"
+role = "vpnserver"
+
+[iroh.transport]
+recieve_window = 1048576
+"#,
+        )
+        .err()
+        .expect("typo'd [iroh.transport] key must be rejected");
+        assert!(
+            err.to_string().contains("recieve_window"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

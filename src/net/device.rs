@@ -2287,55 +2287,10 @@ pub async fn add_bypass_route(
 ) -> VpnResult<BypassRouteGuard> {
     let peer_ip = peer_addr.ip();
 
-    // Query current route to this IP before adding any VPN routes
-    let mut route_info = query_route_for_ip(peer_ip).await?;
-
-    if let Some(disallowed) = disallow_device
-        && route_info.device == disallowed
-    {
-        // The route already resolves through the VPN tunnel. Re-pin it via the
-        // underlay gateway captured before the VPN routes went up, if we have
-        // one; otherwise refuse rather than pin the peer's underlay IP into the
-        // tunnel (self-capture).
-        match underlay_fallback {
-            Some(fb) if fb.gateway.is_some() => {
-                log::info!(
-                    "Bypass route for {} resolved via VPN tunnel {}; re-pinning via captured underlay gateway {} (dev {})",
-                    peer_ip,
-                    disallowed,
-                    fb.gateway_str.as_deref().unwrap_or("?"),
-                    fb.device
-                );
-                route_info = BypassRouteInfo {
-                    peer_ip,
-                    device: fb.device.clone(),
-                    gateway: fb.gateway,
-                    gateway_str: fb.gateway_str.clone(),
-                    if_index: fb.if_index,
-                };
-            }
-            _ => {
-                return Err(VpnError::tun_device(format!(
-                    "Refusing bypass route for {}: route lookup resolved via VPN tunnel interface {} (no captured underlay gateway to fall back to)",
-                    peer_ip, disallowed
-                )));
-            }
-        }
-    }
-
-    // Always pin the bypass via the resolved next-hop gateway. Without a gateway
-    // we would install a link-scope host route (macOS `-interface`, Linux `dev`
-    // only), which tells the kernel the peer is directly on-link; for a remote
-    // underlay address that black-holes it and — because the poisoned route then
-    // makes future `route get` lookups return no gateway — breaks it on every
-    // later run. Refuse instead; the caller keeps existing routes and retries.
-    if route_info.gateway.is_none() {
-        return Err(VpnError::tun_device(format!(
-            "Refusing bypass route for {}: no next-hop gateway resolved via {} \
-             (would create a link-scope route that black-holes the address)",
-            peer_ip, route_info.device
-        )));
-    }
+    // Query current route to this IP before adding any VPN routes, then apply
+    // the captured-underlay-gateway fallback if the queried route is unusable.
+    let route_info = query_route_for_ip(peer_ip).await?;
+    let route_info = resolve_bypass_route_info(route_info, disallow_device, underlay_fallback)?;
 
     log::info!(
         "Adding bypass route for ICE peer {} via {} (gateway: {:?})",
@@ -2357,6 +2312,89 @@ pub async fn add_bypass_route(
         // pre-existing route belongs to the system and must be left intact.
         owned: outcome == RouteAddOutcome::Added,
     })
+}
+
+/// Decide the route info to use for a bypass route, applying the captured
+/// underlay-gateway fallback when the freshly queried route is unusable.
+///
+/// Two cases need the fallback, both re-pinning via the underlay default gateway
+/// captured before the VPN routes went up:
+///
+/// 1. **Resolves through the VPN tunnel** (`route_info.device == disallow_device`):
+///    a direct iroh path discovered after the VPN routes went up, so `route get`
+///    now follows the tunnel; following it would self-capture the peer's underlay
+///    traffic.
+/// 2. **No next-hop gateway** (`route_info.gateway.is_none()`) while resolving via
+///    a physical interface: typically a transient startup state where the per-IP
+///    route is a cloned entry off the default route whose next hop has not been
+///    populated yet (observed on macOS as `route get` returning only
+///    `interface:`). Installing a gateway-less route would create an
+///    address-black-holing link-scope host route, so we re-pin via the captured
+///    gateway instead — a relay/server underlay IP is reached via the default
+///    route, so that gateway is the correct next hop.
+///
+/// Returns an error only when the route is unusable *and* there is no usable
+/// captured gateway to fall back to. Pure (no I/O) so it is unit-testable.
+fn resolve_bypass_route_info(
+    mut route_info: BypassRouteInfo,
+    disallow_device: Option<&str>,
+    underlay_fallback: Option<&UnderlayGateway>,
+) -> VpnResult<BypassRouteInfo> {
+    let peer_ip = route_info.peer_ip;
+
+    let repin_via_fallback = |route_info: &mut BypassRouteInfo, fb: &UnderlayGateway| {
+        route_info.device = fb.device.clone();
+        route_info.gateway = fb.gateway;
+        route_info.gateway_str = fb.gateway_str.clone();
+        route_info.if_index = fb.if_index;
+    };
+
+    if disallow_device.is_some_and(|disallowed| route_info.device == disallowed) {
+        // Case 1: resolves through the VPN tunnel.
+        match underlay_fallback {
+            Some(fb) if fb.gateway.is_some() => {
+                log::info!(
+                    "Bypass route for {} resolved via VPN tunnel {}; re-pinning via captured underlay gateway {} (dev {})",
+                    peer_ip,
+                    route_info.device,
+                    fb.gateway_str.as_deref().unwrap_or("?"),
+                    fb.device
+                );
+                repin_via_fallback(&mut route_info, fb);
+            }
+            _ => {
+                return Err(VpnError::tun_device(format!(
+                    "Refusing bypass route for {}: route lookup resolved via VPN tunnel interface {} (no captured underlay gateway to fall back to)",
+                    peer_ip, route_info.device
+                )));
+            }
+        }
+    } else if route_info.gateway.is_none() {
+        // Case 2: physical interface but no next-hop gateway.
+        match underlay_fallback {
+            Some(fb) if fb.gateway.is_some() => {
+                log::info!(
+                    "Bypass route for {} resolved via {} with no next-hop gateway; \
+                     falling back to captured underlay gateway {} (dev {})",
+                    peer_ip,
+                    route_info.device,
+                    fb.gateway_str.as_deref().unwrap_or("?"),
+                    fb.device
+                );
+                repin_via_fallback(&mut route_info, fb);
+            }
+            _ => {
+                return Err(VpnError::tun_device(format!(
+                    "Refusing bypass route for {}: no next-hop gateway resolved via {} \
+                     and no captured underlay gateway to fall back to \
+                     (would create a link-scope route that black-holes the address)",
+                    peer_ip, route_info.device
+                )));
+            }
+        }
+    }
+
+    Ok(route_info)
 }
 
 /// Implementation of adding a bypass route (Linux).
@@ -2793,6 +2831,80 @@ mod tests {
 
         let specific: Ipv6Net = "2600:1f13:adc:a000::/56".parse().unwrap();
         assert_eq!(expand_default_route6(specific), vec![specific]);
+    }
+
+    /// Build a `BypassRouteInfo` for `resolve_bypass_route_info` tests.
+    fn test_route_info(device: &str, gateway: Option<&str>) -> BypassRouteInfo {
+        BypassRouteInfo {
+            peer_ip: "203.0.113.7".parse().unwrap(),
+            device: device.to_string(),
+            gateway: gateway.map(|g| g.parse().unwrap()),
+            gateway_str: gateway.map(|g| g.to_string()),
+            if_index: None,
+        }
+    }
+
+    /// Build an `UnderlayGateway` for `resolve_bypass_route_info` tests.
+    fn test_underlay(device: &str, gateway: Option<&str>) -> UnderlayGateway {
+        UnderlayGateway {
+            device: device.to_string(),
+            gateway: gateway.map(|g| g.parse().unwrap()),
+            gateway_str: gateway.map(|g| g.to_string()),
+            if_index: None,
+        }
+    }
+
+    #[test]
+    fn resolve_bypass_keeps_usable_route() {
+        // A normal route via a physical interface with a gateway is used as-is.
+        let out = resolve_bypass_route_info(test_route_info("en0", Some("10.0.0.1")), Some("utun8"), None)
+            .expect("usable route must be accepted");
+        assert_eq!(out.device, "en0");
+        assert_eq!(out.gateway, Some("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolve_bypass_repins_tunnel_route_via_fallback() {
+        // Route resolved through the VPN tunnel -> re-pinned via the captured
+        // underlay gateway (the direct-path-after-routes case).
+        let fb = test_underlay("en0", Some("10.0.0.1"));
+        let out = resolve_bypass_route_info(test_route_info("utun8", Some("10.99.0.1")), Some("utun8"), Some(&fb))
+            .expect("tunnel route must re-pin via fallback");
+        assert_eq!(out.device, "en0");
+        assert_eq!(out.gateway, Some("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolve_bypass_refuses_tunnel_route_without_fallback() {
+        assert!(
+            resolve_bypass_route_info(test_route_info("utun8", Some("10.99.0.1")), Some("utun8"), None)
+                .is_err()
+        );
+    }
+
+    /// Regression for the full-tunnel outage: a relay IP whose route resolves via
+    /// the physical interface but has no next-hop gateway (the transient
+    /// cloned-route startup state) must fall back to the captured underlay
+    /// gateway, not be refused.
+    #[test]
+    fn resolve_bypass_falls_back_when_gateway_missing() {
+        let fb = test_underlay("en8", Some("10.22.32.1"));
+        let out = resolve_bypass_route_info(test_route_info("en8", None), Some("utun8"), Some(&fb))
+            .expect("gateway-less route must fall back to underlay gateway");
+        assert_eq!(out.device, "en8");
+        assert_eq!(out.gateway, Some("10.22.32.1".parse().unwrap()));
+        assert_eq!(out.gateway_str.as_deref(), Some("10.22.32.1"));
+    }
+
+    #[test]
+    fn resolve_bypass_refuses_gateway_missing_without_usable_fallback() {
+        // No fallback at all.
+        assert!(resolve_bypass_route_info(test_route_info("en8", None), Some("utun8"), None).is_err());
+        // A fallback that itself has no gateway is not usable.
+        let fb = test_underlay("en8", None);
+        assert!(
+            resolve_bypass_route_info(test_route_info("en8", None), Some("utun8"), Some(&fb)).is_err()
+        );
     }
 
     #[test]

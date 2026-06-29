@@ -8,39 +8,45 @@ use iroh::TransportAddr;
 use iroh::endpoint::{Connection, PathList};
 use tokio::task::JoinHandle;
 
-/// Format connection path info for display, showing selected paths with RTT.
+/// Format connection path info for display, showing *all* paths with RTT and
+/// marking which is selected.
+///
+/// All paths are listed (not just the selected one) so a direct path that iroh
+/// has discovered but not selected — e.g. when direct-path bypass is disabled
+/// and the direct path is self-captured into the tunnel — is still visible in
+/// `ezvpn client status` and the `Connection:` log line.
 pub fn format_connection_paths(paths: &PathList<'_>) -> String {
     if paths.is_empty() {
         return "establishing...".to_string();
     }
     let parts: Vec<String> = paths
         .iter()
-        .filter(|p| p.is_selected())
         .map(|path| {
             let rtt = path.rtt();
+            let sel = if path.is_selected() { " (selected)" } else { "" };
             match path.remote_addr() {
-                TransportAddr::Ip(addr) => format!("Direct {} (rtt {:.0?})", addr, rtt),
-                TransportAddr::Relay(url) => format!("Relay {} (rtt {:.0?})", url, rtt),
-                other => format!("{:?} (rtt {:.0?})", other, rtt),
+                TransportAddr::Ip(addr) => format!("Direct {}{} (rtt {:.0?})", addr, sel, rtt),
+                TransportAddr::Relay(url) => format!("Relay {}{} (rtt {:.0?})", url, sel, rtt),
+                other => format!("{:?}{} (rtt {:.0?})", other, sel, rtt),
             }
         })
         .collect();
     if parts.is_empty() {
-        "no selected path".to_string()
+        "no paths".to_string()
     } else {
         parts.join(", ")
     }
 }
 
-/// Key identifying the selected-path topology, excluding the volatile RTT,
-/// so we only log when the path actually changes.
+/// Key identifying the full path topology (all paths plus which is selected),
+/// excluding the volatile RTT, so we only log when the path set actually
+/// changes — including when a non-selected direct candidate appears or goes.
 fn paths_key(paths: &PathList<'_>) -> (bool, Vec<String>) {
-    let selected = paths
+    let all = paths
         .iter()
-        .filter(|p| p.is_selected())
-        .map(|p| format!("{:?}", p.remote_addr()))
+        .map(|p| format!("{:?}{}", p.remote_addr(), if p.is_selected() { "*" } else { "" }))
         .collect();
-    (paths.is_empty(), selected)
+    (paths.is_empty(), all)
 }
 
 /// RAII guard that aborts the background path watcher task on drop.
