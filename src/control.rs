@@ -739,13 +739,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// A per-call, filesystem-safe instance name (`[A-Za-z0-9_]`). Including the
-    /// PID and a process-local counter keeps lock files and sockets from
-    /// colliding with other tests, leftover files, or a concurrent `cargo test`.
+    /// A per-call, filesystem-safe instance name (`[A-Za-z0-9_]`). A
+    /// process-local counter keeps names unique within a run; cross-process
+    /// isolation comes for free from the per-PID test `runtime_dir`, so the PID
+    /// is deliberately *not* repeated here. Keeping the name short matters: the
+    /// full Unix-socket path must stay under macOS's ~104-char `SUN_LEN` limit,
+    /// and the temp dir already eats most of that budget.
     fn unique_instance(prefix: &str) -> String {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        format!("{prefix}_{}_{}", std::process::id(), n)
+        format!("{prefix}_{n}")
     }
 
     #[test]
@@ -873,7 +876,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn listener_serves_a_snapshot_to_a_querier() {
-        let instance = unique_instance("listener");
+        let instance = unique_instance("lstn");
         // Query before any listener exists: not running.
         assert!(
             query_status(LockRole::Server, &instance)
@@ -940,7 +943,7 @@ mod tests {
         // A running instance has both a lock file (discovery) and a listener
         // (the probe). Use a per-run-unique name so other tests' lock files and
         // concurrent runs can't matter — we assert membership, not the exact set.
-        let instance = unique_instance("ctl_list_ok");
+        let instance = unique_instance("lok");
         let _lock = VpnLock::acquire(LockRole::Client, &instance).expect("acquire lock");
         let handle = ClientStatusHandle::new(instance.clone(), "server-node".into(), 0x1234);
         let probe = handle.clone();
@@ -973,7 +976,7 @@ mod tests {
         // An instance whose socket exists and accepts a connection but replies
         // with a malformed (non-JSON) response: this is a probe *error*, not a
         // stale lock, and must not be reported as "stale".
-        let instance = unique_instance("ctl_list_err");
+        let instance = unique_instance("lerr");
         let _lock = VpnLock::acquire(LockRole::Client, &instance).expect("acquire lock");
         let path = socket_path(LockRole::Client, &instance);
         let _ = std::fs::remove_file(&path);
