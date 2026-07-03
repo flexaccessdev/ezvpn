@@ -395,6 +395,70 @@ impl TunDevice {
     }
 }
 
+/// Actionable message shown when TUN creation is denied for lack of privileges.
+#[cfg(target_os = "linux")]
+const TUN_PERMISSION_HELP: &str =
+    "insufficient privileges to create a TUN device: run as root (e.g. via sudo) or grant \
+     CAP_NET_ADMIN to the binary (sudo setcap cap_net_admin+ep <path-to-ezvpn>)";
+#[cfg(target_os = "macos")]
+const TUN_PERMISSION_HELP: &str =
+    "insufficient privileges to create a utun device: run as root (e.g. via sudo)";
+
+/// Fail fast if this process cannot create a TUN device for lack of privileges.
+///
+/// TUN creation needs elevated privileges (root, or `CAP_NET_ADMIN` on Linux),
+/// but in the normal flow that is only discovered *late*: the client creates its
+/// TUN device only after connecting to the server and completing the handshake,
+/// and the server only after opening its iroh endpoint. Without this preflight a
+/// privilege problem surfaces after a wasted network round trip (and, for the
+/// client daemon, after the process has already forked into the background).
+///
+/// The `start` paths call this up front — before any network connection or
+/// daemonization — so the error lands immediately in the foreground. It creates
+/// a throwaway, unconfigured (nameless, address-less, not-up) TUN device and
+/// drops it right away, exercising exactly the privileged syscall that gates TUN
+/// creation on each platform:
+/// - Linux: `open("/dev/net/tun")` + `TUNSETIFF`
+/// - macOS: `connect()` on a `PF_SYSTEM` utun control socket
+///
+/// Only a *permission* failure is fatal here; any other failure (or Windows,
+/// whose wintun driver reports privilege problems through a different path) is
+/// left for [`TunDevice::create`] to report with the full device configuration.
+#[cfg(not(target_os = "ios"))]
+pub fn ensure_tun_permission() -> VpnResult<()> {
+    // Windows (wintun) surfaces privilege problems through a driver-specific
+    // error path and needs the wintun runtime just to attempt creation; skip the
+    // preflight there and defer to TunDevice::create.
+    #[cfg(target_os = "windows")]
+    {
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        match tun::create(&Configuration::default()) {
+            Ok(device) => {
+                // The device is non-persistent, so dropping it (closing the fd)
+                // tears the ephemeral interface back down immediately.
+                drop(device);
+                Ok(())
+            }
+            Err(tun::Error::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err(VpnError::tun_device_with_source(TUN_PERMISSION_HELP, e))
+            }
+            // Non-permission failures are not this check's concern: defer to the
+            // real, fully-configured TunDevice::create so preflight never blocks
+            // startup on an unrelated (or transient) error.
+            Err(e) => {
+                log::debug!(
+                    "TUN privilege preflight inconclusive (non-permission error, deferring to \
+                     device creation): {e}"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn configure_linux_tun_offload(device: &AsyncDevice, enable_gso: bool) -> TunOffloadStatus {
     let fd = device.as_raw_fd();
