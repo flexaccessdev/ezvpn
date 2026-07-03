@@ -98,7 +98,7 @@ where
 
 /// Initialize logging. Safe to call multiple times; subsequent calls are no-ops.
 ///
-/// Reads `RUST_LOG` (defaults to `info`). On iOS the output goes to stderr,
+/// Reads `RUST_LOG` (defaults to `info,iroh=warn,tracing=warn`). On iOS the output goes to stderr,
 /// which the system captures into the unified log / Console.
 ///
 /// # Safety
@@ -106,7 +106,7 @@ where
 #[unsafe(no_mangle)]
 pub extern "C" fn ezvpn_init_logging() {
     let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
+        env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
     )
     .try_init();
 }

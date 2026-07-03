@@ -467,6 +467,12 @@ fn prepare_client_start(
         (true, true) => unreachable!(), // guarded by assert above
     };
 
+    // Fail fast if we lack the privileges to create a TUN device, before opening
+    // any network connection or (with --daemon) forking into the background. The
+    // client otherwise only discovers this after connecting to the server and
+    // completing the handshake.
+    ezvpn::net::device::ensure_tun_permission()?;
+
     // Build resolved config: defaults -> config file -> CLI
     VpnClientConfigBuilder::new()
         .apply_defaults()
@@ -840,6 +846,11 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         tun_writer_channel_size: resolved.tun_writer_channel_size,
         disable_spoofing_check: resolved.disable_spoofing_check,
     };
+
+    // Fail fast if we lack the privileges to create the TUN device, before
+    // opening the iroh endpoint. The server otherwise only discovers this in
+    // setup_tun() after the endpoint is up.
+    ezvpn::net::device::ensure_tun_permission()?;
 
     // Create iroh endpoint for signaling.
     // relay_only is hardcoded to false: VPN traffic is high-bandwidth and latency-sensitive,
