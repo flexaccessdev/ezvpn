@@ -461,6 +461,28 @@ graph TB
     style F fill:#FFF9C4
 ```
 
+#### Local Control Endpoint
+
+Each running instance serves a local status endpoint (Unix domain socket in the
+runtime directory; Windows named pipe). The protocol is **request-free and
+read-only**: on connect, the listener writes one JSON status snapshot and
+closes — a connection cannot send anything the daemon acts on.
+
+Because of that, the endpoint is deliberately **world-connectable** so
+`status`/`list` work without sudo:
+
+- Unix: the runtime directory is `0755` (world-traversable, root-writable only)
+  and the socket is `0666` (`connect(2)` needs write permission on the socket
+  inode).
+- Windows: the pipe is created outbound-only (`PIPE_ACCESS_OUTBOUND`) and the
+  querier opens it read-only, which the default pipe DACL grants to Everyone.
+
+Mutation is out-of-band: `client stop` reads the PID from the lock file and
+sends SIGTERM, which still requires root (signaling a root-owned process). The
+accepted trade-off is that any local user can read VPN status metadata
+(endpoint IDs, assigned IPs, connection state) — comparable to what `ifconfig`
+and the routing table already reveal locally.
+
 #### ALPN and Protocol Versioning
 
 There are two independent version numbers, checked at two different layers:

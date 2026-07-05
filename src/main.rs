@@ -65,6 +65,10 @@ enum Command {
         /// Overwrite existing file if it exists
         #[arg(long)]
         force: bool,
+
+        /// Output the result as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Show the server's public EndpointId derived from a private key
     ///
@@ -73,6 +77,10 @@ enum Command {
         /// Path to the private key file
         #[arg(short, long)]
         secret_file: PathBuf,
+
+        /// Output the result as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Generate a client authentication token
     ///
@@ -82,6 +90,10 @@ enum Command {
         /// Number of tokens to generate (default: 1)
         #[arg(short, long, default_value = "1")]
         count: usize,
+
+        /// Output the tokens as a JSON array
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -195,6 +207,10 @@ enum ClientAction {
         /// Instance name of the client to stop (see `client start --instance`).
         #[arg(long, default_value = "default")]
         instance: String,
+
+        /// Output the result as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Query the status of the running VPN client on this host.
     Status {
@@ -345,18 +361,27 @@ fn main() -> Result<()> {
         }
 
         // Synchronous commands: no Tokio runtime is ever created.
-        Command::GenerateServerKey { output, force } => {
+        Command::GenerateServerKey {
+            output,
+            force,
+            json,
+        } => {
             init_logger();
-            secret::generate_secret(expand_tilde(&output), force)
+            secret::generate_secret(expand_tilde(&output), force, json)
         }
-        Command::ShowServerId { secret_file } => {
+        Command::ShowServerId { secret_file, json } => {
             init_logger();
-            secret::show_id(expand_tilde(&secret_file))
+            secret::show_id(expand_tilde(&secret_file), json)
         }
-        Command::GenerateAuthToken { count } => {
+        Command::GenerateAuthToken { count, json } => {
             init_logger();
-            for _ in 0..count {
-                println!("{}", auth::generate_token());
+            let tokens: Vec<String> = (0..count).map(|_| auth::generate_token()).collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tokens)?);
+            } else {
+                for token in &tokens {
+                    println!("{token}");
+                }
             }
             Ok(())
         }
@@ -408,8 +433,8 @@ async fn run_async(command: Command) -> Result<()> {
             action: ServerAction::List { json },
         } => show_list(LockRole::Server, json).await,
         Command::Client {
-            action: ClientAction::Stop { instance },
-        } => stop_client(&instance).await,
+            action: ClientAction::Stop { instance, json },
+        } => stop_client(&instance, json).await,
         Command::Client {
             action: ClientAction::Status { json, instance },
         } => {
@@ -701,15 +726,42 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// One-shot result document for `client stop --json`. `pid` is omitted when
+/// the instance was not running.
+#[cfg(unix)]
+#[derive(serde::Serialize)]
+struct StopReport<'a> {
+    instance: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    /// `"not_running"` | `"stopped"` | `"signal_sent"` (signaled, but still
+    /// shutting down when the wait timed out).
+    result: &'static str,
+}
+
 /// Stop a running VPN client by signaling its process with SIGTERM. The client
 /// catches the signal and shuts down gracefully (releasing its lock, removing
-/// the status socket, and tearing down the TUN device).
+/// the status socket, and tearing down the TUN device). With `json`, prints a
+/// single [`StopReport`] instead of the human progress lines.
 #[cfg(unix)]
-async fn stop_client(instance: &str) -> Result<()> {
+async fn stop_client(instance: &str, json: bool) -> Result<()> {
     runtime::validate_instance_name(instance)?;
+
+    let report = |pid: Option<u32>, result: &'static str| -> Result<()> {
+        let text = serde_json::to_string_pretty(&StopReport {
+            instance,
+            pid,
+            result,
+        })?;
+        println!("{text}");
+        Ok(())
+    };
 
     // Confirm an instance is actually serving before signaling a PID.
     if control::query_status(LockRole::Client, instance).await?.is_none() {
+        if json {
+            return report(None, "not_running");
+        }
         println!("ezvpn client (instance {instance}) is not running.");
         return Ok(());
     }
@@ -723,22 +775,30 @@ async fn stop_client(instance: &str) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("failed to signal client pid {pid}"));
     }
-    println!("Sent stop signal to client (instance {instance}, pid {pid}).");
+    if !json {
+        println!("Sent stop signal to client (instance {instance}, pid {pid}).");
+    }
 
     // Best-effort: wait briefly for the process to exit.
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if control::query_status(LockRole::Client, instance).await?.is_none() {
+            if json {
+                return report(Some(pid), "stopped");
+            }
             println!("Client stopped.");
             return Ok(());
         }
+    }
+    if json {
+        return report(Some(pid), "signal_sent");
     }
     println!("Stop signal sent; client did not exit within 5s (still shutting down?).");
     Ok(())
 }
 
 #[cfg(not(unix))]
-async fn stop_client(_instance: &str) -> Result<()> {
+async fn stop_client(_instance: &str, _json: bool) -> Result<()> {
     anyhow::bail!("client stop is only supported on Unix");
 }
 
@@ -1028,6 +1088,25 @@ mod tests {
             DAEMON_LOG_MAX_BYTES
         );
         assert_eq!(parse_log_max_bytes(Some(OsStr::new("-5"))), DAEMON_LOG_MAX_BYTES);
+    }
+
+    #[test]
+    fn stop_report_omits_pid_only_when_absent() {
+        let json = serde_json::to_string(&StopReport {
+            instance: "default",
+            pid: None,
+            result: "not_running",
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"instance":"default","result":"not_running"}"#);
+
+        let json = serde_json::to_string(&StopReport {
+            instance: "work",
+            pid: Some(42),
+            result: "stopped",
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"instance":"work","pid":42,"result":"stopped"}"#);
     }
 
     #[test]

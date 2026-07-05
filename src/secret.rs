@@ -8,19 +8,25 @@ use std::path::PathBuf;
 
 use crate::transport::endpoint::{load_secret, secret_to_endpoint_id};
 
-fn write_secret_to_output(
-    output: &PathBuf,
-    secret_content: &str,
-    public_info: &str,
-    force: bool,
-    secret_label: &str,
-) -> Result<()> {
-    if output.as_os_str() == std::ffi::OsStr::new("-") {
-        println!("{}", secret_content);
-        eprintln!("{}", public_info);
-        return Ok(());
-    }
+/// JSON output for `generate-server-key` and `show-server-id`. Exactly one of
+/// `path` (key written to a file) and `secret_key` (key requested on stdout via
+/// `--output -`) is set for keygen; both are `None` for `show-server-id`.
+#[derive(serde::Serialize)]
+struct KeygenReport {
+    endpoint_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_key: Option<String>,
+}
 
+fn print_report(report: &KeygenReport) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(report)?);
+    Ok(())
+}
+
+/// Write the secret key material to `output`, owner-only (`0600` on Unix).
+fn write_secret_file(output: &PathBuf, secret_content: &str, force: bool) -> Result<()> {
     if output.exists() && !force {
         anyhow::bail!(
             "File already exists: {}. Use --force to overwrite.",
@@ -68,30 +74,92 @@ fn write_secret_to_output(
         std::fs::write(output, secret_content).context("Failed to write secret key file")?;
     }
 
-    info!("{} saved to: {}", secret_label, output.display());
-    println!("{}", public_info);
-
     Ok(())
 }
 
-/// Generate a new secret key file (base64 encoded) and output the EndpointId to stdout
-pub fn generate_secret(output: PathBuf, force: bool) -> Result<()> {
+/// Generate a new secret key file (base64 encoded) and output the EndpointId
+/// to stdout. With `--output -` the key itself goes to stdout instead of a
+/// file; with `json`, everything is folded into one JSON document.
+pub fn generate_secret(output: PathBuf, force: bool, json: bool) -> Result<()> {
     let secret = SecretKey::generate();
     let secret_base64 = BASE64.encode(secret.to_bytes());
     let endpoint_id = secret_to_endpoint_id(&secret);
-    write_secret_to_output(
-        &output,
-        &secret_base64,
-        &format!("EndpointId: {}", endpoint_id),
-        force,
-        "Secret key",
-    )
+
+    if output.as_os_str() == std::ffi::OsStr::new("-") {
+        if json {
+            return print_report(&KeygenReport {
+                endpoint_id: endpoint_id.to_string(),
+                path: None,
+                secret_key: Some(secret_base64),
+            });
+        }
+        println!("{}", secret_base64);
+        eprintln!("EndpointId: {}", endpoint_id);
+        return Ok(());
+    }
+
+    write_secret_file(&output, &secret_base64, force)?;
+    info!("Secret key saved to: {}", output.display());
+    if json {
+        return print_report(&KeygenReport {
+            endpoint_id: endpoint_id.to_string(),
+            path: Some(output.display().to_string()),
+            secret_key: None,
+        });
+    }
+    println!("EndpointId: {}", endpoint_id);
+    Ok(())
 }
 
 /// Show the EndpointId for an existing secret key file
-pub fn show_id(secret_file: PathBuf) -> Result<()> {
+pub fn show_id(secret_file: PathBuf, json: bool) -> Result<()> {
     let secret = load_secret(&secret_file)?;
     let endpoint_id = secret_to_endpoint_id(&secret);
+    if json {
+        return print_report(&KeygenReport {
+            endpoint_id: endpoint_id.to_string(),
+            path: None,
+            secret_key: None,
+        });
+    }
     println!("{}", endpoint_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keygen_report_file_mode_omits_secret_key() {
+        let json = serde_json::to_string(&KeygenReport {
+            endpoint_id: "abc".into(),
+            path: Some("/tmp/key".into()),
+            secret_key: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"endpoint_id":"abc","path":"/tmp/key"}"#);
+    }
+
+    #[test]
+    fn keygen_report_stdout_mode_omits_path() {
+        let json = serde_json::to_string(&KeygenReport {
+            endpoint_id: "abc".into(),
+            path: None,
+            secret_key: Some("s3cret".into()),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"endpoint_id":"abc","secret_key":"s3cret"}"#);
+    }
+
+    #[test]
+    fn keygen_report_show_id_has_only_endpoint_id() {
+        let json = serde_json::to_string(&KeygenReport {
+            endpoint_id: "abc".into(),
+            path: None,
+            secret_key: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"endpoint_id":"abc"}"#);
+    }
 }

@@ -16,6 +16,17 @@
 //! Request-free: on accept, the listener immediately writes one line of JSON
 //! (the [`StatusSnapshot`]) and closes. A querier that cannot connect (no
 //! socket, or connection refused) treats the instance as not running.
+//!
+//! # Access control
+//!
+//! The endpoint is deliberately world-connectable so `status`/`list` work
+//! without sudo: the Unix socket is `0666` in a `0755` runtime dir, and the
+//! Windows pipe's default DACL grants Everyone read (the querier opens it
+//! read-only). This is safe because the protocol is request-free and read-only
+//! — a connection can only receive a status snapshot; nothing mutating goes
+//! over it. Mutation (`client stop`) is out-of-band via SIGTERM to the PID in
+//! the lock file, which remains root-only. The accepted trade-off is that any
+//! local user can read VPN status metadata.
 
 use crate::error::{VpnError, VpnResult};
 use crate::runtime::{LockRole, runtime_base_name, validate_instance_name};
@@ -397,12 +408,15 @@ where
         let _ = std::fs::remove_file(&path);
         let listener = tokio::net::UnixListener::bind(&path)
             .map_err(|e| VpnError::config_with_source("Failed to bind control socket", e))?;
-        // Restrict the socket to the owner (0600) before serving any snapshots,
-        // rather than relying on umask or the runtime directory's permissions.
+        // Open the socket to everyone (0666): connect(2) requires write
+        // permission on the socket inode, and the endpoint is read-only and
+        // request-free by design (see the module docs), so unprivileged
+        // `status`/`list` can query it. The chmod after bind only ever loosens
+        // the umask-derived mode and happens before the accept loop starts.
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| VpnError::config_with_source("Failed to secure control socket", e),
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).map_err(
+                |e| VpnError::config_with_source("Failed to set control socket permissions", e),
             )?;
         }
         log::debug!("Status control socket listening: {}", path.display());
@@ -438,7 +452,11 @@ where
         // before the task ran would see the pipe missing and treat the instance
         // as not running. `first_pipe_instance(true)` also rejects a name already
         // owned by another process (the instance lock makes us the sole owner).
+        // `access_inbound(false)` (PIPE_ACCESS_OUTBOUND) matches the
+        // server-writes-only protocol; unelevated queriers connect read-only,
+        // which the default pipe DACL grants to Everyone.
         let mut server = ServerOptions::new()
+            .access_inbound(false)
             .first_pipe_instance(true)
             .create(&name)
             .map_err(|e| VpnError::config_with_source("Failed to create control pipe", e))?;
@@ -456,7 +474,7 @@ where
                 // Create the next instance before serving so a new client can
                 // connect while this one is served (and so the pipe never briefly
                 // disappears between connections).
-                match ServerOptions::new().create(&name) {
+                match ServerOptions::new().access_inbound(false).create(&name) {
                     Ok(next) => {
                         server = next;
                         serve_one(&mut connected, provider.as_ref()).await;
@@ -574,6 +592,15 @@ async fn read_snapshot_bytes(role: LockRole, instance: &str) -> VpnResult<Option
     {
         Err(_) => return Err(VpnError::config("Timed out connecting to control socket")),
         Ok(Err(e)) if is_not_running(&e) => return Ok(None),
+        // Not folded into `is_not_running`: an instance IS running here, so
+        // reporting "not running" would be wrong — surface the error instead.
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(VpnError::config_with_source(
+                "Permission denied connecting to the control socket \
+                 (daemon started by an older ezvpn version? restart it, or retry with sudo)",
+                e,
+            ));
+        }
         Ok(Err(e)) => return Err(VpnError::Network(e)),
         Ok(Ok(s)) => s,
     };
@@ -584,7 +611,10 @@ async fn read_snapshot_bytes(role: LockRole, instance: &str) -> VpnResult<Option
 async fn read_snapshot_bytes(role: LockRole, instance: &str) -> VpnResult<Option<Vec<u8>>> {
     use tokio::net::windows::named_pipe::ClientOptions;
     let name = pipe_name(role, instance);
-    let client = match ClientOptions::new().open(&name) {
+    // Open read-only: the protocol never writes from this side, and the pipe's
+    // default DACL grants Everyone read but not write — so dropping
+    // GENERIC_WRITE is what lets an unelevated `status`/`list` connect.
+    let client = match ClientOptions::new().write(false).open(&name) {
         Ok(c) => c,
         Err(e) if is_not_running(&e) => return Ok(None),
         Err(e) => return Err(VpnError::Network(e)),
@@ -974,6 +1004,16 @@ mod tests {
         };
         let guard = spawn_status_listener(LockRole::Server, &instance, provider)
             .expect("listener spawns");
+
+        // The socket must be world-connectable so unprivileged status/list work.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(socket_path(LockRole::Server, &instance))
+                .expect("socket exists")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o666);
+        }
 
         let snapshot = query_status(LockRole::Server, &instance)
             .await
