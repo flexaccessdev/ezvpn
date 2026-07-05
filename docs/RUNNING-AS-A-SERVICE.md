@@ -39,15 +39,17 @@ directory**: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
 `%ProgramData%\ezvpn` on Windows. Unix control sockets also live in that
 runtime directory; Windows uses global named pipes such as
 `\\.\pipe\ezvpn-client-work`. The directory is created on first run
-(owner-only, `0700`, on Unix). It holds runtime state — on Linux `/run` is
-tmpfs and cleared on reboot. (The
+(world-traversable, `0755`, on Unix — the control sockets inside are read-only
+and world-connectable so `status`/`list` work without sudo). It holds runtime
+state — on Linux `/run` is tmpfs and cleared on reboot. (The
 `--daemon` log file is kept separately under the persistent log directory; see
 above. The service-manager setups below run in the foreground and capture logs
 via the service manager, so they don't use it.)
 
 Because the runtime location and control endpoint names are fixed, `status` /
 `list` and Unix `stop` resolve the same instance no matter how the service was
-started. Run `status` / `list` elevated (`sudo` or Administrator), and run Unix
+started. `status` / `list` need no elevation (a daemon started by an older
+ezvpn version keeps its restrictive permissions until restarted); run Unix
 `stop` with `sudo`. Set `EZVPN_RUNTIME_DIR` only if you need a non-default
 location (e.g. containers or a rootless deployment); if you do, set it
 identically for the service and for the commands you type by hand.
@@ -89,11 +91,11 @@ sudo systemctl restart     ezvpn-client@work
 sudo systemctl disable --now ezvpn-client@work    # stop + remove from boot
 ```
 
-App-level status / listing:
+App-level status / listing (no sudo needed):
 
 ```bash
-sudo ezvpn client status --instance work
-sudo ezvpn client list
+ezvpn client status --instance work
+ezvpn client list
 ```
 
 Run a second instance by starting another copy of the template:
@@ -161,11 +163,11 @@ sudo launchctl kickstart -k system/com.ezvpn.client.work  # restart
 sudo launchctl bootout   system/com.ezvpn.client.work     # stop + unload
 ```
 
-App-level status / listing:
+App-level status / listing (no sudo needed):
 
 ```bash
-sudo ezvpn client status --instance work
-sudo ezvpn client list
+ezvpn client status --instance work
+ezvpn client list
 ```
 
 ### Default instance (no `--instance`)
@@ -223,11 +225,12 @@ sudo launchctl kickstart -k system/com.ezvpn.client  # restart
 sudo launchctl bootout   system/com.ezvpn.client     # stop + unload
 ```
 
-App-level status / listing (no `--instance` queries the default instance):
+App-level status / listing (no sudo needed; no `--instance` queries the
+default instance):
 
 ```bash
-sudo ezvpn client status
-sudo ezvpn client list
+ezvpn client status
+ezvpn client list
 ```
 
 ---
@@ -266,11 +269,12 @@ nssm stop    ezvpn-work
 nssm remove  ezvpn-work confirm   # uninstall
 ```
 
-App-level status / listing (from an elevated shell):
+App-level status / listing (no elevation needed — the pipe is opened
+read-only, which its default ACL grants to everyone):
 
 ```powershell
 # status uses the global named pipe \\.\pipe\ezvpn-client-work; list scans
-# lock files in the fixed runtime dir (%ProgramData%\ezvpn). Run elevated.
+# lock files in the fixed runtime dir (%ProgramData%\ezvpn).
 ezvpn client status --instance work
 ezvpn client list
 ```
@@ -299,11 +303,12 @@ nssm stop    ezvpn
 nssm remove  ezvpn confirm   # uninstall
 ```
 
-App-level status / listing (no `--instance` queries the default instance):
+App-level status / listing (no elevation needed; no `--instance` queries the
+default instance):
 
 ```powershell
 # status uses the global named pipe \\.\pipe\ezvpn-client-default; list scans
-# lock files in the fixed runtime dir (%ProgramData%\ezvpn). Run elevated.
+# lock files in the fixed runtime dir (%ProgramData%\ezvpn).
 ezvpn client status
 ezvpn client list
 ```

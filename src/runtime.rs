@@ -35,8 +35,10 @@ use std::path::{Path, PathBuf};
 /// find the running instance.
 ///
 /// Holds lock files on every platform and Unix control sockets on Linux/macOS.
-/// `/run` is tmpfs and cleared on reboot; persistent files such as the daemon
-/// log live in [`log_dir`] instead.
+/// The directory is world-traversable (`0755`, see [`ensure_runtime_dir`]) so
+/// unprivileged users can query the read-only control sockets; only root can
+/// write in it. `/run` is tmpfs and cleared on reboot; persistent files such as
+/// the daemon log live in [`log_dir`] instead.
 ///
 /// Defaults: `/run/ezvpn` on Linux, `/var/run/ezvpn` on macOS, and
 /// `%ProgramData%\ezvpn` on Windows (lock files only; Windows control endpoints
@@ -216,18 +218,19 @@ pub fn validate_dir_env() -> VpnResult<()> {
     Ok(())
 }
 
-/// Create `dir` owner-only (`0700` on Unix) if it does not already exist,
-/// returning the path. Backs [`ensure_runtime_dir`] and [`ensure_log_dir`].
-fn ensure_dir(dir: PathBuf) -> std::io::Result<PathBuf> {
+/// Create `dir` with `mode` (Unix) if it does not already exist, returning the
+/// path. Backs [`ensure_runtime_dir`] and [`ensure_log_dir`].
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn ensure_dir(dir: PathBuf, mode: u32) -> std::io::Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        // Create owner-only (0700) atomically so there is no window where the
-        // directory is world/group-accessible. `recursive(true)` makes this a
-        // no-op (permissions left untouched) when an admin pre-created it.
+        // Create with the final mode atomically so there is no window where the
+        // directory is more accessible than intended. `recursive(true)` makes
+        // this a no-op (permissions left untouched) when the dir already exists.
         std::fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(mode)
             .create(&dir)?;
     }
     #[cfg(not(unix))]
@@ -235,22 +238,36 @@ fn ensure_dir(dir: PathBuf) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Ensure the runtime directory exists, creating it owner-only (`0700` on Unix)
-/// on first creation. Returns the directory path. Called from write paths (lock
-/// acquisition); read-only queries (`status`/`list`) do not create it.
+/// Ensure the runtime directory exists as world-traversable (`0755` on Unix)
+/// and returns its path. Called from write paths (lock acquisition), which run
+/// as root; read-only queries (`status`/`list`) do not create it.
+///
+/// World-traversable on purpose: the control sockets inside serve a read-only,
+/// request-free status snapshot (see `crate::control`), so unprivileged users
+/// can run `status`/`list` without sudo. Only root can create files in it
+/// (root-owned, no group/other write), and lock files expose nothing beyond a
+/// PID, which `ps` shows anyway. The chmod also fixes a directory created
+/// `0700` by an older ezvpn version; note it applies to a custom
+/// `EZVPN_RUNTIME_DIR` too.
 pub(crate) fn ensure_runtime_dir() -> std::io::Result<PathBuf> {
-    ensure_dir(runtime_dir())
+    let dir = ensure_dir(runtime_dir(), 0o755)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(dir)
 }
 
 /// Ensure the log directory exists, creating it owner-only (`0700` on Unix) on
-/// first creation. Returns the directory path. Called when setting up the
-/// daemon log.
+/// first creation; a pre-existing directory keeps its permissions. Returns the
+/// directory path. Called when setting up the daemon log.
 ///
 /// Only the Unix daemonization path creates the log dir up front, so this is
 /// Unix-only; elsewhere `log_dir` is resolved without pre-creating it.
 #[cfg(unix)]
 pub fn ensure_log_dir() -> std::io::Result<PathBuf> {
-    ensure_dir(log_dir())
+    ensure_dir(log_dir(), 0o700)
 }
 
 /// Which single-instance role a lock guards.
@@ -497,6 +514,28 @@ mod tests {
             VpnLock::acquire(LockRole::Client, "default").expect("Should acquire client again");
         let _server2 =
             VpnLock::acquire(LockRole::Server, "default").expect("Should acquire server again");
+    }
+
+    // The runtime dir must end up world-traversable (0755) even when it
+    // pre-exists with restrictive permissions (e.g. created 0700 by an older
+    // ezvpn version). Owner keeps rwx throughout, so this is safe alongside
+    // parallel tests sharing the per-process test dir.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_runtime_dir_is_world_traversable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = runtime_dir();
+        std::fs::create_dir_all(&dir).expect("create test runtime dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("tighten dir");
+
+        let dir = ensure_runtime_dir().expect("ensure runtime dir");
+        let mode = std::fs::metadata(&dir)
+            .expect("stat runtime dir")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     // Two different client instances use different lock files, so both can be

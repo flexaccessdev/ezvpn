@@ -164,6 +164,9 @@ Token format:
 - Auth token: exactly 47 characters, `v` followed by 46 Base64URL characters
   with no padding.
 
+`generate-server-key`, `generate-auth-token`, and `show-server-id` all accept
+`--json` for machine-readable output.
+
 The auth token identifies authorized clients. The tunnel also negotiates a
 fixed ALPN over iroh's QUIC handshake, so a peer that does not speak the ezvpn
 protocol is rejected before any stream is opened.
@@ -294,6 +297,9 @@ client with:
 sudo ezvpn client stop --instance work
 ```
 
+`client stop` also accepts `--json`, reporting one of `not_running`, `stopped`,
+or `signal_sent` (signaled, but still shutting down after 5 s).
+
 `ezvpn client status` prints connection state, assigned VPN IP/gateway, MTU,
 negotiated GSO, live iroh path (direct or relay), and the daemon log path when
 applicable. Add `--json` for machine-readable output, or `--instance <NAME>` to
@@ -313,7 +319,7 @@ config option.
 ```bash
 sudo ezvpn client start -c work.toml --instance work
 sudo ezvpn client start -c home.toml
-sudo ezvpn client status --instance work
+ezvpn client status --instance work
 ```
 
 Each running instance exposes a local control endpoint derived from the same
@@ -341,9 +347,13 @@ is size-capped: at 10 MiB it rotates to a single `<name>.log.1` backup
 instance. Override the cap (in bytes) with
 `EZVPN_LOG_MAX_BYTES`.
 
-Run `status` and `list` as root/Administrator so they resolve the same runtime
-directory and control endpoint names as the tunnel process. On Unix, run `stop`
-the same way. `client list` discovers instances by lock file and probes each
+`status` and `list` work without root/Administrator: the runtime directory is
+world-traversable and the control endpoint is read-only and world-connectable
+(Unix sockets are `0666`; the Windows pipe is opened read-only, which its
+default ACL grants to everyone). A daemon started by an older ezvpn version
+keeps its restrictive permissions until restarted — query it with `sudo` or
+restart it. On Unix, `stop` still requires `sudo` (it signals the root-owned
+tunnel process). `client list` discovers instances by lock file and probes each
 control endpoint; stopped clients may briefly show as
 `not responding (stale lock)` until the lock file is reused or removed.
 
