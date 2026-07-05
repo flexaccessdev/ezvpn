@@ -80,22 +80,25 @@ EzvpnApp (SwiftUI)            PacketTunnel (NEPacketTunnelProvider)
 
 ## Underlay bypass on iOS
 
-Full tunnel is out of scope, so the routed prefixes are private/explicit and the
-public iroh underlay (relays, public server addresses) never overlaps them — no
-relay-set bypass is needed. The one case that does need handling: the server's
-**own underlay address is private and falls inside a routed prefix** (e.g. the
-server is on a LAN at `192.168.1.5` and you route `192.168.0.0/16`). Without
-intervention iOS would route iroh's own QUIC packets into the tunnel and the
-connection would self-capture and stall.
+If a routed prefix covers an address iroh's own transport uses — the server's
+underlay address (e.g. the server is on a LAN at `192.168.1.5` and you route
+`192.168.0.0/16`) or, with broad routes, a relay IP — iOS would route iroh's
+own QUIC packets into the tunnel and the connection would self-capture and
+stall.
 
-The core computes this automatically and unconditionally: it intersects the
-server's handshake-advertised underlay candidate addresses (`server_addrs`,
-which include private/LAN/ULA addresses) with the configured routes, and returns
-each overlap as a host route (`/32` / `/128`). The extension applies them as
-`excludedRoutes`, so the OS keeps those packets on the underlay (Wi-Fi/cellular).
-This is the declarative iOS equivalent of the desktop `BypassRouteManager`. Only
-the static handshake-time set is used; dynamic mid-session address updates are
-not handled.
+The core computes the bypass set automatically at connect, mirroring the
+desktop bootstrap (`add_iroh_bypass_routes`): it resolves every relay the
+endpoint may use (the configured relay URLs, or the default relay map) and adds
+the server's handshake-advertised underlay candidate addresses (`server_addrs`,
+which include private/LAN/ULA addresses), then intersects that candidate set
+with the effective routed prefixes — the configured routes plus the assigned
+interface subnets, which the extension always routes. Each overlap is returned
+as a host route (`/32` / `/128`) and the extension applies them as
+`excludedRoutes`, so the OS keeps those packets on the underlay
+(Wi-Fi/cellular). This is the declarative iOS equivalent of the desktop
+`BypassRouteManager`. Only the static handshake-time set is used; dynamic
+mid-session address updates are not handled (re-applying
+`NEPacketTunnelNetworkSettings` mid-session is disruptive).
 
 **Caveat** (same as desktop — see the README "Routing" section and
 `docs/ARCHITECTURE.md`): a bypassed server underlay IP is reachable only over the

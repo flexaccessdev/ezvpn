@@ -7,12 +7,15 @@
 //!   owns that via `NEPacketTunnelNetworkSettings`, then hands us the tunnel's
 //!   `utun` fd;
 //! - does **not** install OS bypass routes itself. Instead [`IosSession::connect`]
-//!   computes the server underlay addresses that overlap a routed prefix (via
-//!   [`crate::tunnel::client::overlapping_underlay_excludes`]) and
+//!   computes the underlay-bypass set the desktop `BypassRouteManager` would pin
+//!   (every relay IP plus the server's handshake-advertised candidate underlay
+//!   addresses, filtered to those a routed prefix would capture — including the
+//!   assigned interface subnet, which the extension always routes) and
 //!   [`IosSession::network_config`] returns them as host routes (`/32` / `/128`)
-//!   for the extension to apply as `excludedRoutes`. Full tunnel is out of scope,
-//!   so the *public* iroh underlay (relays, public server addresses) never needs
-//!   bypassing — only an overlapping private/ULA server address does;
+//!   for the extension to apply as `excludedRoutes`. This is the static,
+//!   handshake-time equivalent of the desktop bootstrap bypass; the server's
+//!   periodic mid-session address publications are not applied (re-plumbing
+//!   `NEPacketTunnelNetworkSettings` mid-session is disruptive);
 //! - does **not** take the single-instance lock or open a control socket.
 //!
 //! It reuses the portable data plane wholesale: the same handshake
@@ -29,7 +32,7 @@
 //! 3. [`IosSession::run`] — drive the tunnel over that fd until it ends.
 
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
@@ -42,8 +45,8 @@ use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
 use crate::transport::endpoint::create_client_endpoint;
 use crate::tunnel::client::{
-    ServerInfo, collect_local_iroh_udp_ports, overlapping_underlay_excludes, perform_handshake,
-    run_tunnel,
+    ServerInfo, collect_local_iroh_udp_ports, collect_relay_ips, overlapping_underlay_excludes,
+    perform_handshake, run_tunnel,
 };
 use crate::tunnel::signaling::VPN_ALPN;
 
@@ -98,10 +101,10 @@ pub struct IosSession {
     endpoint: Endpoint,
     connection: Connection,
     server_info: ServerInfo,
-    /// IPv4 server underlay `/32`s overlapping a routed prefix (computed at
-    /// connect from the handshake's `server_addrs`).
+    /// IPv4 underlay `/32`s (relay + server addresses) overlapping a routed
+    /// prefix (computed at connect, see [`Self::connect`]).
     excluded_routes: Vec<String>,
-    /// IPv6 server underlay `/128`s overlapping a routed prefix.
+    /// IPv6 underlay `/128`s overlapping a routed prefix.
     excluded_routes6: Vec<String>,
 }
 
@@ -142,14 +145,31 @@ impl IosSession {
         // `perform_handshake` already guarantees at least one family was
         // assigned, so IPv4-only, IPv6-only, and dual-stack all pass here.
 
-        // Compute the underlay bypass set: server candidate addresses that fall
-        // within a routed prefix and would otherwise self-capture. Applied by
+        // Compute the underlay bypass set, mirroring the desktop bootstrap
+        // (`add_iroh_bypass_routes`): every relay IP the endpoint may use plus
+        // the server's candidate underlay addresses, filtered to those a routed
+        // prefix would capture and would therefore self-capture the transport.
+        // The filter includes the assigned interface subnets, which the
+        // extension always routes even with no configured prefixes. Applied by
         // the extension as `excludedRoutes` (see module docs).
+        let mut candidates: Vec<IpAddr> = collect_relay_ips(&endpoint, &cfg.relay_urls)
+            .await
+            .into_iter()
+            .collect();
+        candidates.extend(server_info.server_addrs.iter().copied());
+        candidates.sort();
+        candidates.dedup();
+
+        let mut routed4 = cfg.routes.clone();
+        routed4.extend(server_info.network);
+        let mut routed6 = cfg.routes6.clone();
+        routed6.extend(server_info.network6);
+
         let (excluded_routes, excluded_routes6) =
-            overlapping_underlay_excludes(&server_info.server_addrs, &cfg.routes, &cfg.routes6);
+            overlapping_underlay_excludes(&candidates, &routed4, &routed6);
         if !excluded_routes.is_empty() || !excluded_routes6.is_empty() {
             log::info!(
-                "Bypassing overlapping server underlay addresses (reachable only off-tunnel; \
+                "Bypassing overlapping underlay addresses (reachable only off-tunnel; \
                  reach the server through the tunnel via its VPN gateway IP): v4={:?} v6={:?}",
                 excluded_routes,
                 excluded_routes6
