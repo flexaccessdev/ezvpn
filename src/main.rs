@@ -57,6 +57,7 @@ enum Command {
     ///
     /// Creates a secret key file for the server config's [iroh] secret_file.
     /// The server's EndpointId remains constant when using the same key.
+    #[command(arg_required_else_help = true)]
     GenerateServerKey {
         /// Path where to save the private key file
         #[arg(short, long)]
@@ -73,6 +74,7 @@ enum Command {
     /// Show the server's public EndpointId derived from a private key
     ///
     /// Clients use this EndpointId with --server-node-id to connect.
+    #[command(arg_required_else_help = true)]
     ShowServerId {
         /// Path to the private key file
         #[arg(short, long)]
@@ -107,6 +109,7 @@ enum ServerAction {
     /// vpn_server.toml in the system config dir (/etc/ezvpn on Linux,
     /// /usr/local/etc/ezvpn on macOS, %ProgramData%\ezvpn on Windows). See
     /// vpn_server.toml.example for format.
+    #[command(arg_required_else_help = true)]
     Start {
         /// Config file path (required unless --default-config is used)
         #[arg(short = 'c', long)]
@@ -136,6 +139,7 @@ enum ServerAction {
 #[derive(Subcommand)]
 enum ClientAction {
     /// Start the VPN client (connects to server and establishes tunnel).
+    #[command(arg_required_else_help = true)]
     Start {
         /// Config file path
         #[arg(short = 'c', long)]
