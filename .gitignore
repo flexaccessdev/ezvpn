@@ -9,6 +9,9 @@ target/
 # Build folders used by some tools
 build/
 
+# Build staging output
+dist/
+
 
 # Backup and temp files
 *~
