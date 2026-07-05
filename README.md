@@ -425,6 +425,25 @@ tunnel, `0.0.0.0/0`/`::/0` covers everything, so the server and relay addresses
 are always pinned — but those are iroh infrastructure, not resources you address
 directly.)
 
+**In a split tunnel this usually means zero bypass routes** — and when a bypass
+is needed at all, it is only the server's own host address (`/32`/`/128`) for
+each routed prefix that happens to contain it, never anything broader. The two
+common ways a split-tunnel route overlaps a server address:
+
+- **The client is inside the same private network as the server.** If you route
+  a private prefix (e.g. `172.31.0.0/16`) and connect from within that network,
+  the server's private LAN address falls inside the routed prefix — and that is
+  exactly the address iroh uses for transport, so it gets the host bypass. Every
+  other host in the prefix still routes through the VPN.
+- **A routed IPv6 prefix contains the server's public IPv6.** Cloud servers
+  typically sit inside the same broad IPv6 CIDR as the resources you route (e.g.
+  an AWS VPC prefix), so routing that CIDR captures the server's own public
+  IPv6; it gets the `/128` bypass while the rest of the prefix routes through
+  the tunnel.
+
+If none of your routed CIDRs contains a server or relay underlay address, no
+bypass routes are installed at all.
+
 The side effect is that **this one address is reachable only over the underlay,
 not through the VPN**, for as long as the client is connected. If that same host
 also serves resources you want to reach *through* the tunnel, do not address them

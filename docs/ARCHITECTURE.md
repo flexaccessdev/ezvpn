@@ -371,7 +371,14 @@ be wrong (`server_candidate_addrs` in `tunnel/server.rs`). A bypass pins **only 
 endpoints, not the rest of the routed prefix**: other hosts inside the same CIDR
 still route through the VPN normally. In a full tunnel (`0.0.0.0/0`/`::/0`) the
 server and relay addresses are always covered and thus always pinned; in a split
-tunnel only an endpoint that overlaps a routed CIDR is.
+tunnel only an endpoint that overlaps a routed CIDR is — typically zero bypass
+routes, or just the server's own host address per overlapping prefix. The
+membership test is a pure per-IP prefix check (`ip_covered_by_vpn_routes` in
+`tunnel/client.rs`), so the common split-tunnel triggers are: the client sits
+inside the same private network as the server (the routed private prefix
+contains the server's LAN address, which is precisely the address iroh selects
+for transport there), or a routed IPv6 CIDR is broad enough to contain the
+server's public IPv6.
 
 **Caveat (user-visible).** As a consequence, the one address used for tunnel
 transport is reachable only over the underlay, not through the VPN, while the
