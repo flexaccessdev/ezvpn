@@ -1664,7 +1664,7 @@ async fn run_bypass_route_manager(
 /// would capture. Unresolvable relays are skipped; the connection still rides
 /// whichever relay it selects (its IP is covered when resolvable here, and the
 /// server's published address set covers the direct underlay path).
-async fn collect_relay_ips(endpoint: &Endpoint, relay_urls: &[String]) -> HashSet<IpAddr> {
+pub(crate) async fn collect_relay_ips(endpoint: &Endpoint, relay_urls: &[String]) -> HashSet<IpAddr> {
     let mut ips = HashSet::new();
     let relay_map = match parse_relay_mode(relay_urls) {
         Ok(mode) => mode.relay_map(),
