@@ -7,7 +7,10 @@
 //!    network config (IPv4 and/or IPv6, as JSON) to the caller's buffer so the
 //!    extension can build `NEPacketTunnelNetworkSettings`.
 //! 2. [`ezvpn_run`] — hand back the `utun` fd (obtained after applying the
-//!    network settings); spawns the datagram loop on the embedded runtime.
+//!    network settings); spawns the datagram loop on the embedded runtime. The
+//!    optional exit callback fires when that loop ends on its own (connection
+//!    lost, peer close, fatal I/O error) so the extension can tear the NE
+//!    session down instead of lingering as a connected-but-dead tunnel.
 //! 3. [`ezvpn_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! All functions are null-safe and never unwind across the FFI boundary (the
@@ -47,7 +50,7 @@
 //! }
 //! ```
 
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 
@@ -56,6 +59,28 @@ use serde::Deserialize;
 
 use crate::error::VpnResult;
 use crate::tunnel::ios::{IosConfig, IosSession};
+
+/// Exit notification for [`ezvpn_run`]: invoked at most once, from a library
+/// thread, when the tunnel data loop ends on its own. `reason` is a
+/// NUL-terminated UTF-8 message valid only for the duration of the call.
+/// Not invoked when the loop is stopped via [`ezvpn_stop`].
+pub type EzvpnExitCallback =
+    Option<unsafe extern "C" fn(ctx: *mut c_void, reason: *const c_char)>;
+
+/// Caller-supplied context pointer, moved into the tunnel task so it can be
+/// handed back through the exit callback. The caller guarantees it is safe to
+/// use from another thread (on the Swift side it is null or a global).
+struct ExitCtx(*mut c_void);
+unsafe impl Send for ExitCtx {}
+
+impl ExitCtx {
+    /// Accessor rather than direct `.0` field access inside the tunnel task:
+    /// async blocks capture disjoint fields, and capturing the raw pointer
+    /// alone would sidestep this wrapper's `Send`.
+    fn get(&self) -> *mut c_void {
+        self.0
+    }
+}
 
 /// Opaque handle owned by the Swift side. Created by [`ezvpn_connect`], freed by
 /// [`ezvpn_stop`].
@@ -219,15 +244,28 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
 /// success, `-1` on error (null handle, no pending session, fd dup failure, or
 /// already running).
 ///
+/// `on_exit` (optional) fires when the loop ends on its own — connection lost,
+/// peer close, fatal I/O error — so the extension can cancel the NE session
+/// instead of lingering as a connected-but-dead tunnel. It does not fire when
+/// the loop is aborted by [`ezvpn_stop`]: past-the-await sync code never runs
+/// on an aborted task, so a user-requested stop cannot race a spurious cancel.
+///
 /// This `dup`s `tun_fd` **synchronously before returning**, so the caller may
 /// close its own copy as soon as `ezvpn_run` returns — there is no race with the
 /// spawned task picking the fd up.
 ///
 /// # Safety
-/// `handle` must be a valid pointer returned by [`ezvpn_connect`] and not yet
-/// passed to [`ezvpn_stop`]. `tun_fd` must be a valid open file descriptor.
+/// - `handle` must be a valid pointer returned by [`ezvpn_connect`] and not yet
+///   passed to [`ezvpn_stop`]. `tun_fd` must be a valid open file descriptor.
+/// - `on_exit` (if non-null) must remain callable with `on_exit_ctx` from any
+///   thread until after [`ezvpn_stop`] returns.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ezvpn_run(handle: *mut EzvpnHandle, tun_fd: c_int) -> c_int {
+pub unsafe extern "C" fn ezvpn_run(
+    handle: *mut EzvpnHandle,
+    tun_fd: c_int,
+    on_exit: EzvpnExitCallback,
+    on_exit_ctx: *mut c_void,
+) -> c_int {
     if handle.is_null() {
         return -1;
     }
@@ -249,11 +287,26 @@ pub unsafe extern "C" fn ezvpn_run(handle: *mut EzvpnHandle, tun_fd: c_int) -> c
         }
     };
 
+    let exit_ctx = ExitCtx(on_exit_ctx);
     let task = handle.runtime.spawn(async move {
         // `owned_fd` is owned by this task and closed when it ends; `run` dups it
         // again into the TunDevice, so our copy outlives that internal dup setup.
         let result = session.run(owned_fd.as_raw_fd()).await;
         drop(owned_fd);
+        // Everything from here is synchronous: an `ezvpn_stop` abort can only
+        // land at an await point, so it either cancels the whole tail or none
+        // of it — the callback cannot fire for a user-requested stop.
+        if let Some(cb) = on_exit {
+            let reason = match &result {
+                Ok(()) => "tunnel closed".to_string(),
+                Err(e) => e.to_string(),
+            };
+            log::info!("tunnel loop ended: {reason}");
+            // Interior NULs would make CString::new fail; the message is
+            // human-readable so stripping them is harmless.
+            let reason = CString::new(reason.replace('\0', "")).expect("NULs stripped");
+            unsafe { cb(exit_ctx.get(), reason.as_ptr()) };
+        }
         result
     });
     handle.task = Some(task);

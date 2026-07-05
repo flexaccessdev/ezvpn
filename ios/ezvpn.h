@@ -10,8 +10,10 @@
  *        On success `buf` holds the network-config JSON; use it to build
  *        NEPacketTunnelNetworkSettings, then setTunnelNetworkSettings.
  *        On error `buf` holds the error message.
- *   2. ezvpn_run(handle, utunFd)            -> 0 on success, -1 on error
+ *   2. ezvpn_run(handle, utunFd, onExit, ctx) -> 0 on success, -1 on error
  *        Pass the utun file descriptor obtained after the settings apply.
+ *        onExit (optional) fires if the tunnel later dies on its own — call
+ *        cancelTunnelWithError from it so iOS tears the session down.
  *   3. ezvpn_stop(handle)                   (in stopTunnel / on teardown)
  *
  * All functions are NULL-safe and never unwind into Swift.
@@ -59,12 +61,25 @@ void ezvpn_init_logging(void);
 EzvpnHandle *ezvpn_connect(const char *config_json, char *out_buf, size_t out_len);
 
 /*
+ * Exit notification for ezvpn_run: invoked at most once, from a library
+ * thread, when the tunnel data loop ends on its own (connection lost, peer
+ * close, fatal I/O error). NOT invoked when the loop is stopped by
+ * ezvpn_stop. `reason` is a NUL-terminated UTF-8 message valid only for the
+ * duration of the call. The callback (with its ctx) must remain callable from
+ * any thread until ezvpn_stop returns.
+ */
+typedef void (*ezvpn_exit_cb)(void *ctx, const char *reason);
+
+/*
  * Start the tunnel data loop on the given utun fd. The library dups the fd
  * synchronously before returning, so the caller may close its own copy as soon
  * as this returns. Returns 0 on success, -1 on error (NULL handle, no pending
  * session, fd dup failure, or already running).
+ *
+ * on_exit may be NULL if exit notification is not wanted; on_exit_ctx is
+ * passed through to the callback verbatim.
  */
-int ezvpn_run(EzvpnHandle *handle, int tun_fd);
+int ezvpn_run(EzvpnHandle *handle, int tun_fd, ezvpn_exit_cb on_exit, void *on_exit_ctx);
 
 /*
  * Stop the tunnel and free the handle. After this call the handle is invalid.
