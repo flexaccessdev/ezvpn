@@ -18,7 +18,10 @@
 //!
 //! `routes`/`routes6` are the split-tunnel prefixes; they drive the
 //! overlapping-server-address bypass. `auth_token` may be null; `relay_urls`,
-//! `relay_only`, `routes`, and `routes6` are all optional.
+//! `relay_only`, `routes`, `routes6`, and `connect_timeout_secs` are all
+//! optional. `connect_timeout_secs` bounds the whole connect+handshake (an
+//! offline server would otherwise hang iroh's connect indefinitely); default
+//! 20 seconds.
 //!
 //! ```json
 //! {
@@ -27,7 +30,8 @@
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_only": false,
 //!   "routes": ["10.0.0.0/8"],
-//!   "routes6": ["fd00::/8"]
+//!   "routes6": ["fd00::/8"],
+//!   "connect_timeout_secs": 20
 //! }
 //! ```
 //!
@@ -56,6 +60,7 @@
 use std::ffi::{CStr, c_char, c_int};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
+use std::time::Duration;
 
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
@@ -88,6 +93,15 @@ struct FfiConfig {
     /// IPv6 routed prefixes (CIDR strings).
     #[serde(default)]
     routes6: Vec<String>,
+    /// Upper bound on connect+handshake, in seconds. iroh's connect waits
+    /// indefinitely for an unreachable peer, so this is what turns an offline
+    /// server into a prompt error instead of a hang.
+    #[serde(default = "default_connect_timeout_secs")]
+    connect_timeout_secs: u64,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    20
 }
 
 /// Parse CIDR strings into typed prefixes, failing on the first malformed entry
@@ -186,8 +200,10 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
         .build()
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
 
+    let timeout = Duration::from_secs(cfg.connect_timeout_secs);
     let session = runtime
-        .block_on(IosSession::connect(&ios_config))
+        .block_on(tokio::time::timeout(timeout, IosSession::connect(&ios_config)))
+        .map_err(|_| format!("connect timed out after {}s", cfg.connect_timeout_secs))?
         .map_err(|e| format!("connect failed: {e}"))?;
 
     let net = session
