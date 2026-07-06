@@ -82,19 +82,19 @@ pub const IROH_SOCKET_BUFFER_REQUEST: usize = 7 << 20; // 7 MiB
 
 /// Initial QUIC path MTU (UDP payload bytes) before MTU discovery completes.
 ///
-/// 1452 is the IPv6-safe maximum for a standard 1500-byte Ethernet path
-/// (`1500 − 40 IPv6 − 8 UDP`) and matches quinn's own DPLPMTUD `upper_bound`
-/// default. Starting here (instead of the 1200 protocol minimum) makes the
-/// per-connection `max_datagram_size` large *immediately* at handshake — the IP
-/// data path rides QUIC datagrams whose size is snapshotted once at connect, so
-/// the snapshot must start large to avoid pinning the inner TUN MTU low.
+/// 1200 is the QUIC protocol minimum (and quinn's `min_mtu` default), so the
+/// very first datagrams survive *any* path — cellular, tunnel-in-tunnel, PPPoE —
+/// with no early black-holing. DPLPMTUD's first run happens right after the
+/// handshake and binary-searches upward to its default `upper_bound` (1452), so
+/// LAN/broadband paths reach full size within a few RTTs.
 ///
-/// This assumes a standard ≥1500-MTU path (LAN / most broadband). On a smaller
-/// path quinn's black-hole detection still lowers the *live* `current_mtu` (down
-/// to `min_mtu = 1200`), but the inner TUN MTU is fixed for the connection's
-/// life, so constrained or tunnel-in-tunnel deployments should lower `mtu` in
-/// the server config. `min_mtu` and MTU discovery keep their defaults.
-pub const QUIC_INITIAL_MTU: u16 = 1452;
+/// The primary deployment target is mobile / high-latency internet access, where
+/// an optimistic initial MTU (e.g. 1452) causes persistent datagram drops on
+/// paths with a smaller real MTU. Reliability from packet one is worth the brief
+/// ramp-up; the data path reads the *live* `max_datagram_size` per TUN read, so
+/// framing follows discovery as the path MTU rises (or falls). `min_mtu` and MTU
+/// discovery keep their defaults.
+pub const QUIC_INITIAL_MTU: u16 = 1200;
 
 /// Create a congestion controller factory based on the selected algorithm.
 fn create_congestion_controller_factory(
@@ -163,9 +163,9 @@ pub fn build_quic_transport_config(tuning: &TransportTuning) -> Result<QuicTrans
         send_source
     );
 
-    // Start with a larger initial path MTU so early packets are full-size and
-    // the throughput ramp-up is shorter (see QUIC_INITIAL_MTU). MTU discovery
-    // and min_mtu keep their defaults.
+    // Start at the protocol-minimum path MTU so the first datagrams survive any
+    // path (see QUIC_INITIAL_MTU); MTU discovery probes upward right after the
+    // handshake. Discovery config and min_mtu keep their defaults.
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
     info!(
         "Transport MTU: initial={} (discovery enabled)",

@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// Default MTU for VPN tunnel (1500 - 60 bytes overhead for QUIC/TLS + framing).
-pub const DEFAULT_MTU: u16 = 1440;
+/// Default MTU for VPN tunnel: the IPv6 minimum link MTU, mobile-safe on any
+/// real path (see `DATAGRAM_SAFE_MTU` in the tunnel server for the rationale).
+/// Must stay in sync with [`file_config::DEFAULT_VPN_MTU`].
+pub const DEFAULT_MTU: u16 = 1280;
 
 /// IPv6 address-assignment strategy for VPN clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

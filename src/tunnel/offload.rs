@@ -646,6 +646,80 @@ pub fn segment_tcp_gso_packet(
     Ok(out)
 }
 
+/// Synthesize TCP-GSO offload metadata for a plain (non-offload) TCP packet so
+/// it can be resegmented with [`segment_tcp_gso_into`].
+///
+/// Used when a plain packet's framed size exceeds the live QUIC datagram cap
+/// (the path MTU shrank below the inner TUN MTU): re-cutting the TCP payload
+/// into smaller, fully valid segments keeps the flow alive where dropping would
+/// blackhole it (the origin re-sends the same size). Returns `None` for
+/// anything that cannot be safely resegmented — non-TCP, IP fragments, and TCP
+/// segments carrying SYN/RST/URG (FIN/PSH are fine: the segmenter masks them
+/// onto only the final segment) — and for empty payloads, where splitting is
+/// meaningless.
+///
+/// Note [`parse_coalescible_tcp`] cannot be reused here: it enforces
+/// GRO-specific restrictions (rejects FIN, IPv4 options, ECN) that do not
+/// apply to segmentation.
+pub fn synthesize_tcp_gso(packet: &[u8]) -> Option<VirtioNetHdr> {
+    let (ip_header_len, gso_type) = match packet.first()? >> 4 {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let ihl = usize::from(packet[0] & 0x0F) * 4;
+            if ihl < 20 || packet.len() < ihl {
+                return None;
+            }
+            // Protocol must be TCP and the packet must not be an IP fragment
+            // (MF set or a non-zero fragment offset): a fragment's payload is
+            // not a self-contained TCP segment.
+            if packet[9] != 6 || (packet[6] & 0x20) != 0 || ((packet[6] & 0x1F) | packet[7]) != 0 {
+                return None;
+            }
+            (ihl, VIRTIO_NET_HDR_GSO_TCPV4)
+        }
+        6 => {
+            // Fixed 40-byte header only; extension headers (incl. fragment
+            // headers) are not walked and such packets are not resegmented.
+            if packet.len() < 40 || packet[6] != 6 {
+                return None;
+            }
+            (40, VIRTIO_NET_HDR_GSO_TCPV6)
+        }
+        _ => return None,
+    };
+
+    if packet.len() < ip_header_len + 20 {
+        return None;
+    }
+    let tcp_header_len = usize::from(packet[ip_header_len + 12] >> 4) * 4;
+    if tcp_header_len < 20 || packet.len() < ip_header_len + tcp_header_len {
+        return None;
+    }
+    // SYN/RST/URG must not be replicated across segments (SYN/RST payloads are
+    // degenerate anyway; URG pointer semantics do not survive splitting).
+    if packet[ip_header_len + 13] & (0x02 | 0x04 | 0x20) != 0 {
+        return None;
+    }
+
+    let header_len = ip_header_len + tcp_header_len;
+    let payload_len = packet.len() - header_len;
+    if payload_len == 0 {
+        return None;
+    }
+
+    Some(VirtioNetHdr {
+        flags: 0,
+        gso_type,
+        hdr_len: u16::try_from(header_len).ok()?,
+        gso_size: u16::try_from(payload_len).ok()?,
+        csum_start: u16::try_from(ip_header_len).ok()?,
+        csum_offset: 16,
+        num_buffers: 0,
+    })
+}
+
 /// Convert offload metadata into one or more plain IP packets, emitting each
 /// via callback without per-packet heap allocation.
 ///
@@ -2781,5 +2855,108 @@ mod tests {
         let mut out = BytesMut::new();
         assert!(assemble_tcp_gso_superframe(&mut out, &single).is_err());
         assert!(assemble_tcp_gso_superframe(&mut out, &[]).is_err());
+    }
+
+    #[test]
+    fn test_synthesize_tcp_gso_ipv4() {
+        // Builder sets ACK+PSH+FIN — FIN/PSH must be accepted (the segmenter
+        // masks them onto only the final segment).
+        let packet = build_ipv4_tcp_packet(1000);
+        let hdr = synthesize_tcp_gso(&packet).expect("plain IPv4 TCP accepted");
+        assert_eq!(hdr.flags, 0);
+        assert_eq!(hdr.gso_type, VIRTIO_NET_HDR_GSO_TCPV4);
+        assert_eq!(hdr.hdr_len, 40);
+        assert_eq!(hdr.gso_size, 1000);
+        assert_eq!(hdr.csum_start, 20);
+        assert_eq!(hdr.csum_offset, 16);
+    }
+
+    #[test]
+    fn test_synthesize_tcp_gso_ipv6() {
+        let packet = build_ipv6_tcp_packet(1000);
+        let hdr = synthesize_tcp_gso(&packet).expect("plain IPv6 TCP accepted");
+        assert_eq!(hdr.gso_type, VIRTIO_NET_HDR_GSO_TCPV6);
+        assert_eq!(hdr.hdr_len, 60);
+        assert_eq!(hdr.gso_size, 1000);
+        assert_eq!(hdr.csum_start, 40);
+        assert_eq!(hdr.csum_offset, 16);
+    }
+
+    #[test]
+    fn test_synthesize_tcp_gso_ipv4_options() {
+        // Insert 4 bytes of NOP options after the fixed IPv4 header; hdr_len
+        // and csum_start must follow the IHL, not assume 20 bytes.
+        let packet = build_ipv4_tcp_packet(100);
+        let mut with_opts = Vec::with_capacity(packet.len() + 4);
+        with_opts.extend_from_slice(&packet[..20]);
+        with_opts.extend_from_slice(&[1, 1, 1, 1]);
+        with_opts.extend_from_slice(&packet[20..]);
+        with_opts[0] = 0x46; // IHL 6
+        let total_len = u16::try_from(with_opts.len()).unwrap();
+        with_opts[2..4].copy_from_slice(&total_len.to_be_bytes());
+
+        let hdr = synthesize_tcp_gso(&with_opts).expect("IPv4 with options accepted");
+        assert_eq!(hdr.hdr_len, 44);
+        assert_eq!(hdr.csum_start, 24);
+        assert_eq!(hdr.gso_size, 100);
+    }
+
+    #[test]
+    fn test_synthesize_tcp_gso_rejects_unsplittable() {
+        // SYN
+        let mut packet = build_ipv4_tcp_packet(100);
+        packet[33] |= 0x02;
+        assert!(synthesize_tcp_gso(&packet).is_none(), "SYN must be rejected");
+        // RST
+        let mut packet = build_ipv4_tcp_packet(100);
+        packet[33] |= 0x04;
+        assert!(synthesize_tcp_gso(&packet).is_none(), "RST must be rejected");
+        // URG
+        let mut packet = build_ipv4_tcp_packet(100);
+        packet[33] |= 0x20;
+        assert!(synthesize_tcp_gso(&packet).is_none(), "URG must be rejected");
+        // IPv4 fragment: MF set
+        let mut packet = build_ipv4_tcp_packet(100);
+        packet[6] |= 0x20;
+        assert!(synthesize_tcp_gso(&packet).is_none(), "MF fragment must be rejected");
+        // IPv4 fragment: non-zero offset
+        let mut packet = build_ipv4_tcp_packet(100);
+        packet[7] = 1;
+        assert!(
+            synthesize_tcp_gso(&packet).is_none(),
+            "offset fragment must be rejected"
+        );
+        // Non-TCP protocol
+        let mut packet = build_ipv4_tcp_packet(100);
+        packet[9] = 17; // UDP
+        assert!(synthesize_tcp_gso(&packet).is_none(), "non-TCP must be rejected");
+        // IPv6 non-TCP next header
+        let mut packet6 = build_ipv6_tcp_packet(100);
+        packet6[6] = 17;
+        assert!(
+            synthesize_tcp_gso(&packet6).is_none(),
+            "IPv6 non-TCP must be rejected"
+        );
+        // Empty payload: nothing to split
+        let packet = build_ipv4_tcp_packet(0);
+        assert!(
+            synthesize_tcp_gso(&packet).is_none(),
+            "empty payload must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_synthesize_tcp_gso_roundtrip_segments_valid() {
+        let packet = build_ipv4_tcp_packet(3000);
+        let mut hdr = synthesize_tcp_gso(&packet).expect("accepted");
+        hdr.gso_size = 1000;
+        let segments = segment_tcp_gso_packet(&hdr, &packet).expect("segment");
+        assert_eq!(segments.len(), 3);
+        let mut total_payload = 0;
+        for seg in &segments {
+            assert_tcp_checksum_valid(seg);
+            total_payload += seg.len() - 40;
+        }
+        assert_eq!(total_payload, 3000);
     }
 }

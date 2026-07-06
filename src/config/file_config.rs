@@ -150,8 +150,10 @@ pub struct VpnClientConfig {
     pub iroh: Option<VpnClientIrohConfig>,
 }
 
-/// Default MTU for VPN packets (1500 - ~60 bytes overhead).
-pub const DEFAULT_VPN_MTU: u16 = 1440;
+/// Default MTU for VPN packets: the IPv6 minimum link MTU, mobile-safe on any
+/// real path (see `DATAGRAM_SAFE_MTU` in the tunnel server for the rationale).
+/// Must stay in sync with [`crate::config::DEFAULT_MTU`].
+pub const DEFAULT_VPN_MTU: u16 = 1280;
 
 /// Default channel buffer size for outbound packets to each client.
 pub const DEFAULT_CLIENT_CHANNEL_SIZE: usize = 1024;
@@ -506,6 +508,12 @@ impl ResolvedVpnServerConfig {
 
         let mtu = net.mtu.unwrap_or(DEFAULT_VPN_MTU);
         validate_mtu(mtu, "network")?;
+        if net.network6.is_some() && mtu < 1280 {
+            log::warn!(
+                "[network] mtu {} is below 1280, the IPv6 minimum link MTU; inner IPv6 traffic will not work",
+                mtu
+            );
+        }
 
         let has_tokens = auth.auth_tokens.as_ref().is_some_and(|t| !t.is_empty());
         if has_tokens && auth.auth_tokens_file.is_some() {
