@@ -85,15 +85,19 @@ pub const IROH_SOCKET_BUFFER_REQUEST: usize = 7 << 20; // 7 MiB
 /// 1452 is the IPv6-safe maximum for a standard 1500-byte Ethernet path
 /// (`1500 − 40 IPv6 − 8 UDP`) and matches quinn's own DPLPMTUD `upper_bound`
 /// default. Starting here (instead of the 1200 protocol minimum) makes the
-/// per-connection `max_datagram_size` large *immediately* at handshake — the IP
-/// data path rides QUIC datagrams whose size is snapshotted once at connect, so
-/// the snapshot must start large to avoid pinning the inner TUN MTU low.
+/// per-connection `max_datagram_size` large *immediately* at handshake — the
+/// negotiated (advertised) tunnel MTU is clamped against the handshake-time
+/// snapshot, so the snapshot must start large to avoid pinning the inner TUN
+/// MTU low.
 ///
 /// This assumes a standard ≥1500-MTU path (LAN / most broadband). On a smaller
-/// path quinn's black-hole detection still lowers the *live* `current_mtu` (down
-/// to `min_mtu = 1200`), but the inner TUN MTU is fixed for the connection's
-/// life, so constrained or tunnel-in-tunnel deployments should lower `mtu` in
-/// the server config. `min_mtu` and MTU discovery keep their defaults.
+/// path quinn's black-hole detection lowers the *live* `current_mtu` (down to
+/// `min_mtu = 1200`) while the inner TUN MTU stays fixed for the connection's
+/// life. The data path handles that by framing to the live cap and software-
+/// resegmenting oversized plain TCP packets (see `tunnel::datagram`); oversized
+/// non-TCP packets are dropped like any path-MTU loss, so deployments with lots
+/// of large inner UDP on constrained paths should still lower `mtu` in the
+/// server config. `min_mtu` and MTU discovery keep their defaults.
 pub const QUIC_INITIAL_MTU: u16 = 1452;
 
 /// Create a congestion controller factory based on the selected algorithm.

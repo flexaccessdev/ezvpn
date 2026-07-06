@@ -115,9 +115,10 @@ struct ClientState {
     client_gso_enabled: bool,
     /// Effective per-connection GSO mode (server local && client reported).
     connection_gso_active: bool,
-    /// Per-connection QUIC datagram size cap, used to segment outbound frames.
-    max_datagram_size: usize,
-    /// The iroh connection, kept for reporting live path info in status.
+    /// The iroh connection, kept for reporting live path info in status and
+    /// for querying the live per-datagram cap when framing outbound packets
+    /// (the cap tracks the path MTU estimate and changes over the
+    /// connection's life — never cache it).
     connection: Connection,
 }
 
@@ -1301,12 +1302,17 @@ impl VpnServer {
                 }
                 let mut fatal = None;
                 for dgram in batch.drain(..) {
+                    let len = dgram.len();
                     match writer_conn.send_datagram_wait(dgram).await {
                         Ok(()) => {}
                         Err(SendDatagramError::TooLarge) => {
+                            // Rare race: the live cap shrank between framing
+                            // and send (framing sizes to the live cap).
                             log::warn!(
-                                "Dropping datagram to client {} larger than max_datagram_size",
-                                writer_client_id
+                                "Dropping {} B datagram to client {} larger than live max_datagram_size ({:?})",
+                                len,
+                                writer_client_id,
+                                writer_conn.max_datagram_size()
                             );
                         }
                         Err(e) => {
@@ -1363,7 +1369,6 @@ impl VpnServer {
             packet_tx: packet_tx.clone(),
             client_gso_enabled,
             connection_gso_active,
-            max_datagram_size,
             connection: connection.clone(),
         };
 
@@ -1585,13 +1590,18 @@ impl VpnServer {
     ) {
         for state in gro_states.values_mut() {
             let outputs = state.table.flush_all();
+            // Live cap; `None` means the connection is going away — skip the
+            // flush, the retain() below evicts the state once the channel closes.
+            let Some(max_datagram_size) = state.connection.max_datagram_size() else {
+                continue;
+            };
             self.send_gro_outputs_to_client(
                 &outputs,
                 arena,
                 seg_scratch,
                 pending,
                 &state.packet_tx,
-                state.max_datagram_size,
+                max_datagram_size,
             )
             .await;
         }
@@ -1975,19 +1985,26 @@ impl VpnServer {
             let client_key = (endpoint_id, device_id);
 
             // Get client's packet channel sender (DashMap lookup is lock-free)
-            let (packet_tx, client_gso_enabled, connection_gso_active, max_datagram_size) =
+            let (packet_tx, client_gso_enabled, connection_gso_active, client_conn) =
                 match self.clients.get(&client_key) {
                     Some(c) => (
                         c.packet_tx.clone(),
                         c.client_gso_enabled,
                         c.connection_gso_active,
-                        c.max_datagram_size,
+                        c.connection.clone(),
                     ),
                     None => {
                         self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 };
+
+            // Live per-datagram cap for this client: tracks its path MTU
+            // estimate, which can shrink below the negotiated tunnel MTU
+            // mid-connection. `None` means the connection is going away.
+            let Some(max_datagram_size) = client_conn.max_datagram_size() else {
+                continue;
+            };
 
             if software_gro && client_gso_enabled {
                 // Non-GSO TUN frames never carry offload metadata; push the
@@ -1999,12 +2016,12 @@ impl VpnServer {
                     .or_insert_with(|| ClientGroState {
                         table: TcpGroTable::new(),
                         packet_tx: packet_tx.clone(),
-                        max_datagram_size,
+                        connection: client_conn.clone(),
                     });
                 // Keep the freshest sender in case the client reconnected.
                 if !state.packet_tx.same_channel(&packet_tx) {
                     state.packet_tx = packet_tx.clone();
-                    state.max_datagram_size = max_datagram_size;
+                    state.connection = client_conn.clone();
                 }
                 let result = state.table.push(packet_ref);
                 if !result.outputs.is_empty() {
@@ -2065,8 +2082,9 @@ impl VpnServer {
 struct ClientGroState {
     table: TcpGroTable,
     packet_tx: mpsc::Sender<Bytes>,
-    /// Per-connection datagram cap, used when framing coalesced outputs.
-    max_datagram_size: usize,
+    /// The client's connection, for querying the live per-datagram cap when
+    /// framing coalesced outputs at flush time.
+    connection: Connection,
 }
 
 /// IP address extracted from a packet (source or destination).

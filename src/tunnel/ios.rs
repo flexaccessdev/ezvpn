@@ -224,8 +224,9 @@ impl IosSession {
     pub async fn run(self, tun_fd: RawFd) -> VpnResult<()> {
         let tun = TunDevice::from_raw_fd(tun_fd, self.server_info.mtu)?;
 
-        let max_datagram_size = self
-            .connection
+        // Validate datagram support up front; the live per-datagram cap is
+        // queried at framing time inside `run_tunnel`.
+        self.connection
             .max_datagram_size()
             .ok_or_else(|| VpnError::Signaling("Peer does not support QUIC datagrams".into()))?;
 
@@ -236,7 +237,6 @@ impl IosSession {
             tun,
             self.connection,
             self.server_info.server_gso_enabled,
-            max_datagram_size,
             None,
             None,
             local_iroh_udp_ports,

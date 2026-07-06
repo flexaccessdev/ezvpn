@@ -508,14 +508,15 @@ impl VpnClient {
                 None
             };
 
-        // The IP data path is unreliable QUIC datagrams. Each datagram is
-        // capped at the connection's `max_datagram_size`; the server already
-        // clamped the negotiated MTU to fit, and we segment GSO super-frames to
-        // this cap when sending.
+        // The IP data path is unreliable QUIC datagrams. Validate datagram
+        // support up front; the per-datagram cap is queried live at framing
+        // time because it tracks the path MTU estimate, which can change over
+        // the connection's life (the value here is only the handshake-time
+        // snapshot the server clamped the negotiated MTU against).
         let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
             VpnError::Signaling("Peer does not support QUIC datagrams".into())
         })?;
-        log::info!("QUIC max datagram size: {}", max_datagram_size);
+        log::info!("QUIC max datagram size (at handshake): {}", max_datagram_size);
 
         let offload_status = tun_device.offload_status();
         let local_gso_enabled = offload_status.enabled;
@@ -594,7 +595,6 @@ impl VpnClient {
             tun_device,
             connection,
             server_info.server_gso_enabled,
-            max_datagram_size,
             bypass_route_guard,
             server_addr_tx,
             local_iroh_udp_ports,
@@ -881,10 +881,16 @@ pub(crate) async fn perform_handshake(
 /// connection ends the tunnel.
 async fn flush_datagrams(connection: &Connection, pending: &mut Vec<Bytes>) -> Result<(), String> {
     for dgram in pending.drain(..) {
+        let len = dgram.len();
         match connection.send_datagram_wait(dgram).await {
             Ok(()) => {}
             Err(SendDatagramError::TooLarge) => {
-                log::warn!("Dropping outbound datagram larger than QUIC max_datagram_size");
+                // Rare race: the live cap shrank between framing and send.
+                log::warn!(
+                    "Dropping {} B outbound datagram larger than QUIC max_datagram_size ({:?})",
+                    len,
+                    connection.max_datagram_size()
+                );
             }
             Err(e) => return Err(format!("QUIC datagram send error: {}", e)),
         }
@@ -900,13 +906,13 @@ async fn flush_datagrams(connection: &Connection, pending: &mut Vec<Bytes>) -> R
 /// liveness is detected by `Connection::closed()` (QUIC keep-alive + idle
 /// timeout) — there is no application-level heartbeat.
 ///
-/// `server_gso_enabled` is the server's advertised GSO capability;
-/// `max_datagram_size` is the per-datagram cap GSO super-frames are segmented to.
+/// `server_gso_enabled` is the server's advertised GSO capability. The
+/// per-datagram cap packets are framed/segmented to is queried live from the
+/// connection before each framing batch, so it follows the path MTU estimate.
 pub(crate) async fn run_tunnel(
     tun_device: TunDevice,
     connection: Connection,
     server_gso_enabled: bool,
-    max_datagram_size: usize,
     bypass_route_guard: Option<AbortOnDropTask>,
     server_addr_tx: Option<mpsc::Sender<HashSet<IpAddr>>>,
     local_iroh_udp_ports: Arc<HashSet<u16>>,
@@ -960,6 +966,9 @@ pub(crate) async fn run_tunnel(
                     Some(read_result) => read_result,
                     None => {
                         pending.clear();
+                        let Some(max_datagram_size) = conn_out.max_datagram_size() else {
+                            return Some("QUIC datagram support lost on connection".to_string());
+                        };
                         if let Err(e) = build_gro_datagrams(
                             &mut arena,
                             &mut seg_scratch,
@@ -995,6 +1004,12 @@ pub(crate) async fn run_tunnel(
                         );
                         continue;
                     }
+
+                    // Live per-datagram cap: tracks the path MTU estimate, which
+                    // can shrink below the negotiated tunnel MTU mid-connection.
+                    let Some(max_datagram_size) = conn_out.max_datagram_size() else {
+                        return Some("QUIC datagram support lost on connection".to_string());
+                    };
 
                     if software_gro {
                         // Non-GSO TUN frames never carry offload metadata;
@@ -1047,16 +1062,18 @@ pub(crate) async fn run_tunnel(
                     log::error!("TUN read error: {}", e);
                     // Flush pending coalesced groups before shutting down.
                     pending.clear();
-                    if build_gro_datagrams(
-                        &mut arena,
-                        &mut seg_scratch,
-                        &mut pending,
-                        &gro_table.flush_all(),
-                        max_datagram_size,
-                    )
-                    .is_ok()
-                    {
-                        let _ = flush_datagrams(&conn_out, &mut pending).await;
+                    if let Some(max_datagram_size) = conn_out.max_datagram_size() {
+                        if build_gro_datagrams(
+                            &mut arena,
+                            &mut seg_scratch,
+                            &mut pending,
+                            &gro_table.flush_all(),
+                            max_datagram_size,
+                        )
+                        .is_ok()
+                        {
+                            let _ = flush_datagrams(&conn_out, &mut pending).await;
+                        }
                     }
                     return Some(format!("TUN read error: {}", e));
                 }
