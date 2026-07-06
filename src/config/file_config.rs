@@ -202,6 +202,11 @@ pub fn validate_transport_tuning(tuning: &TransportTuning, section: &str) -> Res
 /// Minimum VPN tunnel MTU.
 const MIN_VPN_MTU: u16 = 576;
 
+/// IPv6 minimum link MTU (RFC 8200): inner IPv6 cannot run on a smaller link.
+/// A protocol constant — deliberately independent of [`DEFAULT_VPN_MTU`], which
+/// merely happens to equal it today.
+const IPV6_MIN_MTU: u16 = 1280;
+
 /// Maximum VPN tunnel MTU. Jumbo frames are allowed because throughput on
 /// per-packet-syscall-bound platforms (notably macOS `utun`, which has no GSO
 /// and reads one packet per syscall) scales ~linearly with MTU. The transport
@@ -508,10 +513,11 @@ impl ResolvedVpnServerConfig {
 
         let mtu = net.mtu.unwrap_or(DEFAULT_VPN_MTU);
         validate_mtu(mtu, "network")?;
-        if net.network6.is_some() && mtu < 1280 {
+        if net.network6.is_some() && mtu < IPV6_MIN_MTU {
             log::warn!(
-                "[network] mtu {} is below 1280, the IPv6 minimum link MTU; inner IPv6 traffic will not work",
-                mtu
+                "[network] mtu {} is below {}, the IPv6 minimum link MTU; inner IPv6 traffic will not work",
+                mtu,
+                IPV6_MIN_MTU
             );
         }
 

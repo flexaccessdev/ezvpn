@@ -2032,16 +2032,18 @@ mod tests {
     fn test_backoff_capped_at_max() {
         let mut rng = ChaCha8Rng::seed_from_u64(12345);
 
-        // Attempt 6+: base = 32000ms, but capped to 30000ms
+        // Attempt 6+: base = 32000ms exceeds the cap, so the result is exactly
+        // the 30s cap regardless of jitter. Hardcoded so an upward drift of
+        // BACKOFF_MAX_MS fails this test.
         let d6 = calculate_backoff_with_rng(6, &mut rng);
-        assert!(d6.as_millis() <= BACKOFF_MAX_MS as u128);
+        assert_eq!(d6, Duration::from_millis(30_000));
 
         let d7 = calculate_backoff_with_rng(7, &mut rng);
-        assert!(d7.as_millis() <= BACKOFF_MAX_MS as u128);
+        assert_eq!(d7, Duration::from_millis(30_000));
 
         // Very high attempt still capped
         let d100 = calculate_backoff_with_rng(100, &mut rng);
-        assert!(d100.as_millis() <= BACKOFF_MAX_MS as u128);
+        assert_eq!(d100, Duration::from_millis(30_000));
     }
 
     #[test]

@@ -145,8 +145,17 @@ pub fn build_datagrams(
                     );
                 }
                 let ip_version = packet.first().map(|b| b >> 4).unwrap_or(0);
+                // synthesize_tcp_gso also rejects TCP it cannot safely split
+                // (fragments, SYN/RST/URG, IPv6 extension headers); report
+                // that distinctly from genuine non-TCP traffic.
+                let is_tcp = match ip_version {
+                    4 => packet.get(9) == Some(&6),
+                    6 => packet.get(6) == Some(&6),
+                    _ => false,
+                };
+                let kind = if is_tcp { "unsplittable TCP" } else { "non-TCP" };
                 log::warn!(
-                    "Dropping plain IPv{ip_version} non-TCP packet ({framed_len} B framed) exceeding max_datagram_size ({max_datagram_size}); path MTU below inner MTU"
+                    "Dropping plain IPv{ip_version} {kind} packet ({framed_len} B framed) exceeding max_datagram_size ({max_datagram_size}); path MTU below inner MTU"
                 );
                 return Ok(());
             }
