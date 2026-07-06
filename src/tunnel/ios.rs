@@ -19,7 +19,7 @@
 //! - does **not** take the single-instance lock or open a control socket.
 //!
 //! It reuses the portable data plane wholesale: the same handshake
-//! ([`crate::tunnel::client::perform_handshake`]) and datagram loop
+//! ([`crate::tunnel::client::perform_handshake`]) and data-stream loop
 //! ([`crate::tunnel::client::run_tunnel`]).
 //!
 //! The flow is two-phase because the extension needs the server-assigned
@@ -37,10 +37,11 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use ipnet::{Ipv4Net, Ipv6Net};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 
+use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
 use crate::transport::endpoint::create_client_endpoint;
@@ -90,7 +91,7 @@ pub struct IosNetworkConfig {
     /// VPN IPv6 gateway (the server's VPN address). The extension must add it
     /// as an included `/128` route.
     pub gateway6: Option<Ipv6Addr>,
-    /// Server-dictated tunnel MTU.
+    /// Fixed tunnel MTU ([`VPN_MTU`]).
     pub mtu: u16,
     /// IPv4 server underlay addresses (`/32`) to exclude from the tunnel because
     /// they overlap a routed prefix (would otherwise self-capture).
@@ -103,6 +104,10 @@ pub struct IosNetworkConfig {
 pub struct IosSession {
     endpoint: Endpoint,
     connection: Connection,
+    /// Send half of the data stream (the handshake bi-stream, kept open).
+    data_send: SendStream,
+    /// Receive half of the data stream.
+    data_recv: RecvStream,
     server_info: ServerInfo,
     /// IPv4 underlay `/32`s (relay + server addresses) overlapping a routed
     /// prefix (computed at connect, see [`Self::connect`]).
@@ -142,7 +147,7 @@ impl IosSession {
         // Random per-session id, like the desktop client. The server keys IP
         // allocation by (endpoint id, device id).
         let device_id: u64 = rand::rng().random();
-        let server_info =
+        let (server_info, data_send, data_recv) =
             perform_handshake(&connection, device_id, cfg.auth_token.as_deref()).await?;
 
         // `perform_handshake` already guarantees at least one family was
@@ -187,12 +192,14 @@ impl IosSession {
             server_info.assigned_ip6,
             server_info.network6,
             server_info.server_ip6,
-            server_info.mtu
+            VPN_MTU
         );
 
         Ok(Self {
             endpoint,
             connection,
+            data_send,
+            data_recv,
             server_info,
             excluded_routes,
             excluded_routes6,
@@ -210,7 +217,7 @@ impl IosSession {
             assigned_ip6: info.assigned_ip6,
             prefix_len6: info.network6.map(|n| n.prefix_len()),
             gateway6: info.server_ip6,
-            mtu: info.mtu,
+            mtu: VPN_MTU,
             excluded_routes: self.excluded_routes.clone(),
             excluded_routes6: self.excluded_routes6.clone(),
         })
@@ -225,7 +232,7 @@ impl IosSession {
     /// front, by the extension's `NEPacketTunnelNetworkSettings` (computed in
     /// [`Self::connect`], see module docs).
     pub async fn run(self, tun_fd: RawFd) -> VpnResult<()> {
-        let tun = TunDevice::from_raw_fd(tun_fd, self.server_info.mtu)?;
+        let tun = TunDevice::from_raw_fd(tun_fd, VPN_MTU)?;
 
         let local_iroh_udp_ports: Arc<HashSet<u16>> =
             Arc::new(collect_local_iroh_udp_ports(&self.endpoint));
@@ -233,6 +240,8 @@ impl IosSession {
         run_tunnel(
             tun,
             self.connection,
+            self.data_send,
+            self.data_recv,
             self.server_info.server_gso_enabled,
             None,
             None,

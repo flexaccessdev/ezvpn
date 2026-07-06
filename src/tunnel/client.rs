@@ -15,8 +15,9 @@
 use crate::net::buffer::uninitialized_vec;
 #[cfg(not(target_os = "ios"))]
 use crate::config::VpnClientConfig;
-use crate::tunnel::datagram::{
-    Datagram, FRAME_ARENA_CHUNK, build_datagrams, build_gro_datagrams, classify,
+use crate::tunnel::stream::{
+    FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, build_frames, build_gro_frames, classify,
+    copy_packet_to_arena, read_frame, write_frames,
 };
 use crate::net::device::{
     BypassRouteGuard, Route6Guard, RouteGuard, TunConfig, TunDevice, UnderlayGateway,
@@ -29,15 +30,15 @@ use crate::error::{VpnError, VpnResult};
 use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::{TcpGroTable, VirtioNetHdr, materialize_offload_into};
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
+use crate::config::VPN_MTU;
 use crate::tunnel::signaling::{
-    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse, WireTransport,
+    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse,
     parse_ip_packet_v2, read_message, write_message,
 };
-use crate::transport::build_quic_transport_config;
 use crate::transport::endpoint::parse_relay_mode;
 use bytes::{Bytes, BytesMut};
 use ipnet::{Ipv4Net, Ipv6Net};
-use iroh::endpoint::{ConnectOptions, Connection, SendDatagramError};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -55,12 +56,13 @@ const WRITE_BATCH_SIZE: usize = 256;
 
 /// Channel buffer size for inbound packets queued to the TUN writer task.
 ///
-/// Decouples datagram receipt from TUN write syscalls so the inbound reader
-/// keeps draining datagrams while the writer task issues per-packet TUN writes.
+/// Decouples frame receipt from TUN write syscalls so the inbound reader
+/// keeps draining the data stream while the writer task issues per-packet TUN
+/// writes.
 const INBOUND_TUN_CHANNEL_SIZE: usize = 512;
 
 /// Channel buffer size for server-published candidate-address sets handed from
-/// the inbound datagram loop to the bypass-route manager. Tiny: publications are
+/// the inbound frame loop to the bypass-route manager. Tiny: publications are
 /// infrequent (every [`crate::transport::SERVER_ADDR_PUBLISH_INTERVAL`]) and a
 /// dropped one is recovered by the next periodic publish.
 const SERVER_ADDR_CHANNEL_SIZE: usize = 8;
@@ -139,10 +141,6 @@ pub struct ServerInfo {
     pub server_ip6: Option<Ipv6Addr>,
     /// Whether server-side Linux TUN GSO is enabled.
     pub server_gso_enabled: bool,
-    /// QUIC transport settings dictated by the server.
-    pub transport: WireTransport,
-    /// MTU dictated by the server for the client TUN device.
-    pub mtu: u16,
     /// Server's candidate iroh underlay addresses, delivered in the handshake so
     /// the client can bypass-route any a VPN route would capture at onboarding
     /// (rather than waiting for the first periodic data-path publication). Empty
@@ -155,8 +153,8 @@ pub struct ServerInfo {
 /// Captured from the first successful handshake and compared against every
 /// later reconnect. A change to just the assigned client IP(s) is rebuilt in
 /// place (the next `connect()` builds a fresh TUN device and routes for the new
-/// address); a change to any other field — network, gateway, the IPv6 trio, or
-/// mtu — makes the client quit instead (see
+/// address); a change to any other field — network, gateway, or the IPv6 trio —
+/// makes the client quit instead (see
 /// [`VpnClient::check_config_consistency`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetworkParams {
@@ -166,7 +164,6 @@ struct NetworkParams {
     assigned_ip6: Option<Ipv6Addr>,
     network6: Option<Ipv6Net>,
     server_ip6: Option<Ipv6Addr>,
-    mtu: u16,
 }
 
 impl NetworkParams {
@@ -178,7 +175,6 @@ impl NetworkParams {
             assigned_ip6: info.assigned_ip6,
             network6: info.network6,
             server_ip6: info.server_ip6,
-            mtu: info.mtu,
         }
     }
 
@@ -192,7 +188,6 @@ impl NetworkParams {
             && self.server_ip == other.server_ip
             && self.network6 == other.network6
             && self.server_ip6 == other.server_ip6
-            && self.mtu == other.mtu
     }
 }
 
@@ -203,14 +198,13 @@ impl std::fmt::Display for NetworkParams {
         }
         write!(
             f,
-            "ip={} net={} gw={} ip6={} net6={} gw6={} mtu={}",
+            "ip={} net={} gw={} ip6={} net6={} gw6={}",
             opt(&self.assigned_ip),
             opt(&self.network),
             opt(&self.server_ip),
             opt(&self.assigned_ip6),
             opt(&self.network6),
             opt(&self.server_ip6),
-            self.mtu,
         )
     }
 }
@@ -223,7 +217,7 @@ impl std::fmt::Display for NetworkParams {
 ///   baseline and return `Ok`, so the caller rebuilds the TUN device and routes
 ///   for the new address (this is what a server restart that reassigns the IP
 ///   looks like);
-/// - any other field changed (network, gateway, IPv6 trio, mtu) →
+/// - any other field changed (network, gateway, IPv6 trio) →
 ///   [`VpnError::ServerConfigChanged`], a non-recoverable error that quits.
 ///
 /// Factored out of [`VpnClient::check_config_consistency`] so the set-once /
@@ -324,71 +318,18 @@ impl VpnClient {
     pub async fn connect(&self, endpoint: &Endpoint, relay_urls: &[String]) -> VpnResult<()> {
         let endpoint_addr = self.resolve_server_addr(relay_urls)?;
 
-        // Connect to server with the baseline transport tuning (the client
-        // endpoint defaults). The server dictates the effective transport
-        // settings in the handshake response.
+        // Client and server both build the identical fixed transport config
+        // (see crate::transport), so nothing is negotiated or upgraded here.
         let connection = endpoint
-            .connect(endpoint_addr.clone(), VPN_ALPN)
+            .connect(endpoint_addr, VPN_ALPN)
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to connect to server: {}", e)))?;
 
         log::info!("Connected to server, performing handshake...");
 
-        // Perform handshake on first stream
-        let mut server_info = self.perform_handshake(&connection).await?;
-
-        // The congestion controller (and send window) cannot be changed on a
-        // live connection, so when the server dictates non-baseline transport
-        // settings, reconnect once with a per-connection transport config.
-        let baseline = WireTransport::default();
-        let connection = if server_info.transport == baseline {
-            connection
-        } else {
-            log::info!(
-                "Server dictates non-default transport settings (cc={:?}, receive={}KB, send={}KB), reconnecting to apply them...",
-                server_info.transport.congestion_controller,
-                server_info.transport.receive_window / 1024,
-                server_info.transport.send_window / 1024
-            );
-            connection.close(0u32.into(), b"transport upgrade");
-
-            let tuning = server_info.transport.to_tuning();
-            let transport_config = build_quic_transport_config(&tuning).map_err(|e| {
-                VpnError::Signaling(format!("Failed to build transport config: {}", e))
-            })?;
-            let connection = endpoint
-                .connect_with_opts(
-                    endpoint_addr,
-                    VPN_ALPN,
-                    ConnectOptions::new().with_transport_config(transport_config),
-                )
-                .await
-                .map_err(|e| VpnError::Signaling(format!("Failed to reconnect to server: {}", e)))?
-                .await
-                .map_err(|e| {
-                    VpnError::Signaling(format!("Failed to reconnect to server: {}", e))
-                })?;
-
-            // Re-handshake on the upgraded connection. The server allocates
-            // the same addresses (keyed by endpoint ID + device ID).
-            let applied_transport = server_info.transport;
-            let new_info = self.perform_handshake(&connection).await?;
-            if new_info.transport != applied_transport {
-                // Server changed its answer mid-flight (e.g. restart with new
-                // config). Proceed with the connection we have instead of
-                // risking a reconnect loop.
-                log::warn!(
-                    "Server transport settings changed during reconnect (expected {:?}, got {:?}); continuing",
-                    applied_transport,
-                    new_info.transport
-                );
-            }
-            server_info = new_info;
-            // Keep the transport actually applied to this connection, not the
-            // second response's answer, so later logging reflects reality.
-            server_info.transport = applied_transport;
-            connection
-        };
+        // Perform handshake on the first bi-stream; it stays open as the
+        // reliable data stream afterwards.
+        let (server_info, data_send, data_recv) = self.perform_handshake(&connection).await?;
 
         // Monitor and report connection path changes (e.g., relay -> direct)
         let _path_watcher = watch_connection_paths(&connection, "Connection");
@@ -423,13 +364,7 @@ impl VpnClient {
             log::info!("  Mode: IPv4-only");
         }
         log::info!("  Server GSO enabled: {}", server_info.server_gso_enabled);
-        log::info!("  MTU (server-dictated): {}", server_info.mtu);
-        log::info!(
-            "  Transport (server-dictated): cc={:?}, receive={}KB, send={}KB",
-            server_info.transport.congestion_controller,
-            server_info.transport.receive_window / 1024,
-            server_info.transport.send_window / 1024
-        );
+        log::info!("  MTU (fixed): {}", VPN_MTU);
 
         // If this is a reconnect and the server's network parameters changed,
         // quit rather than rebuild for a new config — unless only the assigned
@@ -525,18 +460,6 @@ impl VpnClient {
                 None
             };
 
-        // The IP data path is unreliable QUIC datagrams; verify the peer
-        // supports them. The datagram cap is read live during the packet loop
-        // (it tracks path-MTU discovery); this handshake-time value is
-        // informational only.
-        let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
-            VpnError::Signaling("Peer does not support QUIC datagrams".into())
-        })?;
-        log::info!(
-            "QUIC max datagram size at connect: {} (tracks path-MTU discovery)",
-            max_datagram_size
-        );
-
         let offload_status = tun_device.offload_status();
         let local_gso_enabled = offload_status.enabled;
         let negotiated_gso = local_gso_enabled && server_info.server_gso_enabled;
@@ -586,7 +509,7 @@ impl VpnClient {
                 assigned_ip6: server_info.assigned_ip6.map(|ip| ip.to_string()),
                 network6: server_info.network6.map(|n| n.to_string()),
                 gateway6: server_info.server_ip6.map(|ip| ip.to_string()),
-                mtu: server_info.mtu,
+                mtu: VPN_MTU,
                 gso_negotiated: negotiated_gso,
                 routes: active_routes,
                 routes6: active_routes6,
@@ -605,14 +528,16 @@ impl VpnClient {
             );
         }
 
-        // Run the VPN packet loop (tunneled over iroh datagrams). Hand the still-
-        // armed guard to `run_tunnel`, which disarms it only after its own setup
-        // can no longer return early (past `tun_device.split()`); until then the
-        // guard keeps aborting the bypass task on any early exit. `run_tunnel`
-        // aborts the task when the VPN ends.
+        // Run the VPN packet loop (tunneled over the reliable data stream).
+        // Hand the still-armed guard to `run_tunnel`, which disarms it only
+        // after its own setup can no longer return early (past
+        // `tun_device.split()`); until then the guard keeps aborting the bypass
+        // task on any early exit. `run_tunnel` aborts the task when the VPN ends.
         let result = run_tunnel(
             tun_device,
             connection,
+            data_send,
+            data_recv,
             server_info.server_gso_enabled,
             bypass_route_guard,
             server_addr_tx,
@@ -657,11 +582,12 @@ impl VpnClient {
         Ok(addr)
     }
 
-    /// Perform VPN handshake with the server.
+    /// Perform VPN handshake with the server, returning the assigned network
+    /// parameters and the bi-stream that now carries the data frames.
     async fn perform_handshake(
         &self,
         connection: &iroh::endpoint::Connection,
-    ) -> VpnResult<ServerInfo> {
+    ) -> VpnResult<(ServerInfo, SendStream, RecvStream)> {
         perform_handshake(connection, self.device_id, self.config.auth_token.as_deref()).await
     }
 
@@ -681,16 +607,16 @@ impl VpnClient {
             // Dual-stack: both IPv4 and IPv6
             (Some(ip4), Some(net4), Some(gw4), Some(ip6), Some(net6), Some(_gw6)) => {
                 TunConfig::new(ip4, net4.netmask(), gw4)
-                    .with_mtu(server_info.mtu)
+                    .with_mtu(VPN_MTU)
                     .with_ipv6(ip6, net6.prefix_len())?
             }
             // IPv4-only
             (Some(ip4), Some(net4), Some(gw4), None, None, None) => {
-                TunConfig::new(ip4, net4.netmask(), gw4).with_mtu(server_info.mtu)
+                TunConfig::new(ip4, net4.netmask(), gw4).with_mtu(VPN_MTU)
             }
             // IPv6-only
             (None, None, None, Some(ip6), Some(net6), Some(_gw6)) => {
-                TunConfig::ipv6_only(ip6, net6.prefix_len(), server_info.mtu)?
+                TunConfig::ipv6_only(ip6, net6.prefix_len(), VPN_MTU)?
             }
             // Invalid: should be caught earlier in perform_handshake
             _ => {
@@ -799,7 +725,8 @@ impl VpnClient {
 }
 
 /// Perform the VPN handshake on `connection` and return the server-assigned
-/// network parameters.
+/// network parameters plus the stream halves of the handshake bi-stream, which
+/// stays open as the reliable data stream.
 ///
 /// Shared by the desktop [`VpnClient`] and the iOS connect path
 /// ([`crate::tunnel::ios`]): both open a bi-stream, send a [`VpnHandshake`]
@@ -810,16 +737,17 @@ pub(crate) async fn perform_handshake(
     connection: &Connection,
     device_id: u64,
     auth_token: Option<&str>,
-) -> VpnResult<ServerInfo> {
-    // Open bidirectional stream for handshake
+) -> VpnResult<(ServerInfo, SendStream, RecvStream)> {
+    // Open the bidirectional stream used for the handshake and, once the
+    // response is in, all data frames.
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|e| VpnError::Signaling(format!("Failed to open stream: {}", e)))?;
 
     // Send handshake. The client advertises its data-channel GSO capability
-    // here (the data path is datagrams, so there is no separate, racy
-    // capabilities message — the reliable handshake carries it).
+    // here (the handshake leads the data frames on the same reliable stream,
+    // so there is no separate, racy capabilities message).
     let mut handshake = VpnHandshake::new(device_id).with_gso(ADVERTISED_GSO);
     if let Some(token) = auth_token {
         handshake = handshake.with_auth_token(token);
@@ -875,61 +803,40 @@ pub(crate) async fn perform_handshake(
         ));
     }
 
-    // Close handshake stream (best-effort, handshake already completed)
-    if let Err(e) = send.finish() {
-        log::debug!("Failed to finish handshake stream: {}", e);
-    }
-    Ok(ServerInfo {
-        assigned_ip,
-        network,
-        server_ip,
-        assigned_ip6,
-        network6,
-        server_ip6,
-        server_gso_enabled: response.server_gso_enabled,
-        transport: response.transport,
-        mtu: response.mtu,
-        server_addrs: response.server_addrs,
-    })
-}
-
-/// Send every queued datagram over the connection.
-///
-/// Returns a disconnect reason on a fatal send error. A `TooLarge` datagram is
-/// dropped (the inner flow retransmits, as with any path-MTU drop); a lost
-/// connection ends the tunnel.
-async fn flush_datagrams(connection: &Connection, pending: &mut Vec<Bytes>) -> Result<(), String> {
-    for dgram in pending.drain(..) {
-        let dgram_len = dgram.len();
-        match connection.send_datagram_wait(dgram).await {
-            Ok(()) => {}
-            Err(SendDatagramError::TooLarge) => {
-                log::warn!(
-                    "Dropping outbound datagram ({} B) larger than QUIC max_datagram_size ({:?}); path MTU shrank mid-batch",
-                    dgram_len,
-                    connection.max_datagram_size()
-                );
-            }
-            Err(e) => return Err(format!("QUIC datagram send error: {}", e)),
-        }
-    }
-    Ok(())
+    // Keep the stream open: it now carries the data frames.
+    Ok((
+        ServerInfo {
+            assigned_ip,
+            network,
+            server_ip,
+            assigned_ip6,
+            network6,
+            server_ip6,
+            server_gso_enabled: response.server_gso_enabled,
+            server_addrs: response.server_addrs,
+        },
+        send,
+        recv,
+    ))
 }
 
 /// Run the VPN packet processing loop over the iroh QUIC connection.
 ///
-/// IP packets travel as unreliable QUIC datagrams; the reliable handshake was
-/// already completed on a bi-stream by the caller. This function only shovels
-/// framed IP packets between the TUN device and the datagram transport. Peer
-/// liveness is detected by `Connection::closed()` (QUIC keep-alive + idle
-/// timeout) — there is no application-level heartbeat.
+/// IP packets travel as length-prefixed frames on the reliable data stream
+/// (`data_send`/`data_recv`, the same bi-stream the handshake ran on). This
+/// function only shovels framed IP packets between the TUN device and that
+/// stream. Peer liveness is detected by `Connection::closed()` (QUIC
+/// keep-alive + idle timeout) — there is no application-level heartbeat.
 ///
-/// `server_gso_enabled` is the server's advertised GSO capability. The
-/// per-datagram cap frames are segmented to is read live from the connection
-/// each loop iteration, so framing follows QUIC path-MTU discovery.
+/// `server_gso_enabled` is the server's advertised GSO capability. The stream
+/// is size-agnostic (QUIC packetizes it), so frames are never segmented for
+/// path MTU — only when GSO metadata was not negotiated.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tunnel(
     tun_device: TunDevice,
     connection: Connection,
+    data_send: SendStream,
+    data_recv: RecvStream,
     server_gso_enabled: bool,
     bypass_route_guard: Option<AbortOnDropTask>,
     server_addr_tx: Option<mpsc::Sender<HashSet<IpAddr>>>,
@@ -945,19 +852,18 @@ pub(crate) async fn run_tunnel(
     let negotiated_gso = local_gso_enabled && server_gso_enabled;
     let buffer_size = tun_reader.buffer_size();
 
-    // Spawn outbound task (TUN -> datagrams -> connection.send_datagram_wait).
-    // `send_datagram` takes `&Connection`, so no writer task or channel is
-    // needed: the TUN reader frames and sends datagrams inline (like a UDP
-    // socket send). Returns a disconnect reason on a fatal error.
-    let conn_out = connection.clone();
+    // Spawn outbound task (TUN -> frames -> data stream). The task owns the
+    // stream's send half: the TUN reader frames packets and writes them
+    // inline. Returns a disconnect reason on a fatal error.
+    let mut data_send = data_send;
     let local_iroh_udp_ports_out = local_iroh_udp_ports.clone();
     let mut outbound_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
         let mut read_storage = uninitialized_vec(buffer_size);
-        // Long-lived framing arena: datagrams are appended and split off as
+        // Long-lived framing arena: frames are appended and split off as
         // refcounted Bytes views, amortizing allocations across packets.
         let mut arena = BytesMut::with_capacity(FRAME_ARENA_CHUNK);
         // Reusable scratch for software-materializing offload super-frames,
-        // and the per-iteration list of datagrams to send.
+        // and the per-iteration list of frames to send.
         let mut seg_scratch: Vec<u8> = Vec::new();
         let mut pending: Vec<Bytes> = Vec::new();
         // Software GRO: on a non-GSO local TUN, coalesce consecutive
@@ -975,12 +881,6 @@ pub(crate) async fn run_tunnel(
         // zeroes the buffer once instead of on every read.
         let mut packet_buf = ReadBuf::uninit(&mut read_storage);
         loop {
-            // Read the datagram cap live each iteration so framing follows
-            // QUIC path-MTU discovery as it raises (or black-hole detection
-            // lowers) the path MTU.
-            let Some(max_datagram_size) = conn_out.max_datagram_size() else {
-                return Some("QUIC datagrams no longer supported by peer".to_string());
-            };
             packet_buf.clear();
             // Event-driven GRO: keep pulling segments that are already
             // queued on the TUN; the instant it drains, emit every
@@ -990,16 +890,17 @@ pub(crate) async fn run_tunnel(
                     Some(read_result) => read_result,
                     None => {
                         pending.clear();
-                        if let Err(e) = build_gro_datagrams(
+                        if let Err(e) = build_gro_frames(
                             &mut arena,
                             &mut seg_scratch,
                             &mut pending,
                             &gro_table.flush_all(),
-                            max_datagram_size,
+                            true,
                         ) {
                             log::warn!("Failed to frame coalesced packet: {}", e);
-                        } else if let Err(reason) = flush_datagrams(&conn_out, &mut pending).await {
-                            return Some(reason);
+                        } else if let Err(reason) = write_frames(&mut data_send, &mut pending).await
+                        {
+                            return Some(reason.to_string());
                         }
                         tun_reader.read_buf(&mut packet_buf).await
                     }
@@ -1032,18 +933,18 @@ pub(crate) async fn run_tunnel(
                         let result = gro_table.push(packet);
                         if !result.outputs.is_empty() {
                             pending.clear();
-                            if let Err(e) = build_gro_datagrams(
+                            if let Err(e) = build_gro_frames(
                                 &mut arena,
                                 &mut seg_scratch,
                                 &mut pending,
                                 &result.outputs,
-                                max_datagram_size,
+                                true,
                             ) {
                                 log::warn!("Failed to frame coalesced packet: {}", e);
                             } else if let Err(reason) =
-                                flush_datagrams(&conn_out, &mut pending).await
+                                write_frames(&mut data_send, &mut pending).await
                             {
-                                return Some(reason);
+                                return Some(reason.to_string());
                             }
                         }
                         if !result.pass_through {
@@ -1053,23 +954,22 @@ pub(crate) async fn run_tunnel(
                         // framing below, avoiding any packet copy.
                     }
 
-                    // Frame the packet into one or more datagrams (segmenting
-                    // GSO super-frames to the datagram cap) and send them.
+                    // Frame the packet (software-segmenting GSO super-frames
+                    // only when the peer did not negotiate GSO) and send.
                     pending.clear();
-                    if let Err(e) = build_datagrams(
+                    if let Err(e) = build_frames(
                         &mut arena,
                         &mut seg_scratch,
                         &mut pending,
                         offload.as_ref(),
                         packet,
                         negotiated_gso,
-                        max_datagram_size,
                     ) {
                         log::warn!("Failed to frame packet: {}", e);
                         continue;
                     }
-                    if let Err(reason) = flush_datagrams(&conn_out, &mut pending).await {
-                        return Some(reason);
+                    if let Err(reason) = write_frames(&mut data_send, &mut pending).await {
+                        return Some(reason.to_string());
                     }
                 }
                 Ok(()) => {}
@@ -1077,16 +977,16 @@ pub(crate) async fn run_tunnel(
                     log::error!("TUN read error: {}", e);
                     // Flush pending coalesced groups before shutting down.
                     pending.clear();
-                    if build_gro_datagrams(
+                    if build_gro_frames(
                         &mut arena,
                         &mut seg_scratch,
                         &mut pending,
                         &gro_table.flush_all(),
-                        max_datagram_size,
+                        true,
                     )
                     .is_ok()
                     {
-                        let _ = flush_datagrams(&conn_out, &mut pending).await;
+                        let _ = write_frames(&mut data_send, &mut pending).await;
                     }
                     return Some(format!("TUN read error: {}", e));
                 }
@@ -1094,7 +994,7 @@ pub(crate) async fn run_tunnel(
         }
     });
 
-    // Create channel for inbound packets to decouple datagram receipt from TUN
+    // Create channel for inbound packets to decouple frame receipt from TUN
     // write syscalls. The TUN writer task owns the TunWriter.
     let (tun_write_tx, mut tun_write_rx) =
         mpsc::channel::<InboundTunWrite>(INBOUND_TUN_CHANNEL_SIZE);
@@ -1172,31 +1072,38 @@ pub(crate) async fn run_tunnel(
         }
     });
 
-    // Spawn inbound task (connection datagrams -> TUN writer channel).
-    // Returns a disconnect reason if the datagram read errors.
-    let conn_in = connection.clone();
+    // Spawn inbound task (data stream frames -> TUN writer channel). The task
+    // owns the stream's receive half. Returns a disconnect reason if the
+    // stream ends or errors.
+    let mut data_recv = data_recv;
     let mut inbound_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
         // Sink for server-published candidate addresses; `None` when no bypass
         // manager is running (the VPN installs no capturing routes).
         let server_addr_tx = server_addr_tx;
-        // Reusable buffers for software-materializing offload super-frames:
-        // segments are built in `seg_scratch`, copied once into `seg_arena`,
-        // and handed out as refcounted Bytes.
+        // Frame receive buffer, sized once for the largest legal frame body.
+        let mut frame_buf = vec![0u8; MAX_FRAME_BODY];
+        // Long-lived arena packets are copied into (once, out of the receive
+        // buffer) and split off as refcounted Bytes for the TUN writer.
+        let mut pkt_arena = BytesMut::with_capacity(FRAME_ARENA_CHUNK);
+        // Reusable scratch for software-materializing offload super-frames.
         let mut seg_scratch: Vec<u8> = Vec::new();
-        let mut seg_arena = BytesMut::new();
         let mut pending_segments: Vec<Bytes> = Vec::new();
         loop {
-            let dgram = match conn_in.read_datagram().await {
-                Ok(d) => d,
+            let body_len = match read_frame(&mut data_recv, &mut frame_buf).await {
+                Ok(Some(len)) => len,
+                Ok(None) => {
+                    log::debug!("Data stream finished by peer");
+                    return Some("data stream closed by peer".to_string());
+                }
                 Err(e) => {
-                    log::debug!("Datagram read ended: {}", e);
-                    return Some(format!("datagram read error: {}", e));
+                    log::debug!("Data stream read ended: {}", e);
+                    return Some(e.to_string());
                 }
             };
 
-            let body = match classify(&dgram) {
-                Ok(Datagram::Ip(body)) => body,
-                Ok(Datagram::ServerAddrs(body)) => {
+            let body = match classify(&frame_buf[..body_len]) {
+                Ok(Frame::Ip(body)) => body,
+                Ok(Frame::ServerAddrs(body)) => {
                     // The server periodically publishes its candidate underlay
                     // addresses; hand them to the bypass-route manager (add-only,
                     // filtered to VPN-covered IPs there). `try_send` so the
@@ -1210,13 +1117,15 @@ pub(crate) async fn run_tunnel(
                                     log::trace!("Dropping server addrs update: {}", e);
                                 }
                             }
-                            Err(e) => log::warn!("Invalid server addrs datagram: {}", e),
+                            Err(e) => log::warn!("Invalid server addrs frame: {}", e),
                         }
                     }
                     continue;
                 }
                 Err(e) => {
-                    log::trace!("Ignoring undecodable datagram: {}", e);
+                    // The length prefix already delimited the frame, so an
+                    // unknown type is skippable without losing sync.
+                    log::trace!("Ignoring undecodable frame: {}", e);
                     continue;
                 }
             };
@@ -1224,7 +1133,7 @@ pub(crate) async fn run_tunnel(
             let (offload, packet) = match parse_ip_packet_v2(body) {
                 Ok(parts) => parts,
                 Err(e) => {
-                    log::warn!("Invalid IP datagram from peer: {}", e);
+                    log::warn!("Invalid IP frame from peer: {}", e);
                     continue;
                 }
             };
@@ -1233,8 +1142,7 @@ pub(crate) async fn run_tunnel(
                 if !local_gso_enabled {
                     let materialized =
                         materialize_offload_into(&meta, packet, &mut seg_scratch, |seg| {
-                            seg_arena.extend_from_slice(seg);
-                            pending_segments.push(seg_arena.split_to(seg.len()).freeze());
+                            pending_segments.push(copy_packet_to_arena(&mut pkt_arena, seg));
                             Ok(())
                         });
                     if let Err(e) = materialized {
@@ -1254,7 +1162,7 @@ pub(crate) async fn run_tunnel(
                     }
                 } else {
                     let req = InboundTunWrite {
-                        packet: dgram.slice_ref(packet),
+                        packet: copy_packet_to_arena(&mut pkt_arena, packet),
                         offload: Some(meta),
                     };
                     if !enqueue_inbound_tun_write(&tun_write_tx, req).await {
@@ -1264,7 +1172,7 @@ pub(crate) async fn run_tunnel(
                 }
             } else {
                 let req = InboundTunWrite {
-                    packet: dgram.slice_ref(packet),
+                    packet: copy_packet_to_arena(&mut pkt_arena, packet),
                     offload: None,
                 };
                 if !enqueue_inbound_tun_write(&tun_write_tx, req).await {
@@ -1275,9 +1183,9 @@ pub(crate) async fn run_tunnel(
         }
     });
 
-    // Spawn liveness task. The data path is unreliable datagrams with no
-    // application heartbeat: QUIC keep-alive + idle timeout drive
-    // `Connection::closed()`, which resolves when the peer goes away.
+    // Spawn liveness task. There is no application heartbeat: QUIC keep-alive
+    // + idle timeout drive `Connection::closed()`, which resolves when the
+    // peer goes away (the stream tasks also notice via read/write errors).
     let conn_close = connection.clone();
     let mut liveness_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
         let reason = conn_close.closed().await;
@@ -2092,8 +2000,6 @@ mod tests {
             network6: Some("fd00::/64".parse().unwrap()),
             server_ip6: Some("fd00::1".parse().unwrap()),
             server_gso_enabled: true,
-            transport: WireTransport::default(),
-            mtu: 1280,
             server_addrs: Vec::new(),
         }
     }
@@ -2108,16 +2014,14 @@ mod tests {
         assert_eq!(p.assigned_ip6, info.assigned_ip6);
         assert_eq!(p.network6, info.network6);
         assert_eq!(p.server_ip6, info.server_ip6);
-        assert_eq!(p.mtu, info.mtu);
     }
 
     #[test]
-    fn network_params_eq_ignores_transport_and_gso() {
+    fn network_params_eq_ignores_gso() {
         let a = sample_server_info();
         let mut b = sample_server_info();
         // Fields not part of the routing/TUN identity must not affect equality.
         b.server_gso_enabled = !a.server_gso_enabled;
-        b.transport.receive_window = a.transport.receive_window.wrapping_add(4096);
         assert_eq!(
             NetworkParams::from_server_info(&a),
             NetworkParams::from_server_info(&b)
@@ -2143,10 +2047,6 @@ mod tests {
         let mut gw = sample_server_info();
         gw.server_ip = Some("10.0.0.254".parse().unwrap());
         assert_ne!(base, NetworkParams::from_server_info(&gw));
-
-        let mut mtu = sample_server_info();
-        mtu.mtu = 1400;
-        assert_ne!(base, NetworkParams::from_server_info(&mtu));
     }
 
     #[test]
@@ -2156,7 +2056,6 @@ mod tests {
         assert!(s.contains("ip=10.0.0.2"));
         assert!(s.contains("net=10.0.0.0/24"));
         assert!(s.contains("gw=10.0.0.1"));
-        assert!(s.contains("mtu=1280"));
     }
 
     #[test]
@@ -2212,10 +2111,10 @@ mod tests {
         let established = std::sync::Mutex::new(None);
         check_params_against(&established, &sample_server_info()).expect("baseline");
 
-        // IP changed AND mtu changed: the non-IP change makes it fatal.
+        // IP changed AND gateway changed: the non-IP change makes it fatal.
         let mut changed = sample_server_info();
         changed.assigned_ip = Some("10.0.0.42".parse().unwrap());
-        changed.mtu = 1400;
+        changed.server_ip = Some("10.0.0.254".parse().unwrap());
         let err = check_params_against(&established, &changed).expect_err("must reject");
         assert!(matches!(err, VpnError::ServerConfigChanged(_)));
     }

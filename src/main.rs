@@ -902,13 +902,8 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         server_ip,
         server_ip6,
         ip6_strategy: resolved.ip6_strategy,
-        mtu: resolved.mtu,
         max_clients: 254,
         auth_tokens: Some(valid_tokens),
-        drop_on_full: resolved.drop_on_full,
-        client_channel_size: resolved.client_channel_size,
-        tun_writer_channel_size: resolved.tun_writer_channel_size,
-        disable_spoofing_check: resolved.disable_spoofing_check,
     };
 
     // Fail fast if we lack the privileges to create the TUN device, before
@@ -925,7 +920,6 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         false, // relay_only - direct P2P preferred for VPN performance
         Some(secret_key),
         resolved.dns_server.as_deref(),
-        &resolved.transport,
     )
     .await
     .context("Failed to create iroh endpoint")?;
@@ -937,7 +931,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     );
 
     // Create and run VPN server
-    let server = VpnServer::new(config, endpoint.id(), &resolved.transport)
+    let server = VpnServer::new(config, endpoint.id())
         .await
         .context("Failed to create VPN server")?;
 

@@ -7,7 +7,7 @@
 //! Network Extension FFI (`src/ffi.rs`, built into a `staticlib`) both consume
 //! it. Desktop platforms (Linux/macOS/Windows) get the full client/server with
 //! TUN creation, routing, single-instance lock, and the control socket. iOS gets
-//! only the portable data plane (iroh connect + handshake + datagram loop) and
+//! only the portable data plane (iroh connect + handshake + data-stream loop) and
 //! drives an OS-provided `utun` fd — routing and IP configuration are owned by
 //! the `NEPacketTunnelProvider`, not this crate.
 

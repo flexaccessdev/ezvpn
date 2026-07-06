@@ -13,8 +13,12 @@
 # Config is grouped by purpose:
 #   [network] - VPN tunnel addressing (the VPN itself)
 #   [auth]    - client authentication tokens
-#   top-level - server runtime behavior (buffering, backpressure, security)
-#   [iroh]    - iroh transport: identity, ALPN, relays, discovery, QUIC tuning
+#   [iroh]    - iroh transport: identity, relays, discovery
+#
+# There are deliberately no performance/tuning knobs (WireGuard/Tailscale
+# style): the tunnel MTU is fixed at 1280, QUIC transport settings (congestion
+# control, windows, queue sizes) are fixed constants, and source-IP spoofing
+# checks are always enforced.
 
 # Required: validates config matches CLI command
 role = "vpnserver"
@@ -78,25 +82,9 @@ network = "10.0.0.0/24"
 # network6 = "fd00::/64"
 # ip6_strategy = "node-id"   # or omit for sequential (server_ip6 allowed then)
 
-# MTU for VPN packets (576-9216, default: 1440)
-# Lower values may help with fragmentation issues.
-# NOTE: The MTU is dictated to clients during the handshake; clients do not
-# configure it themselves. All clients share this one value.
-#
-# DATAGRAM CAP: the data path is unreliable QUIC datagrams, each bounded by the
-# connection's max_datagram_size. The initial QUIC path MTU is 1452 (IPv6-safe
-# max for a 1500-byte Ethernet path), giving a max_datagram_size of ~1416, so the
-# effective TUN MTU is clamped to a datagram-safe ceiling of ~1400 regardless of a
-# larger value here, and the per-client advertised MTU is further clamped to that
-# connection's datagram size. Configuring a jumbo MTU has no effect: a single
-# datagram cannot exceed the QUIC datagram size, so large packets would simply
-# not fit (and are dropped).
-#
-# PATH ASSUMPTION: ~1400 assumes a standard >=1500-MTU path (LAN / most
-# broadband). On a smaller or tunnel-in-tunnel path, QUIC discovery lowers the
-# live path MTU but the inner TUN MTU is fixed for the connection's life, so set
-# this lower for those deployments. For IPv6 keep the effective MTU >= 1280.
-# mtu = 1440   # default (clamped to the datagram-safe ceiling at runtime)
+# NOTE: There is no 'mtu' setting. The tunnel MTU is fixed at 1280 on both
+# ends (the IPv6 minimum link MTU and the same fixed value Tailscale uses),
+# which is mobile-safe on essentially any real path.
 
 [auth]
 # ============================================================================
@@ -117,12 +105,8 @@ auth_tokens = ["<YOUR_AUTH_TOKEN>"]  # Replace with real token from generate-aut
 # auth_tokens_file = "./vpn-tokens.txt"
 
 # ============================================================================
-# Server Runtime (Optional, top-level)
+# Performance Notes (no config keys)
 # ============================================================================
-# These are server-process behavior knobs, not iroh transport settings.
-
-# Performance Tuning
-# ------------------
 # Linux GSO offload is automatic (no config toggle).
 # On startup, server logs local TUN GSO status.
 # Per-client, server logs: `server_local`, `client_reported`, and `active` GSO status.
@@ -135,53 +119,13 @@ auth_tokens = ["<YOUR_AUTH_TOKEN>"]  # Replace with real token from generate-aut
 #   sudo sysctl -w net.core.rmem_max=7340032
 #   sudo sysctl -w net.core.wmem_max=7340032
 # ezvpn logs a startup warning when either is below 7 MiB.
-
-# Channel Buffer Sizes
-# --------------------
-# These control packet buffering between tasks. Valid range: 1-65536.
 #
-# Per-client outbound packet buffer (default: 1024)
-# Controls how many packets can be queued for each client before backpressure/drops.
-# Memory impact: client_channel_size * ~1500 bytes * connected_clients
-# - 1024 (default): ~1.5 MB per client worst case
-# client_channel_size = 1024
+# Queue behavior is fixed: when a slow client's outbound queue fills, its
+# packets are dropped (WireGuard-style) so one stalled client never blocks
+# packet delivery to the others.
 #
-# TUN writer aggregate buffer (default: 512)
-# Shared buffer for all client -> TUN traffic. Lower values bound memory usage.
-# Memory impact: tun_writer_channel_size * ~1500 bytes
-# - 512 (default): ~750 KB worst case (safe for memory-constrained hosts)
-# - 2048-4096: Better burst tolerance for high-bandwidth servers
-# tun_writer_channel_size = 512
-
-# Backpressure Behavior
-# ---------------------
-# What to do when a client's send buffer is full (default: false = apply backpressure)
-#
-# false (default): Apply backpressure by blocking the TUN reader until the slow
-#                  client's buffer has space. This guarantees no packet loss.
-#                  Best for development/homelab use where reliability matters.
-#
-# true:            Drop packets for slow clients. Prevents one slow client from
-#                  blocking packet delivery to all other clients (head-of-line
-#                  blocking). Best for real-time traffic like VoIP, gaming, or
-#                  interactive sessions at scale where latency matters more than
-#                  guaranteed delivery.
-#
-# drop_on_full = false
-
-# Security Settings
-# -----------------
-# Disable source IP spoofing checks (default: false)
-#
-# When false (default): Packets are rejected if their source IP matches another
-# client's assigned VPN IP (assigned client IP). This prevents inter-client
-# spoofing while still allowing clients to use their own public IP addresses
-# (useful for dual-stack scenarios where clients have native IPv6).
-#
-# When true: All source IP validation is disabled. Use with caution as this
-# allows clients to send packets with arbitrary source addresses.
-#
-# disable_spoofing_check = false
+# Source-IP spoofing checks are always enforced (the analog of WireGuard's
+# cryptokey routing) and cannot be disabled.
 
 [iroh]
 # ============================================================================
@@ -216,29 +160,6 @@ secret_file = "./vpn-server.key"
 #   2. mDNS - automatic discovery on the same local network
 # dns_server = "none"
 
-# ============================================================================
-# Transport Tuning (Optional)
-# ============================================================================
-# Fine-tune QUIC transport layer for performance optimization.
-# All values have sensible defaults - only configure if needed.
-#
-# NOTE: These settings are dictated to clients during the handshake. Clients
-# always connect with defaults and reconnect once to apply non-default values,
-# so the server is the single source of truth for transport tuning.
-
-[iroh.transport]
-# Congestion controller algorithm (default: cubic)
-# - cubic: Loss-based, widely deployed, best for general internet
-# - bbr: Model-based, may perform better on high-bandwidth/high-latency links
-# - newreno: Classic TCP-like, most conservative
-# congestion_controller = "cubic"
-
-# QUIC receive window in bytes (default: 8388608 = 8MB)
-# Controls flow control - larger values allow more in-flight data
-# Valid range: 1024 (1KB) to 16777216 (16MB)
-# receive_window = 8388608
-
-# QUIC send window in bytes (default: 8388608 = 8MB)
-# Controls how much data can be sent before acknowledgment
-# Valid range: 1024 (1KB) to 16777216 (16MB)
-# send_window = 8388608
+# NOTE: There is no [iroh.transport] section. QUIC transport settings are
+# fixed constants on both ends: CUBIC congestion control, 8 MB receive/send
+# windows, 15 s keep-alive, and 30 s idle timeout.
