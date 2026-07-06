@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 #
-# Build libezvpn.a for a real iOS device (aarch64-apple-ios) and stage it with
-# the C header for the separate Xcode project (../ezvpn-ios).
+# Build libezvpn for a real iOS device (aarch64-apple-ios) and bundle it into
+# libezvpn.xcframework in dist/ios, staged with the C header. This is the
+# canonical local build output; the CI release workflow zips it into the
+# libezvpn-ios.xcframework.zip asset. The sibling Xcode project (../ezvpn-ios)
+# links it via its own Swift package (Packages/Ezvpn/Package.swift) — by default
+# a pinned release download, or this dist/ios build (reached through a committed
+# symlink) when EZVPN_LOCAL_XCFRAMEWORK is set (FFI dev). This script only
+# produces dist/ios; it does not write into ../ezvpn-ios.
 #
 # Device-only by design: a Packet Tunnel Provider does not run in the iOS
-# Simulator, so there is no simulator/x86_64 slice and no XCFramework here.
+# Simulator, so there is no simulator/x86_64 slice — the xcframework carries a
+# single aarch64-apple-ios slice. An .xcframework (rather than a bare .a) is used
+# so SPM delivers the library and auto-exposes the embedded header to the app's
+# bridging header, with no vendored copy and no HEADER_SEARCH_PATHS.
 #
 # Usage:
 #   ./build-ios.sh            # release build (default)
@@ -35,19 +44,22 @@ echo "Building libezvpn.a [$PROFILE] for $TARGET ..."
 cargo build --lib ${CARGO_FLAGS} --target "$TARGET"
 
 DIST="$SCRIPT_DIR/dist/ios"
+XCFRAMEWORK="$DIST/libezvpn.xcframework"
 mkdir -p "$DIST"
-cp "target/${TARGET}/${OUT_SUBDIR}/libezvpn.a" "$DIST/libezvpn.a"
 cp "ios/ezvpn.h" "$DIST/ezvpn.h"
-echo "Staged: $DIST/libezvpn.a"
+
+echo "Creating libezvpn.xcframework ..."
+rm -rf "$XCFRAMEWORK"
+xcodebuild -create-xcframework \
+  -library "target/${TARGET}/${OUT_SUBDIR}/libezvpn.a" -headers "ios" \
+  -output "$XCFRAMEWORK"
+
+echo "Staged: $XCFRAMEWORK"
 echo "        $DIST/ezvpn.h"
-
-# If the sibling Xcode project exists, sync the artifacts into its vendor dir so
-# a rebuild there picks them up with no manual copy.
-SIBLING_VENDOR="$SCRIPT_DIR/../ezvpn-ios/vendor"
-if [ -d "$SIBLING_VENDOR" ]; then
-  cp "$DIST/libezvpn.a" "$SIBLING_VENDOR/libezvpn.a"
-  cp "$DIST/ezvpn.h"    "$SIBLING_VENDOR/ezvpn.h"
-  echo "Synced into:  $SIBLING_VENDOR/"
-fi
-
+echo
+echo "For local iOS FFI dev, build the app against this xcframework with:"
+echo "    cd ../ezvpn-ios"
+echo "    EZVPN_LOCAL_XCFRAMEWORK=1 xcodegen generate"
+echo "    EZVPN_LOCAL_XCFRAMEWORK=1 xcodebuild -project Ezvpn.xcodeproj \\"
+echo "        -scheme EzvpnApp -destination 'generic/platform=iOS' build"
 echo "Done."

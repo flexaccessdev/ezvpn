@@ -6,13 +6,13 @@ not prepared for App Store distribution.
 
 The iOS client is split across two repositories:
 
-- **This repo (`ezvpn`)** — the Rust core, compiled into a static library
-  (`libezvpn.a`) plus a small C FFI. This is where the iOS-specific Rust code
-  and the build script live.
+- **This repo (`ezvpn`)** — the Rust core, packaged as `libezvpn.xcframework`
+  (a static-library slice for `aarch64-apple-ios`) plus a small C FFI. This is
+  where the iOS-specific Rust code and the build script live.
 - **[`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios)** — the Swift Xcode
   project: a SwiftUI container app and the `NEPacketTunnelProvider` app
-  extension that links `libezvpn.a`. Build/sign/run instructions live in that
-  repo's README.
+  extension that links `libezvpn.xcframework` (consumed via a Swift package
+  binary target). Build/sign/run instructions live in that repo's README.
 
 ## Scope
 
@@ -54,7 +54,8 @@ Key source in this repo:
 - `src/ffi.rs` — the C entry points.
 - `src/net/device.rs` — `TunDevice::from_raw_fd` and the shared Darwin fd I/O.
 - `ios/ezvpn.h` — the C header (also the authoritative JSON config/result shapes).
-- `build-ios.sh` — builds and stages the library + header.
+- `build-ios.sh` — builds the device slice and bundles it into
+  `libezvpn.xcframework` (with the header) in `dist/ios`.
 
 ## C interface
 
@@ -72,7 +73,7 @@ shapes in [`ios/ezvpn.h`](../ios/ezvpn.h)):
 ```
 EzvpnApp (SwiftUI)            PacketTunnel (NEPacketTunnelProvider)
   installs VPN config  ──VPN──▶  startTunnel:
-  start/stop                       ezvpn_connect(json) ──▶ libezvpn.a
+  start/stop                       ezvpn_connect(json) ──▶ libezvpn
                                    setTunnelNetworkSettings   (iroh connect
                                    ezvpn_run(utun_fd) ─────▶   + handshake
                                   stopTunnel: ezvpn_stop        + datagram loop)
@@ -114,9 +115,12 @@ From this repo:
 ./build-ios.sh release
 ```
 
-This builds `libezvpn.a` for `aarch64-apple-ios` and stages it with the header
-in `dist/ios/`. If the sibling `../ezvpn-ios` checkout is present, it also syncs
-the artifacts into that project's `vendor/`.
+This builds the `aarch64-apple-ios` slice and bundles it into
+`dist/ios/libezvpn.xcframework` alongside the header. The CI release workflow
+zips it into the `libezvpn-ios.xcframework.zip` release asset, which `ezvpn-ios`
+downloads by default (pinned by URL+checksum in its Swift package). For local
+FFI dev, `ezvpn-ios` links this `dist/ios` build directly via a committed symlink
+when `EZVPN_LOCAL_XCFRAMEWORK` is set — see that repo's README.
 
 Then follow the [`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios) README
 to generate the Xcode project, set your signing team, and run on a device. Note
