@@ -1595,6 +1595,10 @@ impl VpnServer {
     ) {
         for state in gro_states.values_mut() {
             let Some(max_datagram_size) = state.connection.max_datagram_size() else {
+                // Datagrams unsupported (cannot happen mid-connection: the
+                // transport parameter is fixed at handshake). Drop the buffered
+                // segments rather than leave them to go stale in the table.
+                drop(state.table.flush_all());
                 continue;
             };
             let outputs = state.table.flush_all();
