@@ -41,6 +41,7 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 
+use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
 use crate::transport::endpoint::create_client_endpoint;
@@ -90,7 +91,7 @@ pub struct IosNetworkConfig {
     /// VPN IPv6 gateway (the server's VPN address). The extension must add it
     /// as an included `/128` route.
     pub gateway6: Option<Ipv6Addr>,
-    /// Server-dictated tunnel MTU.
+    /// Fixed tunnel MTU ([`VPN_MTU`]).
     pub mtu: u16,
     /// IPv4 server underlay addresses (`/32`) to exclude from the tunnel because
     /// they overlap a routed prefix (would otherwise self-capture).
@@ -187,7 +188,7 @@ impl IosSession {
             server_info.assigned_ip6,
             server_info.network6,
             server_info.server_ip6,
-            server_info.mtu
+            VPN_MTU
         );
 
         Ok(Self {
@@ -210,7 +211,7 @@ impl IosSession {
             assigned_ip6: info.assigned_ip6,
             prefix_len6: info.network6.map(|n| n.prefix_len()),
             gateway6: info.server_ip6,
-            mtu: info.mtu,
+            mtu: VPN_MTU,
             excluded_routes: self.excluded_routes.clone(),
             excluded_routes6: self.excluded_routes6.clone(),
         })
@@ -225,7 +226,7 @@ impl IosSession {
     /// front, by the extension's `NEPacketTunnelNetworkSettings` (computed in
     /// [`Self::connect`], see module docs).
     pub async fn run(self, tun_fd: RawFd) -> VpnResult<()> {
-        let tun = TunDevice::from_raw_fd(tun_fd, self.server_info.mtu)?;
+        let tun = TunDevice::from_raw_fd(tun_fd, VPN_MTU)?;
 
         let local_iroh_udp_ports: Arc<HashSet<u16>> =
             Arc::new(collect_local_iroh_udp_ports(&self.endpoint));

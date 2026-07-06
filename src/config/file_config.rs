@@ -2,7 +2,7 @@
 //! into the runtime configuration ([`crate::config`]).
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
@@ -15,50 +15,7 @@ pub enum Role {
     VpnClient,
 }
 
-/// Congestion controller algorithm selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CongestionController {
-    /// CUBIC - default loss-based controller.
-    #[default]
-    Cubic,
-    /// BBR model-based controller.
-    Bbr,
-    /// NewReno classic TCP-like controller.
-    #[serde(alias = "new_reno")]
-    NewReno,
-}
-
 pub use super::Ip6Strategy;
-
-/// Default QUIC receive window size (8 MB).
-pub const DEFAULT_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
-
-/// Transport tuning for QUIC connections.
-///
-/// Server-only configuration: the server applies it to its own endpoint and
-/// dictates the resolved values to clients during the handshake.
-#[derive(Deserialize, Default, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct TransportTuning {
-    #[serde(default)]
-    pub congestion_controller: CongestionController,
-    pub receive_window: Option<u32>,
-    pub send_window: Option<u32>,
-}
-
-impl TransportTuning {
-    /// Resolve the effective (receive, send) window sizes in bytes.
-    ///
-    /// Receive defaults to [`DEFAULT_RECEIVE_WINDOW`]; send defaults to the
-    /// effective receive window. Shared by endpoint setup and the handshake
-    /// wire values so they cannot drift.
-    pub fn effective_windows(&self) -> (u32, u32) {
-        let receive_window = self.receive_window.unwrap_or(DEFAULT_RECEIVE_WINDOW);
-        let send_window = self.send_window.unwrap_or(receive_window);
-        (receive_window, send_window)
-    }
-}
 
 /// VPN network configuration (server-assigned addressing). `[network]` section.
 ///
@@ -73,7 +30,6 @@ pub struct ServerNetworkConfig {
     pub server_ip6: Option<String>,
     #[serde(default)]
     pub ip6_strategy: Ip6Strategy,
-    pub mtu: Option<u16>,
 }
 
 /// VPN client authentication tokens accepted by the server. `[auth]` section.
@@ -89,8 +45,6 @@ pub struct ServerAuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct VpnServerIrohConfig {
     pub secret_file: Option<PathBuf>,
-    #[serde(default)]
-    pub transport: TransportTuning,
     pub relay_urls: Option<Vec<String>>,
     pub dns_server: Option<String>,
 }
@@ -128,12 +82,6 @@ pub struct VpnServerConfig {
     pub network: ServerNetworkConfig,
     #[serde(default)]
     pub auth: ServerAuthConfig,
-    #[serde(default = "default_drop_on_full")]
-    pub drop_on_full: bool,
-    pub client_channel_size: Option<usize>,
-    pub tun_writer_channel_size: Option<usize>,
-    #[serde(default)]
-    pub disable_spoofing_check: bool,
     pub iroh: Option<VpnServerIrohConfig>,
 }
 
@@ -148,98 +96,6 @@ pub struct VpnClientConfig {
     pub auto_reconnect: Option<bool>,
     pub max_reconnect_attempts: Option<NonZeroU32>,
     pub iroh: Option<VpnClientIrohConfig>,
-}
-
-/// Default MTU for VPN packets: the IPv6 minimum link MTU, mobile-safe on any
-/// real path (see `DATAGRAM_SAFE_MTU` in the tunnel server for the rationale).
-/// Must stay in sync with [`crate::config::DEFAULT_MTU`].
-pub const DEFAULT_VPN_MTU: u16 = 1280;
-
-/// Default channel buffer size for outbound packets to each client.
-pub const DEFAULT_CLIENT_CHANNEL_SIZE: usize = 1024;
-
-/// Default channel buffer size for TUN writer task.
-pub const DEFAULT_TUN_WRITER_CHANNEL_SIZE: usize = 512;
-
-/// Minimum QUIC window size (1 KB).
-const MIN_WINDOW_SIZE: u32 = 1024;
-
-/// Maximum QUIC window size (16 MB).
-const MAX_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
-
-fn validate_window_size(size: u32, field_name: &str, section: &str) -> Result<()> {
-    if size < MIN_WINDOW_SIZE {
-        anyhow::bail!(
-            "[{}] {} value {} is below minimum of {} bytes (1KB)",
-            section,
-            field_name,
-            size,
-            MIN_WINDOW_SIZE
-        );
-    }
-    if size > MAX_WINDOW_SIZE {
-        anyhow::bail!(
-            "[{}] {} value {} exceeds maximum of {} bytes (16MB)",
-            section,
-            field_name,
-            size,
-            MAX_WINDOW_SIZE
-        );
-    }
-    Ok(())
-}
-
-pub fn validate_transport_tuning(tuning: &TransportTuning, section: &str) -> Result<()> {
-    if let Some(recv) = tuning.receive_window {
-        validate_window_size(recv, "receive_window", section)?;
-    }
-    if let Some(send) = tuning.send_window {
-        validate_window_size(send, "send_window", section)?;
-    }
-    Ok(())
-}
-
-/// Minimum VPN tunnel MTU.
-const MIN_VPN_MTU: u16 = 576;
-
-/// IPv6 minimum link MTU (RFC 8200): inner IPv6 cannot run on a smaller link.
-/// A protocol constant — deliberately independent of [`DEFAULT_VPN_MTU`], which
-/// merely happens to equal it today.
-const IPV6_MIN_MTU: u16 = 1280;
-
-/// Maximum VPN tunnel MTU. Jumbo frames are allowed because throughput on
-/// per-packet-syscall-bound platforms (notably macOS `utun`, which has no GSO
-/// and reads one packet per syscall) scales ~linearly with MTU. The transport
-/// re-segments to the path MTU (TCP MSS for the dummy, QUIC datagrams for iroh),
-/// so a large *inner* MTU needs no jumbo physical frames.
-const MAX_VPN_MTU: u16 = 9216;
-
-pub(crate) fn validate_mtu(mtu: u16, section: &str) -> Result<()> {
-    if !(MIN_VPN_MTU..=MAX_VPN_MTU).contains(&mtu) {
-        anyhow::bail!(
-            "[{}] MTU {} is out of range. Valid range: {}-{}",
-            section,
-            mtu,
-            MIN_VPN_MTU,
-            MAX_VPN_MTU
-        );
-    }
-    Ok(())
-}
-
-fn validate_channel_size(size: usize, field_name: &str, section: &str) -> Result<()> {
-    if size == 0 {
-        anyhow::bail!("[{}] {} must be at least 1", section, field_name);
-    }
-    if size > 65536 {
-        anyhow::bail!(
-            "[{}] {} value {} exceeds maximum of 65536",
-            section,
-            field_name,
-            size
-        );
-    }
-    Ok(())
 }
 
 fn validate_cidr(cidr: &str) -> Result<()> {
@@ -328,10 +184,6 @@ fn validate_vpn_networks(
         .map_err(|e| anyhow::anyhow!("[{}] {}", section, e))
 }
 
-fn default_drop_on_full() -> bool {
-    false
-}
-
 impl VpnServerConfig {
     pub fn validate(&self) -> Result<()> {
         let role = self
@@ -364,10 +216,6 @@ impl VpnServerConfig {
             self.network.ip6_strategy,
             "network",
         )?;
-
-        if let Some(mtu) = self.network.mtu {
-            validate_mtu(mtu, "network")?;
-        }
 
         Ok(())
     }
@@ -474,17 +322,11 @@ pub struct ResolvedVpnServerConfig {
     pub network6: Option<String>,
     pub server_ip6: Option<String>,
     pub ip6_strategy: Ip6Strategy,
-    pub mtu: u16,
     pub secret_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
     pub dns_server: Option<String>,
     pub auth_tokens: Vec<String>,
     pub auth_tokens_file: Option<PathBuf>,
-    pub drop_on_full: bool,
-    pub client_channel_size: usize,
-    pub tun_writer_channel_size: usize,
-    pub transport: TransportTuning,
-    pub disable_spoofing_check: bool,
 }
 
 impl ResolvedVpnServerConfig {
@@ -511,16 +353,6 @@ impl ResolvedVpnServerConfig {
             "network",
         )?;
 
-        let mtu = net.mtu.unwrap_or(DEFAULT_VPN_MTU);
-        validate_mtu(mtu, "network")?;
-        if net.network6.is_some() && mtu < IPV6_MIN_MTU {
-            log::warn!(
-                "[network] mtu {} is below {}, the IPv6 minimum link MTU; inner IPv6 traffic will not work",
-                mtu,
-                IPV6_MIN_MTU
-            );
-        }
-
         let has_tokens = auth.auth_tokens.as_ref().is_some_and(|t| !t.is_empty());
         if has_tokens && auth.auth_tokens_file.is_some() {
             anyhow::bail!(
@@ -528,35 +360,17 @@ impl ResolvedVpnServerConfig {
             );
         }
 
-        let client_channel_size = cfg
-            .client_channel_size
-            .unwrap_or(DEFAULT_CLIENT_CHANNEL_SIZE);
-        validate_channel_size(client_channel_size, "client_channel_size", "config")?;
-
-        let tun_writer_channel_size = cfg
-            .tun_writer_channel_size
-            .unwrap_or(DEFAULT_TUN_WRITER_CHANNEL_SIZE);
-        validate_channel_size(tun_writer_channel_size, "tun_writer_channel_size", "config")?;
-
-        validate_transport_tuning(&iroh.transport, "iroh.transport")?;
-
         Ok(Self {
             network: net.network.clone(),
             server_ip: net.server_ip.clone(),
             network6: net.network6.clone(),
             server_ip6: net.server_ip6.clone(),
             ip6_strategy: net.ip6_strategy,
-            mtu,
             secret_file: iroh.secret_file.clone(),
             relay_urls: iroh.relay_urls.clone().unwrap_or_default(),
             dns_server: iroh.dns_server.clone(),
             auth_tokens: auth.auth_tokens.clone().unwrap_or_default(),
             auth_tokens_file: auth.auth_tokens_file.clone(),
-            drop_on_full: cfg.drop_on_full,
-            client_channel_size,
-            tun_writer_channel_size,
-            transport: iroh.transport.clone(),
-            disable_spoofing_check: cfg.disable_spoofing_check,
         })
     }
 }
@@ -782,35 +596,14 @@ secret_file = "./vpn-server.key"
         );
     }
 
+    /// The removed `mtu` knob must be rejected, not silently ignored: the MTU
+    /// is a fixed protocol constant now (see `crate::config::VPN_MTU`).
     #[test]
-    fn test_server_config_reads_mtu_and_transport() {
-        let config: VpnServerConfig = toml::from_str(&server_toml(
-            "mtu = 1400\n\n[iroh.transport]\ncongestion_controller = \"bbr\"\nreceive_window = 4194304",
-        ))
-        .unwrap();
-        let resolved = ResolvedVpnServerConfig::from_config(&config).unwrap();
-        assert_eq!(resolved.mtu, 1400);
-        assert_eq!(
-            resolved.transport.congestion_controller,
-            CongestionController::Bbr
-        );
-        assert_eq!(resolved.transport.receive_window, Some(4194304));
-        assert_eq!(resolved.transport.send_window, None);
-        assert_eq!(resolved.transport.effective_windows(), (4194304, 4194304));
-    }
-
-    #[test]
-    fn test_effective_windows_defaults() {
-        assert_eq!(
-            TransportTuning::default().effective_windows(),
-            (DEFAULT_RECEIVE_WINDOW, DEFAULT_RECEIVE_WINDOW)
-        );
-        let tuning = TransportTuning {
-            congestion_controller: CongestionController::Cubic,
-            receive_window: Some(1024),
-            send_window: Some(2048),
-        };
-        assert_eq!(tuning.effective_windows(), (1024, 2048));
+    fn test_removed_mtu_knob_rejected() {
+        let err = toml::from_str::<VpnServerConfig>(&server_toml("mtu = 1400"))
+            .err()
+            .expect("removed 'mtu' knob must be rejected");
+        assert!(err.to_string().contains("mtu"), "unexpected error: {err}");
     }
 
     #[test]
@@ -900,21 +693,22 @@ route = ["10.0.0.0/8"]
         assert!(err.to_string().contains("route"), "unexpected error: {err}");
     }
 
-    /// Server-side: a typo under `[iroh.transport]` must be rejected too.
+    /// Server-side: the removed `[iroh.transport]` tuning section must be
+    /// rejected — QUIC transport settings are fixed, not configurable.
     #[test]
-    fn test_unknown_transport_key_rejected() {
+    fn test_removed_transport_section_rejected() {
         let err = toml::from_str::<VpnServerConfig>(
             r#"
 role = "vpnserver"
 
 [iroh.transport]
-recieve_window = 1048576
+receive_window = 1048576
 "#,
         )
         .err()
-        .expect("typo'd [iroh.transport] key must be rejected");
+        .expect("removed [iroh.transport] section must be rejected");
         assert!(
-            err.to_string().contains("recieve_window"),
+            err.to_string().contains("transport"),
             "unexpected error: {err}"
         );
     }

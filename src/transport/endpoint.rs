@@ -1,6 +1,5 @@
 //! Common endpoint helpers for iroh tunnel connections.
 
-use crate::config::file_config::TransportTuning;
 use crate::transport::build_quic_transport_config;
 use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
@@ -128,16 +127,14 @@ fn warn_if_socket_buffer_capped() {
 /// * `relay_only` - If true, only use relay connections (no direct P2P).
 /// * `dns_server` - Optional custom DNS server URL (e.g., "https://dns.example.com"), or "none" to disable DNS discovery
 /// * `secret_key` - Optional secret key (required for publishing to custom DNS server)
-/// * `transport_tuning` - Transport layer tuning (congestion control, buffer sizes)
 pub fn create_endpoint_builder(
     relay_mode: RelayMode,
     relay_only: bool,
     dns_server: Option<&str>,
     secret_key: Option<&SecretKey>,
-    transport_tuning: &TransportTuning,
 ) -> Result<EndpointBuilder> {
     warn_if_socket_buffer_capped();
-    let transport_config = build_quic_transport_config(transport_tuning)?;
+    let transport_config = build_quic_transport_config()?;
     // iroh 1.0 requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
@@ -191,20 +188,13 @@ pub async fn create_server_endpoint(
     relay_only: bool,
     secret: Option<SecretKey>,
     dns_server: Option<&str>,
-    transport_tuning: &TransportTuning,
 ) -> Result<Endpoint> {
     let relay_mode = parse_relay_mode(relay_urls)?;
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder = create_endpoint_builder(
-        relay_mode,
-        relay_only,
-        dns_server,
-        secret.as_ref(),
-        transport_tuning,
-    )?
-    .alpns(vec![VPN_ALPN.to_vec()]);
+    let mut builder = create_endpoint_builder(relay_mode, relay_only, dns_server, secret.as_ref())?
+        .alpns(vec![VPN_ALPN.to_vec()]);
 
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
@@ -233,9 +223,6 @@ pub async fn create_server_endpoint(
 
 /// Create a client endpoint.
 /// If a secret key is provided, the client will use a persistent identity for authentication.
-///
-/// The endpoint is always built with default transport tuning (the baseline);
-/// server-dictated tuning is applied per-connection after the handshake.
 pub async fn create_client_endpoint(
     relay_urls: &[String],
     relay_only: bool,
@@ -246,13 +233,7 @@ pub async fn create_client_endpoint(
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder = create_endpoint_builder(
-        relay_mode,
-        relay_only,
-        dns_server,
-        secret_key,
-        &TransportTuning::default(),
-    )?;
+    let mut builder = create_endpoint_builder(relay_mode, relay_only, dns_server, secret_key)?;
 
     // Set the secret key for persistent identity (used for authentication)
     if let Some(secret) = secret_key {

@@ -109,17 +109,11 @@ sequenceDiagram
     C->>S: VpnHandshake {device_id, auth_token}
     S->>S: Validate auth token
     S->>S: Allocate IP(s) from pool(s)
-    S-->>C: VpnHandshakeResponse {assigned_ip, network, server_ip, transport, mtu, ...}
+    S-->>C: VpnHandshakeResponse {assigned_ip, network, server_ip, ...}
     S->>S: Store client (EndpointId, device_id)
 
-    Note over C,S: Transport Upgrade (only if server dictates non-default tuning)
-    C->>C: Compare dictated transport vs baseline
-    C->>CI: Close + reconnect with per-connection transport config
-    C->>S: VpnHandshake (re-handshake, same device_id → same IPs)
-    S-->>C: VpnHandshakeResponse
-
     Note over C,S: TUN Device Setup
-    C->>C: Create TUN device (tun0, server-dictated MTU)
+    C->>C: Create TUN device (tun0, fixed MTU 1280)
     C->>C: Assign IP(s) (10.0.0.2, fd00::2)
     C->>C: Configure routes
 
@@ -148,16 +142,13 @@ The `network`/`network6` fields carry the server's host prefixes (`server_ip/32`
 
 When `network6` is configured on the server, clients normally receive IPv6 addresses alongside IPv4 (dual-stack) or IPv6-only if `network` is omitted. In dual-stack mode, if one address pool is exhausted, the server can still accept the client with the other address family.
 
-Every accepted response additionally carries the server-dictated settings (see "Server-Dictated Configuration" below): `transport` (`WireTransport`: congestion controller and concrete receive/send windows) and `mtu`.
+### Fixed Protocol Constants (No Tuning Knobs)
 
-### Server-Dictated Configuration
+MTU and QUIC transport settings are fixed protocol constants, WireGuard/Tailscale-style. They are not configurable, not negotiated, and not carried in the handshake; both sides derive identical values from constants in the code:
 
-The server is the single source of truth for QUIC transport tuning (`[iroh.transport]`: congestion controller, receive/send windows) and the VPN `mtu`. Clients do not configure these; the server sends the fully resolved values in the handshake response and the client applies them:
-
-- **MTU**: the server dictates the inner MTU as `min(config.mtu, 1280)` (`DATAGRAM_SAFE_MTU`), the IPv6 minimum link MTU and a mobile-safe value on essentially any real path. The advertised MTU is deliberately *not* derived from the handshake-time `max_datagram_size` — that value is live (it tracks QUIC path-MTU discovery), and pinning a fixed TUN MTU to an optimistic snapshot black-holes full-size packets whenever the path later shrinks; a fixed clamp is also deterministic across reconnects (an advertised-MTU change is a fatal `ServerConfigChanged` to the client). On the wire, `QUIC_INITIAL_MTU` is 1200 (the QUIC protocol minimum), so the first datagrams survive any path; DPLPMTUD probes upward to 1452 right after the handshake. The data path re-reads `max_datagram_size()` per TUN read, so framing follows the discovered path MTU. During windows where the live cap is below the inner MTU (the first RTTs after connect, a black-hole cooldown, or a true ≤1200-wire path), oversized plain TCP packets are software-resegmented to the cap (`synthesize_tcp_gso` + `segment_tcp_gso_into`) and only oversized non-TCP packets are dropped. Keep the effective MTU >= 1280 for IPv6 (the config layer warns if `network6` is set with a smaller `mtu`).
-- **Transport tuning**: the congestion controller (and send window) cannot be changed on a live QUIC connection, so the client always connects with the default baseline (cubic, 8 MB windows). If the dictated `transport` differs from that baseline, the client closes the connection and reconnects once with a per-connection transport config (`Endpoint::connect_with_opts`), then re-handshakes. The same `device_id` is reused, so the server's idempotent IP allocation returns the same addresses. When the server runs default tuning, no extra reconnect occurs.
-
-The shared builder (`build_quic_transport_config` in `src/transport/mod.rs`) is used for both endpoint creation and the per-connection upgrade, so both paths apply identical keep-alive, idle-timeout, congestion-controller and window settings. The wire values are resolved via `TransportTuning::effective_windows()` on the server, guaranteeing they match what the server's own endpoint uses.
+- **MTU**: the inner TUN MTU is `VPN_MTU = 1280` (`src/config/mod.rs`) on client, server, and iOS — the IPv6 minimum link MTU and the same fixed value Tailscale uses, mobile-safe on essentially any real path. It is deliberately *not* derived from the handshake-time `max_datagram_size` — that value is live (it tracks QUIC path-MTU discovery), and pinning a TUN MTU to an optimistic snapshot black-holes full-size packets whenever the path later shrinks; a fixed constant is also trivially deterministic across reconnects. On the wire, `QUIC_INITIAL_MTU` is 1200 (the QUIC protocol minimum), so the first datagrams survive any path; DPLPMTUD probes upward to 1452 right after the handshake. The data path re-reads `max_datagram_size()` per TUN read, so framing follows the discovered path MTU. During windows where the live cap is below the inner MTU (the first RTTs after connect, a black-hole cooldown, or a true ≤1200-wire path), oversized plain TCP packets are software-resegmented to the cap (`synthesize_tcp_gso` + `segment_tcp_gso_into`) and only oversized non-TCP packets are dropped.
+- **Transport**: both endpoints build the identical fixed QUIC transport config from `build_quic_transport_config` (`src/transport/mod.rs`): CUBIC congestion control, 8 MB connection/stream receive and send windows (`QUIC_WINDOW_SIZE`), 15 s keep-alive, 30 s idle timeout, and 4 MiB datagram buffers. Because nothing differs between the sides, there is no transport dictation in the handshake and no reconnect-to-upgrade step.
+- **Server queues**: the per-client outbound queue (1024 frames) and the aggregate TUN-writer queue (512 packets) are fixed constants in `src/tunnel/server.rs`. A full client queue drops packets (WireGuard-style) — one slow client never head-of-line blocks the TUN reader or other clients.
 
 ### Direct IP over QUIC Integration
 
@@ -489,7 +480,7 @@ and the routing table already reveal locally.
 
 There are two independent version numbers, checked at two different layers:
 
-- **ALPN/format version** — the advertised ALPN is the fixed value `ezvpn/4`, where `4` is the ALPN/format version. A peer whose ALPN does not match exactly (e.g. a different version segment, or an older token-bearing `ezvpn/4/<token>`) is rejected during QUIC ALPN negotiation, before any application streams are opened. It carries no embedded secret; access control rests on the server's iroh endpoint identity and the auth token.
+- **ALPN/format version** — the advertised ALPN is the fixed value `ezvpn/5`, where `5` is the ALPN/format version (kept in lockstep with the wire protocol version since v5). A peer whose ALPN does not match exactly (e.g. an older `ezvpn/4`, or the token-bearing `ezvpn/4/<token>` of earlier builds) is rejected during QUIC ALPN negotiation, before any application streams are opened. It carries no embedded secret; access control rests on the server's iroh endpoint identity and the auth token.
 - **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `4`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation.
 
 ### Client Isolation
@@ -602,6 +593,6 @@ sequenceDiagram
 
 ### Client Network Consistency Check (Reconnect)
 
-On reconnect the client compares the server's network params (`assigned_ip`, `network`, `gateway`, the IPv6 trio, and `mtu`) against the params established on the first successful handshake. A change to *just* the assigned client IP (`assigned_ip` / `assigned_ip6`) is not fatal: the client logs a warning, adopts the new IP as the baseline, and rebuilds the TUN device and routes for the new address (every `connect()` builds these fresh anyway). This is what a server restart that reassigns a different IP looks like. A change to any other field (`network`, `gateway`, the IPv6 trio, or `mtu`) is a fatal `VpnError::ServerConfigChanged` that quits the program instead of reconfiguring into inconsistent routing / TUN state. The stable per-process `device_id` (generated once in `VpnClient::new`) means the server normally re-assigns the same IP, so reassignment is the exception, not the norm. See `check_params_against` / `NetworkParams::non_ip_fields_eq` in `src/tunnel/client.rs`.
+On reconnect the client compares the server's network params (`assigned_ip`, `network`, `gateway`, and the IPv6 trio) against the params established on the first successful handshake. A change to *just* the assigned client IP (`assigned_ip` / `assigned_ip6`) is not fatal: the client logs a warning, adopts the new IP as the baseline, and rebuilds the TUN device and routes for the new address (every `connect()` builds these fresh anyway). This is what a server restart that reassigns a different IP looks like. A change to any other field (`network`, `gateway`, or the IPv6 trio) is a fatal `VpnError::ServerConfigChanged` that quits the program instead of reconfiguring into inconsistent routing / TUN state. The stable per-process `device_id` (generated once in `VpnClient::new`) means the server normally re-assigns the same IP, so reassignment is the exception, not the norm. See `check_params_against` / `NetworkParams::non_ip_fields_eq` in `src/tunnel/client.rs`.
 
 ---

@@ -103,9 +103,9 @@ server_node_id = "changeme"
 # Linux GSO offload is automatic (no config toggle).
 # Client connection logs report local, server, and negotiated GSO status.
 
-# MTU and QUIC transport tuning (congestion controller, receive/send windows)
-# are dictated by the server during the handshake and cannot be configured
-# on the client.
+# The tunnel MTU (fixed at 1280) and QUIC transport settings (CUBIC, 8 MB
+# windows) are fixed protocol constants on both ends — nothing to configure,
+# WireGuard/Tailscale style.
 
 # ============================================================================
 # Relay and Discovery (Optional)

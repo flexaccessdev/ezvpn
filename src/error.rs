@@ -118,7 +118,7 @@ impl VpnError {
     /// - `TunDevice` - permission denied, device creation failed
     /// - `IpAssignment` - IP pool exhausted (unlikely to recover quickly)
     /// - `MaxReconnectAttemptsExceeded` - retry limit hit
-    /// - `ServerConfigChanged` - server's VPN network/gateway/mtu differs from
+    /// - `ServerConfigChanged` - server's VPN network/gateway differs from
     ///   the established session; reconfiguring would mean inconsistent routing/
     ///   TUN state, so we quit instead. (A change to just the assigned client
     ///   IP is not fatal — it rebuilds in place; see `check_config_consistency`.)

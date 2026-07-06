@@ -124,7 +124,6 @@ pub struct ServerStatsView {
     pub packets_no_route: u64,
     pub packets_unknown_version: u64,
     pub packets_dropped_full: u64,
-    pub packets_backpressure: u64,
     pub packets_from_clients: u64,
     pub packets_tun_write_failed: u64,
     pub packets_spoofed: u64,
@@ -158,7 +157,7 @@ pub struct ClientStatus {
     pub network6: Option<String>,
     /// IPv6 gateway (server VPN IPv6).
     pub gateway6: Option<String>,
-    /// Server-dictated MTU.
+    /// Tunnel MTU (the fixed protocol constant, shown while connected).
     pub mtu: Option<u16>,
     /// Whether GSO was negotiated for the current session.
     pub gso_negotiated: Option<bool>,
@@ -760,8 +759,8 @@ fn print_server_text(s: &ServerStatus) {
     println!("\nPacket stats:");
     println!("  tun_read={}  to_clients={}  from_clients={}", st.tun_packets_read, st.packets_to_clients, st.packets_from_clients);
     println!(
-        "  no_route={}  unknown_version={}  dropped_full={}  backpressure={}",
-        st.packets_no_route, st.packets_unknown_version, st.packets_dropped_full, st.packets_backpressure
+        "  no_route={}  unknown_version={}  dropped_full={}",
+        st.packets_no_route, st.packets_unknown_version, st.packets_dropped_full
     );
     println!(
         "  tun_write_failed={}  spoofed={}  inter_client_blocked={}",
@@ -863,7 +862,6 @@ mod tests {
                 packets_no_route: 0,
                 packets_unknown_version: 0,
                 packets_dropped_full: 0,
-                packets_backpressure: 0,
                 packets_from_clients: 3,
                 packets_tun_write_failed: 0,
                 packets_spoofed: 0,
@@ -993,7 +991,6 @@ mod tests {
                     packets_no_route: 0,
                     packets_unknown_version: 0,
                     packets_dropped_full: 0,
-                    packets_backpressure: 0,
                     packets_from_clients: 0,
                     packets_tun_write_failed: 0,
                     packets_spoofed: 0,

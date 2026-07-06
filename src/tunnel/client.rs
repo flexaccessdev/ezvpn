@@ -29,15 +29,15 @@ use crate::error::{VpnError, VpnResult};
 use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::{TcpGroTable, VirtioNetHdr, materialize_offload_into};
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
+use crate::config::VPN_MTU;
 use crate::tunnel::signaling::{
-    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse, WireTransport,
+    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse,
     parse_ip_packet_v2, read_message, write_message,
 };
-use crate::transport::build_quic_transport_config;
 use crate::transport::endpoint::parse_relay_mode;
 use bytes::{Bytes, BytesMut};
 use ipnet::{Ipv4Net, Ipv6Net};
-use iroh::endpoint::{ConnectOptions, Connection, SendDatagramError};
+use iroh::endpoint::{Connection, SendDatagramError};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -139,10 +139,6 @@ pub struct ServerInfo {
     pub server_ip6: Option<Ipv6Addr>,
     /// Whether server-side Linux TUN GSO is enabled.
     pub server_gso_enabled: bool,
-    /// QUIC transport settings dictated by the server.
-    pub transport: WireTransport,
-    /// MTU dictated by the server for the client TUN device.
-    pub mtu: u16,
     /// Server's candidate iroh underlay addresses, delivered in the handshake so
     /// the client can bypass-route any a VPN route would capture at onboarding
     /// (rather than waiting for the first periodic data-path publication). Empty
@@ -155,8 +151,8 @@ pub struct ServerInfo {
 /// Captured from the first successful handshake and compared against every
 /// later reconnect. A change to just the assigned client IP(s) is rebuilt in
 /// place (the next `connect()` builds a fresh TUN device and routes for the new
-/// address); a change to any other field — network, gateway, the IPv6 trio, or
-/// mtu — makes the client quit instead (see
+/// address); a change to any other field — network, gateway, or the IPv6 trio —
+/// makes the client quit instead (see
 /// [`VpnClient::check_config_consistency`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetworkParams {
@@ -166,7 +162,6 @@ struct NetworkParams {
     assigned_ip6: Option<Ipv6Addr>,
     network6: Option<Ipv6Net>,
     server_ip6: Option<Ipv6Addr>,
-    mtu: u16,
 }
 
 impl NetworkParams {
@@ -178,7 +173,6 @@ impl NetworkParams {
             assigned_ip6: info.assigned_ip6,
             network6: info.network6,
             server_ip6: info.server_ip6,
-            mtu: info.mtu,
         }
     }
 
@@ -192,7 +186,6 @@ impl NetworkParams {
             && self.server_ip == other.server_ip
             && self.network6 == other.network6
             && self.server_ip6 == other.server_ip6
-            && self.mtu == other.mtu
     }
 }
 
@@ -203,14 +196,13 @@ impl std::fmt::Display for NetworkParams {
         }
         write!(
             f,
-            "ip={} net={} gw={} ip6={} net6={} gw6={} mtu={}",
+            "ip={} net={} gw={} ip6={} net6={} gw6={}",
             opt(&self.assigned_ip),
             opt(&self.network),
             opt(&self.server_ip),
             opt(&self.assigned_ip6),
             opt(&self.network6),
             opt(&self.server_ip6),
-            self.mtu,
         )
     }
 }
@@ -223,7 +215,7 @@ impl std::fmt::Display for NetworkParams {
 ///   baseline and return `Ok`, so the caller rebuilds the TUN device and routes
 ///   for the new address (this is what a server restart that reassigns the IP
 ///   looks like);
-/// - any other field changed (network, gateway, IPv6 trio, mtu) →
+/// - any other field changed (network, gateway, IPv6 trio) →
 ///   [`VpnError::ServerConfigChanged`], a non-recoverable error that quits.
 ///
 /// Factored out of [`VpnClient::check_config_consistency`] so the set-once /
@@ -324,71 +316,17 @@ impl VpnClient {
     pub async fn connect(&self, endpoint: &Endpoint, relay_urls: &[String]) -> VpnResult<()> {
         let endpoint_addr = self.resolve_server_addr(relay_urls)?;
 
-        // Connect to server with the baseline transport tuning (the client
-        // endpoint defaults). The server dictates the effective transport
-        // settings in the handshake response.
+        // Client and server both build the identical fixed transport config
+        // (see crate::transport), so nothing is negotiated or upgraded here.
         let connection = endpoint
-            .connect(endpoint_addr.clone(), VPN_ALPN)
+            .connect(endpoint_addr, VPN_ALPN)
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to connect to server: {}", e)))?;
 
         log::info!("Connected to server, performing handshake...");
 
         // Perform handshake on first stream
-        let mut server_info = self.perform_handshake(&connection).await?;
-
-        // The congestion controller (and send window) cannot be changed on a
-        // live connection, so when the server dictates non-baseline transport
-        // settings, reconnect once with a per-connection transport config.
-        let baseline = WireTransport::default();
-        let connection = if server_info.transport == baseline {
-            connection
-        } else {
-            log::info!(
-                "Server dictates non-default transport settings (cc={:?}, receive={}KB, send={}KB), reconnecting to apply them...",
-                server_info.transport.congestion_controller,
-                server_info.transport.receive_window / 1024,
-                server_info.transport.send_window / 1024
-            );
-            connection.close(0u32.into(), b"transport upgrade");
-
-            let tuning = server_info.transport.to_tuning();
-            let transport_config = build_quic_transport_config(&tuning).map_err(|e| {
-                VpnError::Signaling(format!("Failed to build transport config: {}", e))
-            })?;
-            let connection = endpoint
-                .connect_with_opts(
-                    endpoint_addr,
-                    VPN_ALPN,
-                    ConnectOptions::new().with_transport_config(transport_config),
-                )
-                .await
-                .map_err(|e| VpnError::Signaling(format!("Failed to reconnect to server: {}", e)))?
-                .await
-                .map_err(|e| {
-                    VpnError::Signaling(format!("Failed to reconnect to server: {}", e))
-                })?;
-
-            // Re-handshake on the upgraded connection. The server allocates
-            // the same addresses (keyed by endpoint ID + device ID).
-            let applied_transport = server_info.transport;
-            let new_info = self.perform_handshake(&connection).await?;
-            if new_info.transport != applied_transport {
-                // Server changed its answer mid-flight (e.g. restart with new
-                // config). Proceed with the connection we have instead of
-                // risking a reconnect loop.
-                log::warn!(
-                    "Server transport settings changed during reconnect (expected {:?}, got {:?}); continuing",
-                    applied_transport,
-                    new_info.transport
-                );
-            }
-            server_info = new_info;
-            // Keep the transport actually applied to this connection, not the
-            // second response's answer, so later logging reflects reality.
-            server_info.transport = applied_transport;
-            connection
-        };
+        let server_info = self.perform_handshake(&connection).await?;
 
         // Monitor and report connection path changes (e.g., relay -> direct)
         let _path_watcher = watch_connection_paths(&connection, "Connection");
@@ -423,13 +361,7 @@ impl VpnClient {
             log::info!("  Mode: IPv4-only");
         }
         log::info!("  Server GSO enabled: {}", server_info.server_gso_enabled);
-        log::info!("  MTU (server-dictated): {}", server_info.mtu);
-        log::info!(
-            "  Transport (server-dictated): cc={:?}, receive={}KB, send={}KB",
-            server_info.transport.congestion_controller,
-            server_info.transport.receive_window / 1024,
-            server_info.transport.send_window / 1024
-        );
+        log::info!("  MTU (fixed): {}", VPN_MTU);
 
         // If this is a reconnect and the server's network parameters changed,
         // quit rather than rebuild for a new config — unless only the assigned
@@ -586,7 +518,7 @@ impl VpnClient {
                 assigned_ip6: server_info.assigned_ip6.map(|ip| ip.to_string()),
                 network6: server_info.network6.map(|n| n.to_string()),
                 gateway6: server_info.server_ip6.map(|ip| ip.to_string()),
-                mtu: server_info.mtu,
+                mtu: VPN_MTU,
                 gso_negotiated: negotiated_gso,
                 routes: active_routes,
                 routes6: active_routes6,
@@ -681,16 +613,16 @@ impl VpnClient {
             // Dual-stack: both IPv4 and IPv6
             (Some(ip4), Some(net4), Some(gw4), Some(ip6), Some(net6), Some(_gw6)) => {
                 TunConfig::new(ip4, net4.netmask(), gw4)
-                    .with_mtu(server_info.mtu)
+                    .with_mtu(VPN_MTU)
                     .with_ipv6(ip6, net6.prefix_len())?
             }
             // IPv4-only
             (Some(ip4), Some(net4), Some(gw4), None, None, None) => {
-                TunConfig::new(ip4, net4.netmask(), gw4).with_mtu(server_info.mtu)
+                TunConfig::new(ip4, net4.netmask(), gw4).with_mtu(VPN_MTU)
             }
             // IPv6-only
             (None, None, None, Some(ip6), Some(net6), Some(_gw6)) => {
-                TunConfig::ipv6_only(ip6, net6.prefix_len(), server_info.mtu)?
+                TunConfig::ipv6_only(ip6, net6.prefix_len(), VPN_MTU)?
             }
             // Invalid: should be caught earlier in perform_handshake
             _ => {
@@ -887,8 +819,6 @@ pub(crate) async fn perform_handshake(
         network6,
         server_ip6,
         server_gso_enabled: response.server_gso_enabled,
-        transport: response.transport,
-        mtu: response.mtu,
         server_addrs: response.server_addrs,
     })
 }
@@ -2092,8 +2022,6 @@ mod tests {
             network6: Some("fd00::/64".parse().unwrap()),
             server_ip6: Some("fd00::1".parse().unwrap()),
             server_gso_enabled: true,
-            transport: WireTransport::default(),
-            mtu: 1280,
             server_addrs: Vec::new(),
         }
     }
@@ -2108,16 +2036,14 @@ mod tests {
         assert_eq!(p.assigned_ip6, info.assigned_ip6);
         assert_eq!(p.network6, info.network6);
         assert_eq!(p.server_ip6, info.server_ip6);
-        assert_eq!(p.mtu, info.mtu);
     }
 
     #[test]
-    fn network_params_eq_ignores_transport_and_gso() {
+    fn network_params_eq_ignores_gso() {
         let a = sample_server_info();
         let mut b = sample_server_info();
         // Fields not part of the routing/TUN identity must not affect equality.
         b.server_gso_enabled = !a.server_gso_enabled;
-        b.transport.receive_window = a.transport.receive_window.wrapping_add(4096);
         assert_eq!(
             NetworkParams::from_server_info(&a),
             NetworkParams::from_server_info(&b)
@@ -2143,10 +2069,6 @@ mod tests {
         let mut gw = sample_server_info();
         gw.server_ip = Some("10.0.0.254".parse().unwrap());
         assert_ne!(base, NetworkParams::from_server_info(&gw));
-
-        let mut mtu = sample_server_info();
-        mtu.mtu = 1400;
-        assert_ne!(base, NetworkParams::from_server_info(&mtu));
     }
 
     #[test]
@@ -2156,7 +2078,6 @@ mod tests {
         assert!(s.contains("ip=10.0.0.2"));
         assert!(s.contains("net=10.0.0.0/24"));
         assert!(s.contains("gw=10.0.0.1"));
-        assert!(s.contains("mtu=1280"));
     }
 
     #[test]
@@ -2212,10 +2133,10 @@ mod tests {
         let established = std::sync::Mutex::new(None);
         check_params_against(&established, &sample_server_info()).expect("baseline");
 
-        // IP changed AND mtu changed: the non-IP change makes it fatal.
+        // IP changed AND gateway changed: the non-IP change makes it fatal.
         let mut changed = sample_server_info();
         changed.assigned_ip = Some("10.0.0.42".parse().unwrap());
-        changed.mtu = 1400;
+        changed.server_ip = Some("10.0.0.254".parse().unwrap());
         let err = check_params_against(&established, &changed).expect_err("must reject");
         assert!(matches!(err, VpnError::ServerConfigChanged(_)));
     }

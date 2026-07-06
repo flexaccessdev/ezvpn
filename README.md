@@ -193,10 +193,10 @@ Config notes:
 - `[network]` defines VPN addressing. At least one of `network` (IPv4) or
   `network6` (IPv6) is required.
 - `[auth]` defines accepted client auth tokens.
-- `[iroh]` defines server identity, relay/discovery settings, and optional QUIC
-  transport tuning.
-- Top-level keys control server runtime behavior such as buffering,
-  backpressure, and spoofing checks.
+- `[iroh]` defines server identity and relay/discovery settings.
+- There are no performance or security knobs: MTU, QUIC transport settings,
+  and queue sizes are fixed constants, and spoofing checks are always
+  enforced (WireGuard/Tailscale style).
 - `secret_file` is required for a stable server `EndpointId`.
 - IPv6-only mode is supported but still experimental.
 
@@ -242,9 +242,12 @@ tunables.
 Server-side settings are authoritative for VPN network parameters:
 
 - The server assigns client IPv4/IPv6 addresses.
-- The server dictates the VPN `mtu`.
-- The server dictates QUIC transport tuning from `[iroh.transport]`, including
-  congestion controller and receive/send windows.
+
+The tunnel MTU and QUIC transport settings are fixed protocol constants
+(WireGuard/Tailscale-style — no tuning knobs): the MTU is always 1280
+(Tailscale's fixed value, the IPv6 minimum link MTU) and the transport always
+uses CUBIC with fixed windows. Nothing is negotiated; both sides derive the
+same values from constants.
 
 Clients configure their server identity, auth token, routes, relay and
 discovery settings, and reconnect behavior. Client CLI arguments take
@@ -489,7 +492,7 @@ entirely.
 
 ## Protocol, MTU, and GSO
 
-- Wire protocol v3 is required on both peers. Mixed-version pairs do not
+- Wire protocol v5 is required on both peers. Mixed-version pairs do not
   connect.
 - The data path sends raw IP packets over unreliable QUIC datagrams protected
   by QUIC/TLS 1.3.
@@ -500,16 +503,14 @@ entirely.
   datagrams survive any path (cellular, tunnel-in-tunnel, PPPoE). QUIC path-MTU
   discovery probes upward to 1452 right after the handshake, and the data path
   reads the live datagram cap per TUN read, so framing follows discovery.
-- The inner TUN MTU defaults to 1280 (the IPv6 minimum link MTU, mobile-safe on
-  essentially any real path) and is dictated by the server as
-  `min(config.mtu, 1280)`.
-- A jumbo VPN MTU has no effect when packets exceed the QUIC datagram cap. GSO
-  super-frames — and plain TCP packets that outgrow a shrunken path — are
+- The inner TUN MTU is fixed at 1280 on both ends (the IPv6 minimum link MTU
+  and the same fixed value Tailscale uses, mobile-safe on essentially any real
+  path). It is a protocol constant, not a config knob, and is not carried in
+  the handshake.
+- GSO super-frames — and plain TCP packets that outgrow a shrunken path — are
   segmented to the datagram cap on send and re-coalesced into kernel-TSO
   super-frames on receive where supported. Oversized non-TCP packets are
   dropped when the live path cannot carry them.
-- Keep the effective MTU at least 1280 for IPv6 (the server config warns if
-  `network6` is set with a smaller `mtu`).
 
 Linux GSO is automatic:
 
@@ -519,22 +520,11 @@ Linux GSO is automatic:
   a warning.
 - Connection setup logs include local, remote, and negotiated GSO status.
 
-## Throughput Tuning
+## Throughput Notes
 
-For maximum throughput on direct P2P paths, configure `[iroh.transport]` in the
-server config. The server sends these resolved values to clients during the
-handshake, so clients do not need transport configuration.
-
-- `congestion_controller = "bbr"`: TCP inside the tunnel already reacts to its
-  own congestion signals. When the underlying UDP path also drops packets,
-  loss-based `cubic` can compound the backoff. BBR models the path and often
-  sustains higher throughput on lossy or high-latency direct paths.
-- `receive_window` / `send_window`: the 8 MB defaults cover most links. On
-  high-bandwidth, high-latency paths with a large bandwidth-delay product, raise
-  them toward the 16 MB maximum so `window / RTT` does not cap throughput.
-
-`cubic` remains the default because it is the safer choice for relay paths and
-general internet use.
+There are no transport tuning knobs (WireGuard/Tailscale style). QUIC transport
+settings are fixed constants on both ends: CUBIC congestion control and 8 MB
+receive/send windows, which cover most links.
 
 ### Linux UDP Socket Buffers
 
@@ -578,9 +568,9 @@ first successful handshake:
 - A change only to the assigned client IP (`assigned_ip` or `assigned_ip6`) is
   accepted. The client logs a warning, adopts the new IP as the baseline, and
   rebuilds the TUN device and routes.
-- A change to any other network field (`network`, gateway, IPv6 network/gateway
-  fields, or `mtu`) is fatal. The client exits instead of reconfiguring into an
-  inconsistent routing state.
+- A change to any other network field (`network`, gateway, or the IPv6
+  network/gateway fields) is fatal. The client exits instead of reconfiguring
+  into an inconsistent routing state.
 
 The client uses a stable per-process `device_id`, so the server normally assigns
 the same IP during reconnects. Reassignment is expected mainly after server

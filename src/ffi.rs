@@ -48,7 +48,7 @@
 //! {
 //!   "assigned_ip": "10.0.0.2", "netmask": "255.255.255.255", "gateway": "10.0.0.1",
 //!   "assigned_ip6": "fd00::2", "prefix_len6": 128, "gateway6": "fd00::1",
-//!   "mtu": 1400,
+//!   "mtu": 1280,
 //!   "excluded_routes": ["192.168.1.5/32"], "excluded_routes6": []
 //! }
 //! ```
