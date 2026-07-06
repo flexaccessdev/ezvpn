@@ -613,8 +613,10 @@ and Unix `stop` under service managers.
 
 `ezvpn` runs on iOS as a Network Extension, as a proof of concept (dual-stack
 split tunnel, real-device testing; no full tunnel, no App Store packaging). The
-Rust core builds into a static library here; the Swift app lives in a separate
-repo, [`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios).
+Rust core builds into `libezvpn.xcframework` here (`./build-ios.sh`, released as
+`libezvpn-ios.xcframework.zip`); the Swift app lives in a separate repo,
+[`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios), which consumes it via a
+Swift package binary target.
 
 See [`docs/IOS-POC.md`](docs/IOS-POC.md) for scope, how it reuses the core, the C
 interface, and build steps.
