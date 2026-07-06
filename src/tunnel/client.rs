@@ -477,6 +477,23 @@ impl VpnClient {
             None => (None, None, None),
         };
 
+        // Route the advertised networks — the server's host prefixes (/32 and
+        // /128) — through the TUN so the gateway is reachable on every
+        // platform. The point-to-point destination already covers the IPv4
+        // gateway on macOS/Linux (route-add tolerates the pre-existing route),
+        // but not on Windows, and nothing else routes the IPv6 gateway.
+        let _gateway_route_guard: Option<RouteGuard> = match server_info.network {
+            Some(net) => Some(add_routes(tun_device.name(), &[net]).await?),
+            None => None,
+        };
+        let _gateway_route6_guard: Option<Route6Guard> =
+            match (server_info.assigned_ip6, server_info.network6) {
+                (Some(ip6), Some(net6)) => {
+                    Some(add_routes6_with_src(tun_device.name(), &[net6], ip6).await?)
+                }
+                _ => None,
+            };
+
         // Add custom IPv4 routes through the VPN (guard ensures cleanup on drop)
         // Only add IPv4 routes if server provided IPv4 and client has routes configured
         let mut active_routes: Vec<String> = Vec::new();

@@ -359,8 +359,10 @@ control endpoint; stopped clients may briefly show as
 
 ## Routing
 
-The VPN subnet itself is always routed by default. Within that subnet, the
-server VPN gateway is reachable and other client-assigned VPN IPs are dropped.
+The server's VPN address (`/32` / `/128`) is always routed by default: the
+server advertises only its own host prefix, never the full VPN subnet, since
+the gateway is the only in-VPN destination a client can reach (inter-client
+traffic is dropped server-side anyway).
 Add extra non-VPN destinations with repeatable `--route` and `--route6`; those
 routes are forwarded by the server host according to its routing,
 forwarding/NAT, and firewall configuration.

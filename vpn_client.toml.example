@@ -54,7 +54,8 @@ auth_token = "<YOUR_AUTH_TOKEN>"  # Replace with real token from generate-auth-t
 # ============================================================================
 
 # CIDRs to route through the VPN (like WireGuard AllowedIPs)
-# If omitted, only the VPN interface's connected subnet is present. Add routes
+# If omitted, only the server's VPN address is routed (the server advertises
+# just its own /32; client-to-client traffic is not allowed anyway). Add routes
 # here for non-VPN destinations that should be forwarded through the server.
 # Examples:
 #   - Full tunnel (all traffic): ["0.0.0.0/0"]

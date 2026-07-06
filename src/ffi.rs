@@ -38,10 +38,16 @@
 //! server underlay host routes (`/32` / `/128`) the extension must exclude from
 //! the tunnel.
 //!
+//! `netmask`/`prefix_len6` are host masks (`255.255.255.255` / `128`): the
+//! server advertises only its own host prefix, not the VPN subnet. The
+//! extension must therefore add `gateway`/`gateway6` as *included* host routes
+//! (`/32` / `/128`) alongside its configured split-tunnel routes — the
+//! interface subnet no longer covers the gateway.
+//!
 //! ```json
 //! {
-//!   "assigned_ip": "10.0.0.2", "netmask": "255.255.255.0", "gateway": "10.0.0.1",
-//!   "assigned_ip6": "fd00::2", "prefix_len6": 64, "gateway6": "fd00::1",
+//!   "assigned_ip": "10.0.0.2", "netmask": "255.255.255.255", "gateway": "10.0.0.1",
+//!   "assigned_ip6": "fd00::2", "prefix_len6": 128, "gateway6": "fd00::1",
 //!   "mtu": 1400,
 //!   "excluded_routes": ["192.168.1.5/32"], "excluded_routes6": []
 //! }

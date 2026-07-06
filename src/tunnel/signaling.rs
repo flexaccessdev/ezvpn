@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// VPN protocol version.
-pub const VPN_PROTOCOL_VERSION: u16 = 3;
+///
+/// Version 4: `network`/`network6` carry the server's host prefixes
+/// (`server_ip/32`, `server_ip6/128`) instead of the full VPN subnets.
+pub const VPN_PROTOCOL_VERSION: u16 = 4;
 
 /// Fixed ALPN protocol identifier for the VPN tunnel.
 ///
@@ -153,7 +156,10 @@ pub struct VpnHandshakeResponse {
     /// Assigned VPN IP address for the client (IPv4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_ip: Option<Ipv4Addr>,
-    /// VPN network CIDR (e.g., 10.0.0.0/24).
+    /// The server's IPv4 host prefix (`server_ip/32`) — the prefix the client
+    /// routes through the tunnel by default. Only the server is advertised
+    /// (never the full VPN subnet): inter-client traffic is dropped server-side
+    /// anyway, so routing other clients' addresses would only invite drops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<Ipv4Net>,
     /// Server's VPN IP (gateway).
@@ -162,7 +168,7 @@ pub struct VpnHandshakeResponse {
     /// Assigned IPv6 VPN address for the client (optional, for dual-stack).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_ip6: Option<Ipv6Addr>,
-    /// IPv6 VPN network CIDR (e.g., fd00::/64).
+    /// The server's IPv6 host prefix (`server_ip6/128`); see [`Self::network`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network6: Option<Ipv6Net>,
     /// Server's IPv6 VPN address (gateway).
