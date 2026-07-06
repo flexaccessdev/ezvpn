@@ -14,29 +14,32 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// VPN protocol version.
 ///
-/// Version 5: the handshake response no longer carries `transport` or `mtu`.
-/// Both sides use fixed, WireGuard/Tailscale-style values: the tunnel MTU is
-/// the protocol constant [`crate::config::VPN_MTU`], and QUIC transport tuning
-/// is fixed (see [`crate::transport::build_quic_transport_config`]).
-pub const VPN_PROTOCOL_VERSION: u16 = 5;
+/// Version 6: the data path is a reliable QUIC stream. The handshake bi-stream
+/// stays open after the response and carries length-prefixed data frames (see
+/// [`crate::tunnel::stream`]) instead of the former unreliable QUIC datagrams.
+/// MTU and QUIC transport tuning remain fixed, WireGuard/Tailscale-style: the
+/// tunnel MTU is the protocol constant [`crate::config::VPN_MTU`], and the
+/// transport config is [`crate::transport::build_quic_transport_config`].
+pub const VPN_PROTOCOL_VERSION: u16 = 6;
 
 /// Fixed ALPN protocol identifier for the VPN tunnel.
 ///
 /// A peer whose advertised ALPN does not match this exact value is rejected
 /// during QUIC ALPN negotiation, before any application streams are opened.
 ///
-/// The `5` is the ALPN/format version, kept in lockstep with
-/// [`VPN_PROTOCOL_VERSION`] since v5: a peer advertising a different ALPN
-/// segment (e.g. the older `ezvpn/4`) no longer matches and QUIC negotiation
-/// rejects it before the handshake.
-pub const VPN_ALPN: &[u8] = b"ezvpn/5";
+/// The `6` is the ALPN/format version, kept in lockstep with
+/// [`VPN_PROTOCOL_VERSION`]: a peer advertising a different ALPN segment
+/// (e.g. the older datagram-based `ezvpn/5`) no longer matches and QUIC
+/// negotiation rejects it before the handshake.
+pub const VPN_ALPN: &[u8] = b"ezvpn/6";
 
 /// VPN handshake request from client to server.
 ///
-/// Sent over the iroh QUIC handshake bi-stream to initiate VPN setup. The
-/// client advertises its data-channel GSO capability here (the data path is
-/// unreliable datagrams, so there is no separate, racy capabilities message —
-/// the reliable handshake carries it).
+/// Sent over the iroh QUIC handshake bi-stream to initiate VPN setup; after
+/// the response, the same bi-stream becomes the data channel. The client
+/// advertises its data-channel GSO capability here (the handshake leads the
+/// data frames on the same reliable stream, so there is no separate, racy
+/// capabilities message).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpnHandshake {
     /// Protocol version.
@@ -46,7 +49,7 @@ pub struct VpnHandshake {
     /// Authentication token (optional, for token-based auth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
-    /// Whether the client can send/receive GSO metadata on data datagrams.
+    /// Whether the client can send/receive GSO metadata on data frames.
     #[serde(default)]
     pub gso_enabled: bool,
 }
@@ -328,16 +331,17 @@ pub async fn read_message<R: tokio::io::AsyncReadExt + Unpin>(
 /// Maximum handshake message size (16 KB).
 pub const MAX_HANDSHAKE_SIZE: usize = 16 * 1024;
 
-/// Message types for the VPN data channel (one message per QUIC datagram).
+/// Message types for the VPN data channel (length-prefixed frames on the
+/// reliable data stream).
 ///
-/// The datagram boundary is the message length, so there is no length prefix:
-/// the leading byte is the message type and the remainder is type-specific.
-/// IP packet layout: `[0x00] [offload_len: 1] [offload: 0|10] [ip_packet]`.
-/// Server-addresses layout: `[0x01] [json(ServerAddrsMsg)]`.
+/// Each frame is `[len: u32 BE] [body]` (see [`crate::tunnel::stream`]); the
+/// body's leading byte is the message type and the remainder is type-specific.
+/// IP packet body: `[0x00] [offload_len: 1] [offload: 0|10] [ip_packet]`.
+/// Server-addresses body: `[0x01] [json(ServerAddrsMsg)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DataMessageType {
-    /// IP packet datagram.
+    /// IP packet frame.
     IpPacket = 0x00,
     /// Server-published set of candidate iroh underlay addresses (server →
     /// client only). The client installs bypass routes for any that a VPN route
@@ -383,13 +387,13 @@ impl ServerAddrsMsg {
         Self { addrs }
     }
 
-    /// Encode to bytes (the datagram body after the message-type byte).
+    /// Encode to bytes (the frame body after the message-type byte).
     pub fn encode(&self) -> VpnResult<Vec<u8>> {
         serde_json::to_vec(self)
             .map_err(|e| VpnError::Signaling(format!("Failed to encode server addrs: {}", e)))
     }
 
-    /// Decode from bytes (the datagram body after the message-type byte).
+    /// Decode from bytes (the frame body after the message-type byte).
     pub fn decode(data: &[u8]) -> VpnResult<Self> {
         serde_json::from_slice(data)
             .map_err(|e| VpnError::Signaling(format!("Failed to decode server addrs: {}", e)))
@@ -422,7 +426,7 @@ impl From<DataMessageType> for u8 {
     }
 }
 
-/// Parse a v2 IP packet frame payload (the datagram body after the type byte).
+/// Parse a v2 IP packet frame payload (the frame body after the type byte).
 #[inline]
 pub fn parse_ip_packet_v2(frame_payload: &[u8]) -> VpnResult<(Option<VirtioNetHdr>, &[u8])> {
     if frame_payload.is_empty() {

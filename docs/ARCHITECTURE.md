@@ -146,16 +146,16 @@ When `network6` is configured on the server, clients normally receive IPv6 addre
 
 MTU and QUIC transport settings are fixed protocol constants, WireGuard/Tailscale-style. They are not configurable, not negotiated, and not carried in the handshake; both sides derive identical values from constants in the code:
 
-- **MTU**: the inner TUN MTU is `VPN_MTU = 1280` (`src/config/mod.rs`) on client, server, and iOS — the IPv6 minimum link MTU and the same fixed value Tailscale uses, mobile-safe on essentially any real path. It is deliberately *not* derived from the handshake-time `max_datagram_size` — that value is live (it tracks QUIC path-MTU discovery), and pinning a TUN MTU to an optimistic snapshot black-holes full-size packets whenever the path later shrinks; a fixed constant is also trivially deterministic across reconnects. On the wire, `QUIC_INITIAL_MTU` is 1200 (the QUIC protocol minimum), so the first datagrams survive any path; DPLPMTUD probes upward to 1452 right after the handshake. The data path re-reads `max_datagram_size()` per TUN read, so framing follows the discovered path MTU. During windows where the live cap is below the inner MTU (the first RTTs after connect, a black-hole cooldown, or a true ≤1200-wire path), oversized plain TCP packets are software-resegmented to the cap (`synthesize_tcp_gso` + `segment_tcp_gso_into`) and only oversized non-TCP packets are dropped.
-- **Transport**: both endpoints build the identical fixed QUIC transport config from `build_quic_transport_config` (`src/transport/mod.rs`): CUBIC congestion control, 8 MB connection/stream receive and send windows (`QUIC_WINDOW_SIZE`), 15 s keep-alive, 30 s idle timeout, and 4 MiB datagram buffers. Because nothing differs between the sides, there is no transport dictation in the handshake and no reconnect-to-upgrade step.
+- **MTU**: the inner TUN MTU is `VPN_MTU = 1280` (`src/config/mod.rs`) on client, server, and iOS — the IPv6 minimum link MTU and the same fixed value Tailscale uses, mobile-safe on essentially any real path. It is deliberately not negotiated or derived from live path measurements — a fixed constant is trivially deterministic across reconnects. The data path is a reliable QUIC stream, so the wire path MTU never constrains framing: QUIC packetizes (and retransmits) the byte stream itself, and no packet is ever dropped or resegmented for path-MTU reasons. On the wire, `QUIC_INITIAL_MTU` is 1200 (the QUIC protocol minimum), so the first packets survive any path; DPLPMTUD probes upward to 1452 right after the handshake, invisibly to the framing layer.
+- **Transport**: both endpoints build the identical fixed QUIC transport config from `build_quic_transport_config` (`src/transport/mod.rs`): CUBIC congestion control, 8 MB connection/stream receive and send windows (`QUIC_WINDOW_SIZE`), 15 s keep-alive, and 30 s idle timeout. QUIC datagrams are disabled — the data path does not use them. Because nothing differs between the sides, there is no transport dictation in the handshake and no reconnect-to-upgrade step.
 - **Server queues**: the per-client outbound queue (1024 frames) and the aggregate TUN-writer queue (512 packets) are fixed constants in `src/tunnel/server.rs`. A full client queue drops packets (WireGuard-style) — one slow client never head-of-line blocks the TUN reader or other clients.
 
 ### Direct IP over QUIC Integration
 
-The VPN mode sends raw IP packets directly over iroh's unreliable QUIC datagrams (TLS 1.3). The reliable handshake runs once on a QUIC bi-stream; all IP traffic then rides datagrams, which avoids the head-of-line blocking of a reliable stream (a lost packet does not stall later ones — the inner transport retransmits as it would over plain UDP). This removes the double encryption overhead of running WireGuard inside QUIC.
+The VPN mode sends raw IP packets over a single reliable QUIC bidirectional stream per client (TLS 1.3) — the same bi-stream the handshake runs on, kept open as the data channel. A reliable stream was chosen over mapping packets onto unreliable QUIC datagrams: the datagram mapping proved less reliable in practice (datagrams are dropped under buffer pressure and capped by the live path MTU, forcing software resegmentation and lossy edge cases) without a significant performance win, while the stream gets QUIC's retransmission, flow control, and size-independent framing for free. The theoretical head-of-line-blocking cost of a reliable stream is accepted, mirroring the sibling `tunnel-rs` project's design. This still avoids the double encryption overhead of running WireGuard inside QUIC.
 
 **Key Design Decisions:**
-- **Framing**: each datagram carries one message — `[type][offload_len][offload?][ip_packet]` — with no length prefix (the datagram boundary is the length). IP packets may be tagged with segmentation-offload metadata (see "Segmentation Offload" below). Datagrams are capped at the connection's `max_datagram_size`, read live per TUN read so the cap follows path-MTU discovery; GSO super-frames — and plain TCP packets that outgrow a shrunken path — are segmented to that cap on send.
+- **Framing**: each frame is `[len: u32 BE][type][offload_len][offload?][ip_packet]` — the stream is a byte pipe, so an explicit length prefix delimits messages (`src/tunnel/stream.rs`). The frame body is capped at `MAX_FRAME_BODY` (an offload-tagged 64 KiB super-frame); a larger announced length is a protocol violation and tears the connection down, since stream framing cannot resynchronize. IP packets may be tagged with segmentation-offload metadata (see "Segmentation Offload" below); GSO super-frames of any size ride whole — software segmentation happens only when the peer did not negotiate GSO, never for size.
 - **Security**: Relies on iroh/QUIC's built-in encryption (TLS 1.3).
 - **Efficiency**: Zero-copy forwarding where possible between TUN and QUIC buffers; TCP segments travel as coalesced super-packets when offload is available on either side.
 - **Identification**: Clients identify via a random `u64` `device_id` generated at startup, allowing multiple sessions per iroh endpoint.
@@ -207,9 +207,9 @@ The outbound loops drain packets already queued on the TUN and flush pending sof
 
 ### Throughput Design
 
-- **Dedicated writer tasks**: the server runs a per-client writer task that owns a `Connection` clone and sends datagrams; the client sends datagrams inline from the TUN reader (a datagram send takes `&Connection`, so no writer task is needed). The TUN writer is also a dedicated task fed over an mpsc channel (no per-packet mutex).
-- **Batched receives**: the TUN writer and per-client writer drain up to `WRITE_BATCH_SIZE` (256) items per `recv_many` to amortize task wakeups; each datagram is then sent with one `send_datagram_wait`.
-- **Framing arena**: datagrams are appended to a long-lived 64 KB `BytesMut` (`build_datagrams` / `encode_ip_datagram`) and split off as refcounted `Bytes` views, so the allocator is hit once per arena chunk instead of once per packet.
+- **Dedicated writer tasks**: the server runs a per-client writer task that owns the data stream's send half and writes queued frames; the client's TUN reader task owns its send half and writes frames inline. The TUN writer is also a dedicated task fed over an mpsc channel (no per-packet mutex).
+- **Batched receives**: the TUN writer and per-client writer drain up to `WRITE_BATCH_SIZE` (256) items per `recv_many` to amortize task wakeups; a batch of frames is then written with one vectored `write_all_chunks`.
+- **Framing arena**: frames are appended to a long-lived 64 KB `BytesMut` (`build_frames` / `encode_ip_frame`) and split off as refcounted `Bytes` views, so the allocator is hit once per arena chunk instead of once per packet. The receive side mirrors this: frame bodies land in a reused buffer and packets are detached into a receive arena (`copy_packet_to_arena`) before crossing the TUN-writer channel.
 - **Zero-copy sends**: `Bytes` flow from framing through the channel to the QUIC write without copying.
 - **macOS utun fast path**: Darwin TUN splitting duplicates the `utun` fd and drives it with `AsyncFd` directly. Reads fill the packet arena with the 4-byte address-family prefix still attached, then strip that prefix by slicing; writes use `writev([prefix, packet])` so the IP packet does not need to be copied into a temporary header-prepended buffer.
 
@@ -402,25 +402,20 @@ including the server's tun, so its overlay gateway is filtered out — see
   setup — alongside the eager relay bootstrap, before VPN routes are installed —
   so a direct server address that a VPN route would capture is pinned
   immediately, with no wait for the first periodic publication.
-- **Ongoing, over the data path** (`ServerAddrsMsg`, datagram type `0x01`). A
+- **Ongoing, over the data stream** (`ServerAddrsMsg`, frame type `0x01`). A
   per-connection task (`run_server_addr_publisher`) sends it once immediately on
-  connect, then every `SERVER_ADDR_PUBLISH_INTERVAL` (30s) as a loss-tolerance
-  floor, and promptly on any `Endpoint::watch_addr()` change. It rides the same
-  unreliable datagram path as IP traffic and self-terminates when the connection
-  closes.
+  connect, then every `SERVER_ADDR_PUBLISH_INTERVAL` (30s), and promptly on any
+  `Endpoint::watch_addr()` change. It rides the same data stream as IP traffic
+  (enqueued non-blocking — a full client queue skips the tick rather than wait
+  behind data backpressure) and self-terminates when the connection closes.
 
-The client feeds every received set (handshake or datagram) into its bypass
-manager (add-only, filtered to VPN-covered IPs); a dropped publication is
-recovered by the next tick, and addresses discovered after onboarding arrive via
-the datagram path.
+The client feeds every received set (handshake or data frame) into its bypass
+manager (add-only, filtered to VPN-covered IPs); a publication skipped under
+queue pressure is recovered by the next tick, and addresses discovered after
+onboarding arrive via the data stream.
 
-The feature is wire-compatible and needs no protocol-version bump: the message
-is a new datagram *type*, and a peer that does not understand `0x01` simply drops
-it (the client ignores it when it installs no capturing routes; an old server
-never sends it). A client talking to an old server therefore falls back to the
-eager relay bootstrap alone — it will not learn the server's *direct* underlay
-address, so a direct path that overlaps a routed prefix would self-capture; run a
-server built with this feature to bypass direct server addresses in a full tunnel.
+The message is its own frame *type*: a client that installs no capturing routes
+simply ignores `0x01` frames.
 
 ### Security Model
 
@@ -521,41 +516,48 @@ VPN mode includes automatic reconnection when the tunnel connection fails. This 
 
 **Health Monitoring:**
 
-The data path is unreliable datagrams with no application-level heartbeat. Peer
-liveness is detected entirely by QUIC:
+The data path has no application-level heartbeat. Peer liveness is detected
+entirely by QUIC:
 
 - **QUIC keep-alive** (15s interval) keeps NAT mappings warm and exercises the path.
 - **QUIC idle timeout** (30s) closes a connection whose peer has gone silent.
 - The client awaits `Connection::closed()`; when it resolves (idle timeout, peer
   close, or path failure) the tunnel tears down and (if enabled) reconnects.
-- TUN read/write errors and datagram read/send errors also end the tunnel.
+- TUN read/write errors and data-stream read/write errors also end the tunnel,
+  as does the peer finishing the data stream.
 
 These keep-alive / idle-timeout values live in `src/transport/mod.rs`
 (`QUIC_KEEP_ALIVE_INTERVAL`, `QUIC_IDLE_TIMEOUT`).
 
-**Datagram framing:**
+**Stream framing:**
 
-Each datagram carries one message, prefixed with a 1-byte `DataMessageType`
-(`src/tunnel/signaling.rs`). The datagram boundary is the message length, so
-there is no length prefix:
+Each frame on the data stream is a `u32` big-endian length prefix followed by
+the frame body; the body's leading byte is the `DataMessageType`
+(`src/tunnel/signaling.rs`):
 
 ```
   IP packet (type 0x00):
+    [4 bytes: body length, u32 BE]
     [0x00] [1 byte: offload_len (0 or 10)]
            [offload_len bytes: virtio_net_hdr] [N bytes: raw IP packet]
 ```
 
-GSO capability is negotiated in the reliable handshake (the client advertises
+An announced body length of zero or above `MAX_FRAME_BODY` is a protocol
+violation and ends the connection (a byte stream cannot resynchronize past a
+corrupt length); an intact frame with an unknown type byte is skipped, since
+the prefix already delimited it.
+
+GSO capability is negotiated in the handshake (the client advertises
 `gso_enabled` in `VpnHandshake`), so there is no separate capabilities message.
 
 **Implementation locations** (search by symbol name; line numbers may shift):
 - Type enum: `DataMessageType` in `signaling.rs`
-- Datagram framing: `encode_ip_datagram()` / `build_datagrams()` / `classify()` in `datagram.rs`; body parsing `parse_ip_packet_v2()` in `signaling.rs`
-- Client send (outbound): TUN reader task in `client.rs` - frames via `build_datagrams()` and `Connection::send_datagram_wait()`
-- Client receive (inbound): inbound task in `client.rs` - `Connection::read_datagram()` then `classify()`
+- Stream framing: `encode_ip_frame()` / `build_frames()` / `classify()` / `read_frame()` / `write_frames()` in `stream.rs`; body parsing `parse_ip_packet_v2()` in `signaling.rs`
+- Client send (outbound): TUN reader task in `client.rs` - frames via `build_frames()`, written inline (the task owns the stream send half)
+- Client receive (inbound): inbound task in `client.rs` - `read_frame()` then `classify()`
 - Client liveness: task awaiting `Connection::closed()` in `client.rs`
-- Server send: TUN reader task in `server.rs` - frames via `build_datagrams()`, sent by the per-client writer task
-- Server receive: `handle_client_data()` in `server.rs` - `Connection::read_datagram()` then `classify()`
+- Server send: TUN reader task in `server.rs` - frames via `build_frames()`, written by the per-client writer task that owns the stream send half
+- Server receive: `handle_client_data()` in `server.rs` - `read_frame()` then `classify()`
 
 **Compatibility note:** Peers must speak the same framing version; there is no backward compatibility at 0.0.x.
 

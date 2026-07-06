@@ -19,7 +19,7 @@
 //! - does **not** take the single-instance lock or open a control socket.
 //!
 //! It reuses the portable data plane wholesale: the same handshake
-//! ([`crate::tunnel::client::perform_handshake`]) and datagram loop
+//! ([`crate::tunnel::client::perform_handshake`]) and data-stream loop
 //! ([`crate::tunnel::client::run_tunnel`]).
 //!
 //! The flow is two-phase because the extension needs the server-assigned
@@ -37,7 +37,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use ipnet::{Ipv4Net, Ipv6Net};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
 use rand::Rng;
 
@@ -104,6 +104,10 @@ pub struct IosNetworkConfig {
 pub struct IosSession {
     endpoint: Endpoint,
     connection: Connection,
+    /// Send half of the data stream (the handshake bi-stream, kept open).
+    data_send: SendStream,
+    /// Receive half of the data stream.
+    data_recv: RecvStream,
     server_info: ServerInfo,
     /// IPv4 underlay `/32`s (relay + server addresses) overlapping a routed
     /// prefix (computed at connect, see [`Self::connect`]).
@@ -143,7 +147,7 @@ impl IosSession {
         // Random per-session id, like the desktop client. The server keys IP
         // allocation by (endpoint id, device id).
         let device_id: u64 = rand::rng().random();
-        let server_info =
+        let (server_info, data_send, data_recv) =
             perform_handshake(&connection, device_id, cfg.auth_token.as_deref()).await?;
 
         // `perform_handshake` already guarantees at least one family was
@@ -194,6 +198,8 @@ impl IosSession {
         Ok(Self {
             endpoint,
             connection,
+            data_send,
+            data_recv,
             server_info,
             excluded_routes,
             excluded_routes6,
@@ -234,6 +240,8 @@ impl IosSession {
         run_tunnel(
             tun,
             self.connection,
+            self.data_send,
+            self.data_recv,
             self.server_info.server_gso_enabled,
             None,
             None,

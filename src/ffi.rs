@@ -7,7 +7,7 @@
 //!    network config (IPv4 and/or IPv6, as JSON) to the caller's buffer so the
 //!    extension can build `NEPacketTunnelNetworkSettings`.
 //! 2. [`ezvpn_run`] — hand back the `utun` fd (obtained after applying the
-//!    network settings); spawns the datagram loop on the embedded runtime.
+//!    network settings); spawns the data-stream loop on the embedded runtime.
 //! 3. [`ezvpn_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! All functions are null-safe and never unwind across the FFI boundary (the

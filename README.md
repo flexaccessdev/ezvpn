@@ -492,25 +492,25 @@ entirely.
 
 ## Protocol, MTU, and GSO
 
-- Wire protocol v5 is required on both peers. Mixed-version pairs do not
+- Wire protocol v6 is required on both peers. Mixed-version pairs do not
   connect.
-- The data path sends raw IP packets over unreliable QUIC datagrams protected
-  by QUIC/TLS 1.3.
-- Each datagram carries one message:
-  `[type][offload_len][offload?][ip_packet]`. Datagram boundaries provide the
-  length, so there is no length prefix.
+- The data path sends raw IP packets over a single reliable QUIC
+  bidirectional stream (the handshake stream, kept open) protected by
+  QUIC/TLS 1.3.
+- Each frame is `[len: u32 BE][type][offload_len][offload?][ip_packet]`. The
+  stream is a byte pipe, so an explicit length prefix delimits messages.
 - The initial QUIC path MTU is 1200, the QUIC protocol minimum, so the first
-  datagrams survive any path (cellular, tunnel-in-tunnel, PPPoE). QUIC path-MTU
-  discovery probes upward to 1452 right after the handshake, and the data path
-  reads the live datagram cap per TUN read, so framing follows discovery.
+  packets survive any path (cellular, tunnel-in-tunnel, PPPoE). QUIC path-MTU
+  discovery probes upward to 1452 right after the handshake. The path MTU only
+  affects QUIC's own packetization — application framing is size-independent.
 - The inner TUN MTU is fixed at 1280 on both ends (the IPv6 minimum link MTU
   and the same fixed value Tailscale uses, mobile-safe on essentially any real
   path). It is a protocol constant, not a config knob, and is not carried in
   the handshake.
-- GSO super-frames — and plain TCP packets that outgrow a shrunken path — are
-  segmented to the datagram cap on send and re-coalesced into kernel-TSO
-  super-frames on receive where supported. Oversized non-TCP packets are
-  dropped when the live path cannot carry them.
+- GSO super-frames ride the stream whole when both sides negotiated GSO and
+  are re-coalesced into kernel-TSO super-frames on receive where supported;
+  otherwise they are software-segmented into per-MSS packets. Path MTU never
+  forces segmentation or drops — QUIC retransmits and packetizes the stream.
 
 Linux GSO is automatic:
 
@@ -558,7 +558,7 @@ Liveness is detected by QUIC:
 - QUIC keep-alive runs every 15 seconds.
 - QUIC idle timeout is 30 seconds.
 - The client tears down and reconnects when the connection closes, peer liveness
-  fails, or TUN/datagram I/O fails.
+  fails, or TUN/stream I/O fails.
 - Reconnect backoff starts at 1 second, doubles up to 60 seconds, and adds
   0-500 ms of jitter.
 

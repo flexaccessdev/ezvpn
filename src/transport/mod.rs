@@ -36,7 +36,7 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// are considered dead and closed. With [`QUIC_KEEP_ALIVE_INTERVAL`] enabled,
 /// this timeout only triggers for truly unresponsive peers.
 ///
-/// The data path is unreliable QUIC datagrams with no application-level
+/// The data path is a reliable QUIC stream with no application-level
 /// heartbeat: peer liveness is detected entirely by QUIC keep-alive plus this
 /// idle timeout (a dead peer stops sending keep-alives and the connection
 /// closes after this elapses, resolving `Connection::closed()`). 30s gives
@@ -45,23 +45,15 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval at which the server re-publishes its candidate iroh underlay
-/// addresses to each connected client (on the unreliable datagram path).
+/// addresses to each connected client (on the data stream).
 ///
 /// The server also publishes once immediately on connect and promptly whenever
-/// `Endpoint::watch_addr()` reports a change; this interval is the loss-tolerance
-/// floor (a dropped publication datagram is recovered within one tick). The
-/// client merges the set add-only into its bypass-route manager, so a newly
-/// learned server address is pinned off the VPN tunnel within at most this
-/// interval even if iroh has not yet selected it for the active path.
+/// `Endpoint::watch_addr()` reports a change; this interval is the recovery
+/// floor for a publication skipped because the client's outbound queue was
+/// full. The client merges the set add-only into its bypass-route manager, so
+/// a newly learned server address is pinned off the VPN tunnel within at most
+/// this interval even if iroh has not yet selected it for the active path.
 pub const SERVER_ADDR_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Per-direction QUIC datagram buffer size (bytes).
-///
-/// The QUIC-level analog of the OS socket `SO_RCVBUF`/`SO_SNDBUF`: it bounds how
-/// much datagram data quinn queues before shedding. A few MiB lets the stack
-/// absorb a multi-Gbit burst that briefly outpaces the userspace reader/writer
-/// instead of dropping datagrams (which surface as inner-TCP retransmits).
-pub const QUIC_DATAGRAM_BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Kernel UDP socket buffer size that iroh's socket layer (netwatch) requests
 /// for `SO_RCVBUF`/`SO_SNDBUF`. Mirrors netwatch's private `SOCKET_BUFFER_SIZE`
@@ -79,17 +71,18 @@ pub const IROH_SOCKET_BUFFER_REQUEST: usize = 7 << 20; // 7 MiB
 /// Initial QUIC path MTU (UDP payload bytes) before MTU discovery completes.
 ///
 /// 1200 is the QUIC protocol minimum (and quinn's `min_mtu` default), so the
-/// very first datagrams survive *any* path — cellular, tunnel-in-tunnel, PPPoE —
+/// very first packets survive *any* path — cellular, tunnel-in-tunnel, PPPoE —
 /// with no early black-holing. DPLPMTUD's first run happens right after the
 /// handshake and binary-searches upward to its default `upper_bound` (1452), so
 /// LAN/broadband paths reach full size within a few RTTs.
 ///
 /// The primary deployment target is mobile / high-latency internet access, where
-/// an optimistic initial MTU (e.g. 1452) causes persistent datagram drops on
-/// paths with a smaller real MTU. Reliability from packet one is worth the brief
-/// ramp-up; the data path reads the *live* `max_datagram_size` per TUN read, so
-/// framing follows discovery as the path MTU rises (or falls). `min_mtu` and MTU
-/// discovery keep their defaults.
+/// an optimistic initial MTU (e.g. 1452) causes persistent packet loss on paths
+/// with a smaller real MTU until black-hole detection recovers. Reliability from
+/// packet one is worth the brief ramp-up. The path MTU only affects QUIC's own
+/// packetization of the data stream — application framing is size-independent —
+/// so discovery raising (or lowering) it is invisible above the transport.
+/// `min_mtu` and MTU discovery keep their defaults.
 pub const QUIC_INITIAL_MTU: u16 = 1200;
 
 /// QUIC connection/stream receive window and send window (bytes).
@@ -123,17 +116,14 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.stream_receive_window(QUIC_WINDOW_SIZE.into());
     transport_config = transport_config.send_window(QUIC_WINDOW_SIZE.into());
 
-    // Start at the protocol-minimum path MTU so the first datagrams survive any
+    // Start at the protocol-minimum path MTU so the first packets survive any
     // path (see QUIC_INITIAL_MTU); MTU discovery probes upward right after the
     // handshake. Discovery config and min_mtu keep their defaults.
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
 
-    // Enable and size the QUIC datagram buffers (the data path is datagrams).
-    // `datagram_receive_buffer_size(Some(..))` keeps datagram receipt enabled;
-    // both directions get a few MiB of burst tolerance.
-    transport_config =
-        transport_config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER_SIZE));
-    transport_config = transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_BUFFER_SIZE);
+    // The data path is a reliable stream; QUIC datagrams are unused, so
+    // disable datagram receipt entirely.
+    transport_config = transport_config.datagram_receive_buffer_size(None);
 
     Ok(transport_config.build())
 }
