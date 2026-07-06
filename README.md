@@ -494,15 +494,20 @@ entirely.
 - Each datagram carries one message:
   `[type][offload_len][offload?][ip_packet]`. Datagram boundaries provide the
   length, so there is no length prefix.
-- The initial QUIC path MTU is 1452, the IPv6-safe value for a standard
-  1500-byte Ethernet path. That yields `max_datagram_size` of about 1416, so
-  the effective inner TUN MTU is clamped to about 1400.
+- The initial QUIC path MTU is 1200, the QUIC protocol minimum, so the first
+  datagrams survive any path (cellular, tunnel-in-tunnel, PPPoE). QUIC path-MTU
+  discovery probes upward to 1452 right after the handshake, and the data path
+  reads the live datagram cap per TUN read, so framing follows discovery.
+- The inner TUN MTU defaults to 1280 (the IPv6 minimum link MTU, mobile-safe on
+  essentially any real path) and is dictated by the server as
+  `min(config.mtu, 1280)`.
 - A jumbo VPN MTU has no effect when packets exceed the QUIC datagram cap. GSO
-  super-frames are segmented to the datagram cap on send and re-coalesced into
-  kernel-TSO super-frames on receive where supported.
-- The ~1400 effective MTU assumes a path MTU of at least 1500, such as LAN or
-  most broadband paths. On smaller or tunnel-in-tunnel paths, lower the server
-  `mtu` setting. Keep the effective MTU at least 1280 for IPv6.
+  super-frames — and plain TCP packets that outgrow a shrunken path — are
+  segmented to the datagram cap on send and re-coalesced into kernel-TSO
+  super-frames on receive where supported. Oversized non-TCP packets are
+  dropped when the live path cannot carry them.
+- Keep the effective MTU at least 1280 for IPv6 (the server config warns if
+  `network6` is set with a smaller `mtu`).
 
 Linux GSO is automatic:
 

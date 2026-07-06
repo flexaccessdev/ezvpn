@@ -65,7 +65,7 @@ pub struct TunConfig {
     pub address6: Option<Ipv6Addr>,
     /// IPv6 prefix length (usually 128 for /128 per client).
     pub prefix_len6: Option<u8>,
-    /// MTU for the device (default: 1440, accounts for QUIC/TLS overhead).
+    /// MTU for the device (default: 1280, the IPv6-minimum, mobile-safe value).
     pub mtu: u16,
     /// Attempt Linux TUN GSO/offload ioctls when creating the device.
     pub enable_gso: bool,
@@ -92,7 +92,7 @@ impl TunConfig {
             destination,
             address6: None,
             prefix_len6: None,
-            mtu: 1440,
+            mtu: 1280,
             enable_gso: true,
         }
     }

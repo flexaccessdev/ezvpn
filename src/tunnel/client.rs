@@ -508,14 +508,17 @@ impl VpnClient {
                 None
             };
 
-        // The IP data path is unreliable QUIC datagrams. Each datagram is
-        // capped at the connection's `max_datagram_size`; the server already
-        // clamped the negotiated MTU to fit, and we segment GSO super-frames to
-        // this cap when sending.
+        // The IP data path is unreliable QUIC datagrams; verify the peer
+        // supports them. The datagram cap is read live during the packet loop
+        // (it tracks path-MTU discovery); this handshake-time value is
+        // informational only.
         let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
             VpnError::Signaling("Peer does not support QUIC datagrams".into())
         })?;
-        log::info!("QUIC max datagram size: {}", max_datagram_size);
+        log::info!(
+            "QUIC max datagram size at connect: {} (tracks path-MTU discovery)",
+            max_datagram_size
+        );
 
         let offload_status = tun_device.offload_status();
         let local_gso_enabled = offload_status.enabled;
@@ -594,7 +597,6 @@ impl VpnClient {
             tun_device,
             connection,
             server_info.server_gso_enabled,
-            max_datagram_size,
             bypass_route_guard,
             server_addr_tx,
             local_iroh_udp_ports,
@@ -881,10 +883,15 @@ pub(crate) async fn perform_handshake(
 /// connection ends the tunnel.
 async fn flush_datagrams(connection: &Connection, pending: &mut Vec<Bytes>) -> Result<(), String> {
     for dgram in pending.drain(..) {
+        let dgram_len = dgram.len();
         match connection.send_datagram_wait(dgram).await {
             Ok(()) => {}
             Err(SendDatagramError::TooLarge) => {
-                log::warn!("Dropping outbound datagram larger than QUIC max_datagram_size");
+                log::warn!(
+                    "Dropping outbound datagram ({} B) larger than QUIC max_datagram_size ({:?}); path MTU shrank mid-batch",
+                    dgram_len,
+                    connection.max_datagram_size()
+                );
             }
             Err(e) => return Err(format!("QUIC datagram send error: {}", e)),
         }
@@ -900,13 +907,13 @@ async fn flush_datagrams(connection: &Connection, pending: &mut Vec<Bytes>) -> R
 /// liveness is detected by `Connection::closed()` (QUIC keep-alive + idle
 /// timeout) — there is no application-level heartbeat.
 ///
-/// `server_gso_enabled` is the server's advertised GSO capability;
-/// `max_datagram_size` is the per-datagram cap GSO super-frames are segmented to.
+/// `server_gso_enabled` is the server's advertised GSO capability. The
+/// per-datagram cap frames are segmented to is read live from the connection
+/// each loop iteration, so framing follows QUIC path-MTU discovery.
 pub(crate) async fn run_tunnel(
     tun_device: TunDevice,
     connection: Connection,
     server_gso_enabled: bool,
-    max_datagram_size: usize,
     bypass_route_guard: Option<AbortOnDropTask>,
     server_addr_tx: Option<mpsc::Sender<HashSet<IpAddr>>>,
     local_iroh_udp_ports: Arc<HashSet<u16>>,
@@ -951,6 +958,12 @@ pub(crate) async fn run_tunnel(
         // zeroes the buffer once instead of on every read.
         let mut packet_buf = ReadBuf::uninit(&mut read_storage);
         loop {
+            // Read the datagram cap live each iteration so framing follows
+            // QUIC path-MTU discovery as it raises (or black-hole detection
+            // lowers) the path MTU.
+            let Some(max_datagram_size) = conn_out.max_datagram_size() else {
+                return Some("QUIC datagrams no longer supported by peer".to_string());
+            };
             packet_buf.clear();
             // Event-driven GRO: keep pulling segments that are already
             // queued on the TUN; the instant it drains, emit every
@@ -1748,8 +1761,13 @@ async fn resolve_relay_url(
 }
 
 /// Backoff constants for reconnection delay calculation.
+///
+/// The cap is 30s (not the more common 60s): the primary use case is mobile,
+/// where Wi-Fi↔cellular transitions produce bursts of early connect failures
+/// and a minute-long dead window after ~7 attempts is a poor experience.
+/// Jitter keeps the retry herd spread out.
 const BACKOFF_BASE_MS: u64 = 1000; // 1 second
-const BACKOFF_MAX_MS: u64 = 60000; // 60 seconds
+const BACKOFF_MAX_MS: u64 = 30000; // 30 seconds
 const BACKOFF_JITTER_MS: u64 = 500;
 
 /// Calculate exponential backoff delay with jitter.
@@ -1770,7 +1788,7 @@ fn calculate_backoff(attempt: u32) -> Duration {
 /// * `attempt` - Current attempt number (1-based)
 /// * `rng` - Random number generator for jitter
 fn calculate_backoff_with_rng(attempt: u32, rng: &mut impl Rng) -> Duration {
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, ...
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s, ...
     let multiplier = 2_u64.saturating_pow(attempt.saturating_sub(1));
     let base_delay_ms = BACKOFF_BASE_MS.saturating_mul(multiplier);
 
@@ -2005,22 +2023,27 @@ mod tests {
         let d3 = calculate_backoff_with_rng(3, &mut rng);
         assert!(d3.as_millis() >= 4000 && d3.as_millis() < 4500);
 
-        // Attempt 6: base = 32000ms
-        let d6 = calculate_backoff_with_rng(6, &mut rng);
-        assert!(d6.as_millis() >= 32000 && d6.as_millis() < 32500);
+        // Attempt 5: base = 16000ms
+        let d5 = calculate_backoff_with_rng(5, &mut rng);
+        assert!(d5.as_millis() >= 16000 && d5.as_millis() < 16500);
     }
 
     #[test]
     fn test_backoff_capped_at_max() {
         let mut rng = ChaCha8Rng::seed_from_u64(12345);
 
-        // Attempt 7+: base = 64000ms, but capped to 60000ms
+        // Attempt 6+: base = 32000ms exceeds the cap, so the result is exactly
+        // the 30s cap regardless of jitter. Hardcoded so an upward drift of
+        // BACKOFF_MAX_MS fails this test.
+        let d6 = calculate_backoff_with_rng(6, &mut rng);
+        assert_eq!(d6, Duration::from_millis(30_000));
+
         let d7 = calculate_backoff_with_rng(7, &mut rng);
-        assert!(d7.as_millis() <= BACKOFF_MAX_MS as u128);
+        assert_eq!(d7, Duration::from_millis(30_000));
 
         // Very high attempt still capped
         let d100 = calculate_backoff_with_rng(100, &mut rng);
-        assert!(d100.as_millis() <= BACKOFF_MAX_MS as u128);
+        assert_eq!(d100, Duration::from_millis(30_000));
     }
 
     #[test]

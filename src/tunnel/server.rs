@@ -8,8 +8,8 @@
 use crate::net::buffer::uninitialized_vec;
 use crate::config::{Ip6Strategy, VpnServerConfig, validate_ip6_strategy};
 use crate::tunnel::datagram::{
-    DATAGRAM_FRAMING_OVERHEAD, Datagram, FRAME_ARENA_CHUNK, build_datagrams, build_gro_datagrams,
-    classify, encode_server_addrs_datagram,
+    Datagram, FRAME_ARENA_CHUNK, build_datagrams, build_gro_datagrams, classify,
+    encode_server_addrs_datagram,
 };
 use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
 use crate::control::{ClientEntry, ServerStatsView, ServerStatus, StatusSnapshot};
@@ -43,19 +43,29 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 /// Maximum number of datagrams drained from a channel per batch.
 const WRITE_BATCH_SIZE: usize = 256;
 
-/// Largest TUN MTU guaranteed to fit (with framing) inside a single QUIC
-/// datagram on essentially any path.
+/// Largest TUN MTU the server advertises (and uses for its shared TUN), chosen
+/// for reliability on mobile / high-latency paths.
 ///
-/// The data path is unreliable QUIC datagrams, each capped at the connection's
-/// `max_datagram_size`. With `QUIC_INITIAL_MTU = 1452` the handshake-time
-/// `max_datagram_size` is ~1416 (1452 minus ~30 bytes of QUIC header/tag/frame
-/// overhead). The server's TUN is created once and shared by all clients, so its
-/// MTU must be small enough that a packet it reads always fits in one datagram to
-/// any client; 1400 sits comfortably below ~1416 (~16 B margin for header /
-/// packet-number length variance) so a full-size inner packet nearly fills the
-/// datagram with near-zero GSO padding. The per-connection advertised MTU is
-/// further clamped to that connection's actual `max_datagram_size`.
-const DATAGRAM_SAFE_MTU: u16 = 1400;
+/// 1280 is the IPv6 minimum link MTU (inner IPv6 forbids going lower) and the
+/// same default Tailscale uses. A framed 1280-byte packet (1282 bytes) fits the
+/// live QUIC datagram cap once DPLPMTUD has discovered a wire MTU of ~1318+,
+/// which holds on virtually every real path. Below that — the first RTTs after
+/// connect (discovery starts from the 1200 protocol minimum), a black-hole
+/// cooldown, or a true ≤1200-wire path — oversized plain TCP packets are
+/// software-resegmented to the live cap and only oversized non-TCP packets are
+/// dropped. The advertised MTU is deliberately *not* derived from the
+/// handshake-time `max_datagram_size` snapshot: that value tracks the live path
+/// MTU, and pinning the TUN MTU to an optimistic snapshot black-holes full-size
+/// packets when the path later shrinks.
+const DATAGRAM_SAFE_MTU: u16 = 1280;
+
+/// The MTU the server dictates to a client: the configured MTU clamped to the
+/// mobile-safe [`DATAGRAM_SAFE_MTU`]. Deterministic across reconnects (never
+/// derived from a live path measurement, which would make an MTU change look
+/// like a fatal server-config change to the client).
+fn advertised_client_mtu(config_mtu: u16) -> u16 {
+    config_mtu.min(DATAGRAM_SAFE_MTU)
+}
 
 /// Performance statistics for the VPN server.
 ///
@@ -115,9 +125,8 @@ struct ClientState {
     client_gso_enabled: bool,
     /// Effective per-connection GSO mode (server local && client reported).
     connection_gso_active: bool,
-    /// Per-connection QUIC datagram size cap, used to segment outbound frames.
-    max_datagram_size: usize,
-    /// The iroh connection, kept for reporting live path info in status.
+    /// The iroh connection, kept for live `max_datagram_size()` reads when
+    /// framing outbound datagrams and for reporting live path info in status.
     connection: Connection,
 }
 
@@ -1108,22 +1117,21 @@ impl VpnServer {
     ) -> VpnResult<()> {
         let device_id = handshake.device_id;
         let client_gso_enabled = handshake.gso_enabled;
-        // The IP data path is unreliable QUIC datagrams. Establish the datagram
-        // size cap now and clamp the advertised MTU so a full-size client packet
-        // always fits in one datagram.
-        let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
+        // The IP data path is unreliable QUIC datagrams; verify the peer
+        // supports them. The advertised MTU is deliberately independent of the
+        // current `max_datagram_size` (a live value that tracks path-MTU
+        // discovery): the data path re-reads the cap per TUN read and
+        // software-resegments oversized TCP, so a fixed, deterministic MTU is
+        // both reliable and reconnect-stable.
+        let current_datagram_cap = connection.max_datagram_size().ok_or_else(|| {
             VpnError::Signaling("Peer does not support QUIC datagrams".into())
         })?;
-        let advertised_mtu = self
-            .config
-            .mtu
-            .min(DATAGRAM_SAFE_MTU)
-            .min(u16::try_from(max_datagram_size.saturating_sub(DATAGRAM_FRAMING_OVERHEAD)).unwrap_or(u16::MAX));
+        let advertised_mtu = advertised_client_mtu(self.config.mtu);
         log::info!(
-            "Client {} datagram cap: max_datagram_size={}, advertised MTU={}",
+            "Client {} advertised MTU={} (current datagram cap: {})",
             remote_id,
-            max_datagram_size,
-            advertised_mtu
+            advertised_mtu,
+            current_datagram_cap
         );
         // Allocate IPv4 for client (if server has IPv4 configured)
         let assigned_ip = if let Some(ref ip_pool) = self.ip_pool {
@@ -1301,12 +1309,15 @@ impl VpnServer {
                 }
                 let mut fatal = None;
                 for dgram in batch.drain(..) {
+                    let dgram_len = dgram.len();
                     match writer_conn.send_datagram_wait(dgram).await {
                         Ok(()) => {}
                         Err(SendDatagramError::TooLarge) => {
                             log::warn!(
-                                "Dropping datagram to client {} larger than max_datagram_size",
-                                writer_client_id
+                                "Dropping datagram to client {} ({} B) larger than max_datagram_size ({:?}); path MTU shrank mid-batch",
+                                writer_client_id,
+                                dgram_len,
+                                writer_conn.max_datagram_size()
                             );
                         }
                         Err(e) => {
@@ -1363,7 +1374,6 @@ impl VpnServer {
             packet_tx: packet_tx.clone(),
             client_gso_enabled,
             connection_gso_active,
-            max_datagram_size,
             connection: connection.clone(),
         };
 
@@ -1584,6 +1594,13 @@ impl VpnServer {
         pending: &mut Vec<Bytes>,
     ) {
         for state in gro_states.values_mut() {
+            let Some(max_datagram_size) = state.connection.max_datagram_size() else {
+                // Datagrams unsupported (cannot happen mid-connection: the
+                // transport parameter is fixed at handshake). Drop the buffered
+                // segments rather than leave them to go stale in the table.
+                drop(state.table.flush_all());
+                continue;
+            };
             let outputs = state.table.flush_all();
             self.send_gro_outputs_to_client(
                 &outputs,
@@ -1591,7 +1608,7 @@ impl VpnServer {
                 seg_scratch,
                 pending,
                 &state.packet_tx,
-                state.max_datagram_size,
+                max_datagram_size,
             )
             .await;
         }
@@ -1975,19 +1992,26 @@ impl VpnServer {
             let client_key = (endpoint_id, device_id);
 
             // Get client's packet channel sender (DashMap lookup is lock-free)
-            let (packet_tx, client_gso_enabled, connection_gso_active, max_datagram_size) =
+            let (packet_tx, client_gso_enabled, connection_gso_active, connection) =
                 match self.clients.get(&client_key) {
                     Some(c) => (
                         c.packet_tx.clone(),
                         c.client_gso_enabled,
                         c.connection_gso_active,
-                        c.max_datagram_size,
+                        c.connection.clone(),
                     ),
                     None => {
                         self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 };
+
+            // Read the datagram cap live so framing follows QUIC path-MTU
+            // discovery as it raises (or black-hole detection lowers) the path.
+            let Some(max_datagram_size) = connection.max_datagram_size() else {
+                self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
 
             if software_gro && client_gso_enabled {
                 // Non-GSO TUN frames never carry offload metadata; push the
@@ -1999,12 +2023,12 @@ impl VpnServer {
                     .or_insert_with(|| ClientGroState {
                         table: TcpGroTable::new(),
                         packet_tx: packet_tx.clone(),
-                        max_datagram_size,
+                        connection: connection.clone(),
                     });
                 // Keep the freshest sender in case the client reconnected.
                 if !state.packet_tx.same_channel(&packet_tx) {
                     state.packet_tx = packet_tx.clone();
-                    state.max_datagram_size = max_datagram_size;
+                    state.connection = connection.clone();
                 }
                 let result = state.table.push(packet_ref);
                 if !result.outputs.is_empty() {
@@ -2065,8 +2089,9 @@ impl VpnServer {
 struct ClientGroState {
     table: TcpGroTable,
     packet_tx: mpsc::Sender<Bytes>,
-    /// Per-connection datagram cap, used when framing coalesced outputs.
-    max_datagram_size: usize,
+    /// The client's connection, for live `max_datagram_size()` reads when
+    /// framing coalesced outputs.
+    connection: Connection,
 }
 
 /// IP address extracted from a packet (source or destination).
@@ -2401,6 +2426,13 @@ mod tests {
         let bytes: [u8; 32] = rand::random();
         let secret = iroh::SecretKey::from_bytes(&bytes);
         secret.public()
+    }
+
+    #[test]
+    fn test_advertised_client_mtu_clamped_to_datagram_safe() {
+        assert_eq!(advertised_client_mtu(1500), DATAGRAM_SAFE_MTU);
+        assert_eq!(advertised_client_mtu(DATAGRAM_SAFE_MTU), DATAGRAM_SAFE_MTU);
+        assert_eq!(advertised_client_mtu(1200), 1200);
     }
 
     #[test]

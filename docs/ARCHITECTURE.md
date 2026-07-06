@@ -152,7 +152,7 @@ Every accepted response additionally carries the server-dictated settings (see "
 
 The server is the single source of truth for QUIC transport tuning (`[iroh.transport]`: congestion controller, receive/send windows) and the VPN `mtu`. Clients do not configure these; the server sends the fully resolved values in the handshake response and the client applies them:
 
-- **MTU**: the server clamps its shared TUN MTU to `min(config.mtu, 1400)` (`DATAGRAM_SAFE_MTU`) and clamps each client's advertised `mtu` again to that connection's `max_datagram_size - DATAGRAM_FRAMING_OVERHEAD`. `QUIC_INITIAL_MTU` is 1452 (the IPv6-safe maximum for a standard 1500-byte Ethernet path), giving a handshake-time `max_datagram_size` of about 1416 and a datagram-safe inner MTU of about 1400. This assumes a >=1500-MTU path (LAN / most broadband). The client creates its TUN device after the handshake using the already-clamped `mtu`, and that TUN MTU cannot follow later QUIC path-MTU discovery because the TUN device MTU is fixed for the connection's life. On a constrained or tunnel-in-tunnel path, QUIC black-hole detection lowers the live path MTU but the TUN MTU stays high, so full-size packets may be dropped (`SendDatagramError::TooLarge`); the workaround is to lower the server `mtu` config so the advertised value starts small enough for that path. Keep the effective MTU >= 1280 for IPv6.
+- **MTU**: the server dictates the inner MTU as `min(config.mtu, 1280)` (`DATAGRAM_SAFE_MTU`), the IPv6 minimum link MTU and a mobile-safe value on essentially any real path. The advertised MTU is deliberately *not* derived from the handshake-time `max_datagram_size` — that value is live (it tracks QUIC path-MTU discovery), and pinning a fixed TUN MTU to an optimistic snapshot black-holes full-size packets whenever the path later shrinks; a fixed clamp is also deterministic across reconnects (an advertised-MTU change is a fatal `ServerConfigChanged` to the client). On the wire, `QUIC_INITIAL_MTU` is 1200 (the QUIC protocol minimum), so the first datagrams survive any path; DPLPMTUD probes upward to 1452 right after the handshake. The data path re-reads `max_datagram_size()` per TUN read, so framing follows the discovered path MTU. During windows where the live cap is below the inner MTU (the first RTTs after connect, a black-hole cooldown, or a true ≤1200-wire path), oversized plain TCP packets are software-resegmented to the cap (`synthesize_tcp_gso` + `segment_tcp_gso_into`) and only oversized non-TCP packets are dropped. Keep the effective MTU >= 1280 for IPv6 (the config layer warns if `network6` is set with a smaller `mtu`).
 - **Transport tuning**: the congestion controller (and send window) cannot be changed on a live QUIC connection, so the client always connects with the default baseline (cubic, 8 MB windows). If the dictated `transport` differs from that baseline, the client closes the connection and reconnects once with a per-connection transport config (`Endpoint::connect_with_opts`), then re-handshakes. The same `device_id` is reused, so the server's idempotent IP allocation returns the same addresses. When the server runs default tuning, no extra reconnect occurs.
 
 The shared builder (`build_quic_transport_config` in `src/transport/mod.rs`) is used for both endpoint creation and the per-connection upgrade, so both paths apply identical keep-alive, idle-timeout, congestion-controller and window settings. The wire values are resolved via `TransportTuning::effective_windows()` on the server, guaranteeing they match what the server's own endpoint uses.
@@ -162,7 +162,7 @@ The shared builder (`build_quic_transport_config` in `src/transport/mod.rs`) is 
 The VPN mode sends raw IP packets directly over iroh's unreliable QUIC datagrams (TLS 1.3). The reliable handshake runs once on a QUIC bi-stream; all IP traffic then rides datagrams, which avoids the head-of-line blocking of a reliable stream (a lost packet does not stall later ones — the inner transport retransmits as it would over plain UDP). This removes the double encryption overhead of running WireGuard inside QUIC.
 
 **Key Design Decisions:**
-- **Framing**: each datagram carries one message — `[type][offload_len][offload?][ip_packet]` — with no length prefix (the datagram boundary is the length). IP packets may be tagged with segmentation-offload metadata (see "Segmentation Offload" below). Datagrams are capped at the connection's `max_datagram_size`, so GSO super-frames are segmented to that cap on send.
+- **Framing**: each datagram carries one message — `[type][offload_len][offload?][ip_packet]` — with no length prefix (the datagram boundary is the length). IP packets may be tagged with segmentation-offload metadata (see "Segmentation Offload" below). Datagrams are capped at the connection's `max_datagram_size`, read live per TUN read so the cap follows path-MTU discovery; GSO super-frames — and plain TCP packets that outgrow a shrunken path — are segmented to that cap on send.
 - **Security**: Relies on iroh/QUIC's built-in encryption (TLS 1.3).
 - **Efficiency**: Zero-copy forwarding where possible between TUN and QUIC buffers; TCP segments travel as coalesced super-packets when offload is available on either side.
 - **Identification**: Clients identify via a random `u64` `device_id` generated at startup, allowing multiple sessions per iroh endpoint.
@@ -585,7 +585,7 @@ sequenceDiagram
 
     alt auto_reconnect = true
         RC->>RC: Calculate backoff delay
-        RC->>RC: Wait (1s, 2s, 4s... up to 60s)
+        RC->>RC: Wait (1s, 2s, 4s... up to 30s)
         RC->>VPN: Reconnect
     else auto_reconnect = false
         RC->>RC: Exit with error
@@ -594,8 +594,8 @@ sequenceDiagram
 
 **Reconnection Backoff:**
 - Base delay: 1 second
-- Exponential growth: 1s → 2s → 4s → 8s → 16s → 32s → 60s
-- Maximum delay: 60 seconds
+- Exponential growth: 1s → 2s → 4s → 8s → 16s → 30s
+- Maximum delay: 30 seconds (mobile-friendly: Wi-Fi↔cellular transitions cause bursts of early failures, and a minute-long dead window is a poor phone experience)
 - Jitter: 0-500ms added to prevent thundering herd
 - Counter reset: Resets to 0 after successful tunnel operation
 

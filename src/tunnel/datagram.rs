@@ -13,6 +13,7 @@
 use crate::error::{VpnError, VpnResult};
 use crate::tunnel::offload::{
     CoalescedOutput, VIRTIO_NET_HDR_LEN, VirtioNetHdr, materialize_offload_into,
+    synthesize_tcp_gso,
 };
 use crate::tunnel::signaling::{DataMessageType, ServerAddrsMsg};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -119,45 +120,42 @@ pub fn build_datagrams(
             pending.push(frame_datagram(arena, Some(meta), packet)?);
         }
         Some(meta) => {
-            // Segment the super-frame so each emitted datagram fits the path.
-            //
-            // The kernel sets `gso_size` to the *origin* flow's MSS — forwarded
-            // internet traffic, or a jumbo-MTU datacenter path (e.g. AWS) — which
-            // can exceed this connection's `max_datagram_size`. Re-segment at a
-            // size that fits rather than dropping oversized segments:
-            // `segment_tcp_gso_into` recomputes each segment's IP/TCP headers and
-            // checksums, so smaller TCP segments are fully valid and the peer's
-            // stack reassembles them transparently. Dropping instead would
-            // blackhole every large segment (the origin re-sends the same MSS, so
-            // inner-TCP retransmit does not recover) and stall throughput.
-            let seg_meta = clamp_gso_size_to_path(*meta, max_datagram_size);
-            materialize_offload_into(&seg_meta, packet, seg_scratch, |seg| {
-                // Safety net: only a pathologically small path (the IP/TCP header
-                // alone exceeds the datagram cap) can still overflow. Drop and
-                // warn rather than emit an oversized datagram that fails at send.
-                let framed_len = ip_datagram_len(false, seg.len());
-                if framed_len > max_datagram_size {
-                    log::warn!(
-                        "Dropping GSO segment ({framed_len} B framed) exceeding max_datagram_size ({max_datagram_size}); header too large for path"
-                    );
-                    return Ok(());
-                }
-                let frame = frame_datagram(arena, None, seg).map_err(|e| e.to_string())?;
-                pending.push(frame);
-                Ok(())
-            })
-            .map_err(VpnError::Signaling)?;
+            segment_into_datagrams(arena, seg_scratch, pending, meta, packet, max_datagram_size)?;
         }
         None => {
-            // A plain packet must already fit one datagram: the TUN MTU is
-            // clamped so `mtu + DATAGRAM_FRAMING_OVERHEAD <= max_datagram_size`,
-            // and a non-offload packet is bounded by the MTU. If that contract is
-            // ever violated (misconfigured MTU), drop and warn rather than panic —
-            // a single oversized packet must not tear down the tunnel.
+            // A plain packet normally fits one datagram: the TUN MTU is chosen
+            // so `mtu + DATAGRAM_FRAMING_OVERHEAD` fits the cap on essentially
+            // any discovered path. But the cap is live — it starts at the QUIC
+            // protocol-minimum path MTU and can shrink under black-hole
+            // detection — so an oversized packet is a real (if transient)
+            // condition, not just a misconfiguration. Resegment TCP to fit
+            // (dropping would blackhole the flow: the origin re-sends the same
+            // size); drop anything else with a warning rather than panic — a
+            // single oversized packet must not tear down the tunnel.
             let framed_len = ip_datagram_len(false, packet.len());
             if framed_len > max_datagram_size {
+                if let Some(meta) = synthesize_tcp_gso(packet) {
+                    return segment_into_datagrams(
+                        arena,
+                        seg_scratch,
+                        pending,
+                        &meta,
+                        packet,
+                        max_datagram_size,
+                    );
+                }
+                let ip_version = packet.first().map(|b| b >> 4).unwrap_or(0);
+                // synthesize_tcp_gso also rejects TCP it cannot safely split
+                // (fragments, SYN/RST/URG, IPv6 extension headers); report
+                // that distinctly from genuine non-TCP traffic.
+                let is_tcp = match ip_version {
+                    4 => packet.get(9) == Some(&6),
+                    6 => packet.get(6) == Some(&6),
+                    _ => false,
+                };
+                let kind = if is_tcp { "unsplittable TCP" } else { "non-TCP" };
                 log::warn!(
-                    "Dropping plain IP packet ({framed_len} B framed) exceeding max_datagram_size ({max_datagram_size}); TUN MTU contract violated"
+                    "Dropping plain IPv{ip_version} {kind} packet ({framed_len} B framed) exceeding max_datagram_size ({max_datagram_size}); path MTU below inner MTU"
                 );
                 return Ok(());
             }
@@ -165,6 +163,44 @@ pub fn build_datagrams(
         }
     }
     Ok(())
+}
+
+/// Segment an offload-tagged (or synthesized-offload) packet so each emitted
+/// datagram fits the path.
+///
+/// The kernel sets `gso_size` to the *origin* flow's MSS — forwarded internet
+/// traffic, or a jumbo-MTU datacenter path (e.g. AWS) — which can exceed this
+/// connection's `max_datagram_size`. Re-segment at a size that fits rather than
+/// dropping oversized segments: `segment_tcp_gso_into` recomputes each
+/// segment's IP/TCP headers and checksums, so smaller TCP segments are fully
+/// valid and the peer's stack reassembles them transparently. Dropping instead
+/// would blackhole every large segment (the origin re-sends the same MSS, so
+/// inner-TCP retransmit does not recover) and stall throughput.
+fn segment_into_datagrams(
+    arena: &mut BytesMut,
+    seg_scratch: &mut Vec<u8>,
+    pending: &mut Vec<Bytes>,
+    meta: &VirtioNetHdr,
+    packet: &[u8],
+    max_datagram_size: usize,
+) -> VpnResult<()> {
+    let seg_meta = clamp_gso_size_to_path(*meta, max_datagram_size);
+    materialize_offload_into(&seg_meta, packet, seg_scratch, |seg| {
+        // Safety net: only a pathologically small path (the IP/TCP header
+        // alone exceeds the datagram cap) can still overflow. Drop and
+        // warn rather than emit an oversized datagram that fails at send.
+        let framed_len = ip_datagram_len(false, seg.len());
+        if framed_len > max_datagram_size {
+            log::warn!(
+                "Dropping GSO segment ({framed_len} B framed) exceeding max_datagram_size ({max_datagram_size}); header too large for path"
+            );
+            return Ok(());
+        }
+        let frame = frame_datagram(arena, None, seg).map_err(|e| e.to_string())?;
+        pending.push(frame);
+        Ok(())
+    })
+    .map_err(VpnError::Signaling)
 }
 
 /// Reduce a TCP-GSO super-frame's `gso_size` so each resegmented packet, once
@@ -501,5 +537,162 @@ mod tests {
             "segments must be dropped when the header alone exceeds the cap, got {}",
             pending.len()
         );
+    }
+
+    /// Build a valid IPv6/TCP packet with `payload_len` bytes of payload.
+    fn build_ipv6_tcp_packet(payload_len: usize) -> Vec<u8> {
+        use etherparse::{IpNumber, Ipv6Header, TcpHeader};
+        let payload: Vec<u8> = (0..payload_len).map(|v| (v % 251) as u8).collect();
+        let mut tcp = TcpHeader::new(12345, 443, 10_000, 65_535);
+        tcp.ack = true;
+        let ip = Ipv6Header {
+            traffic_class: 0,
+            flow_label: etherparse::Ipv6FlowLabel::ZERO,
+            payload_length: u16::try_from(tcp.header_len() + payload.len()).unwrap(),
+            next_header: IpNumber::TCP,
+            hop_limit: 64,
+            source: [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            destination: [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        };
+        tcp.checksum = tcp.calc_checksum_ipv6(&ip, &payload).expect("tcp checksum");
+        let mut packet = Vec::new();
+        ip.write(&mut packet).expect("write ip");
+        tcp.write(&mut packet).expect("write tcp");
+        packet.extend_from_slice(&payload);
+        packet
+    }
+
+    /// Build a valid IPv4/UDP packet with `payload_len` bytes of payload.
+    fn build_ipv4_udp_packet(payload_len: usize) -> Vec<u8> {
+        use etherparse::{IpNumber, Ipv4Header};
+        let payload: Vec<u8> = (0..payload_len).map(|v| (v % 251) as u8).collect();
+        let udp_len = u16::try_from(8 + payload.len()).unwrap();
+        let mut ip = Ipv4Header::new(udp_len, 64, IpNumber::UDP, [10, 0, 0, 2], [10, 0, 0, 1])
+            .expect("valid IPv4 header");
+        ip.header_checksum = ip.calc_header_checksum();
+        let mut packet = Vec::new();
+        ip.write(&mut packet).expect("write ip");
+        packet.extend_from_slice(&12345u16.to_be_bytes());
+        packet.extend_from_slice(&53u16.to_be_bytes());
+        packet.extend_from_slice(&udp_len.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes()); // checksum 0 = none (IPv4)
+        packet.extend_from_slice(&payload);
+        packet
+    }
+
+    #[test]
+    fn test_oversized_plain_ipv4_tcp_resegmented() {
+        // A plain (non-offload) TCP packet larger than the live cap — the path
+        // MTU shrank below the inner TUN MTU — must be resegmented, not
+        // dropped (dropping blackholes the flow: the origin re-sends the same
+        // size).
+        let payload_len = 1240;
+        let packet = build_ipv4_tcp_packet(payload_len); // 1280 bytes
+        let (mut arena, mut scratch, mut pending) = (BytesMut::new(), Vec::new(), Vec::new());
+        let cap = 1166; // ~datagram cap at the QUIC protocol-minimum path MTU
+
+        build_datagrams(&mut arena, &mut scratch, &mut pending, None, &packet, true, cap)
+            .expect("frame");
+
+        assert!(pending.len() >= 2, "oversized plain TCP must resegment");
+        let mut total_payload = 0usize;
+        for d in &pending {
+            assert!(d.len() <= cap, "datagram {} exceeds cap {}", d.len(), cap);
+            assert_eq!(d[1], 0, "resegmented datagrams carry no offload metadata");
+            total_payload += d.len() - DATAGRAM_FRAMING_OVERHEAD - 40;
+        }
+        assert_eq!(total_payload, payload_len, "full TCP payload preserved");
+    }
+
+    #[test]
+    fn test_oversized_plain_ipv6_tcp_resegmented() {
+        let payload_len = 1200;
+        let packet = build_ipv6_tcp_packet(payload_len); // 1260 bytes
+        let (mut arena, mut scratch, mut pending) = (BytesMut::new(), Vec::new(), Vec::new());
+        let cap = 1166;
+
+        build_datagrams(&mut arena, &mut scratch, &mut pending, None, &packet, true, cap)
+            .expect("frame");
+
+        assert!(pending.len() >= 2, "oversized plain IPv6 TCP must resegment");
+        let mut total_payload = 0usize;
+        for d in &pending {
+            assert!(d.len() <= cap, "datagram {} exceeds cap {}", d.len(), cap);
+            assert_eq!(d[1], 0);
+            total_payload += d.len() - DATAGRAM_FRAMING_OVERHEAD - 60;
+        }
+        assert_eq!(total_payload, payload_len);
+    }
+
+    #[test]
+    fn test_oversized_plain_tcp_fin_only_on_final_segment() {
+        let payload_len = 1240;
+        let mut packet = build_ipv4_tcp_packet(payload_len);
+        packet[33] |= 0x01; // set FIN (checksums are recomputed per segment)
+        let (mut arena, mut scratch, mut pending) = (BytesMut::new(), Vec::new(), Vec::new());
+        let cap = 1166;
+
+        build_datagrams(&mut arena, &mut scratch, &mut pending, None, &packet, true, cap)
+            .expect("frame");
+
+        assert!(pending.len() >= 2);
+        for (i, d) in pending.iter().enumerate() {
+            // d = [type][offload_len=0][ip(20)][tcp...]; TCP flags at IP offset 33.
+            let fin = d[DATAGRAM_FRAMING_OVERHEAD + 33] & 0x01 != 0;
+            assert_eq!(
+                fin,
+                i == pending.len() - 1,
+                "FIN must appear only on the final segment"
+            );
+        }
+    }
+
+    #[test]
+    fn test_oversized_plain_udp_dropped() {
+        // Non-TCP cannot be resegmented; an oversized plain UDP packet is
+        // dropped (never emitted oversized) without erroring.
+        let packet = build_ipv4_udp_packet(1300);
+        let (mut arena, mut scratch, mut pending) = (BytesMut::new(), Vec::new(), Vec::new());
+
+        build_datagrams(&mut arena, &mut scratch, &mut pending, None, &packet, true, 1166)
+            .expect("framing must not error when the packet is dropped");
+
+        assert!(pending.is_empty(), "oversized plain UDP must be dropped");
+    }
+
+    #[test]
+    fn test_oversized_ipv4_fragment_dropped() {
+        // An IP fragment's payload is not a self-contained TCP segment, so it
+        // cannot be resegmented even if the protocol is TCP.
+        let mut packet = build_ipv4_tcp_packet(1240);
+        packet[6] |= 0x20; // set MF
+        let (mut arena, mut scratch, mut pending) = (BytesMut::new(), Vec::new(), Vec::new());
+
+        build_datagrams(&mut arena, &mut scratch, &mut pending, None, &packet, true, 1166)
+            .expect("framing must not error when the packet is dropped");
+
+        assert!(pending.is_empty(), "oversized IP fragment must be dropped");
+    }
+
+    #[test]
+    fn test_plain_packet_exactly_at_cap_not_resegmented() {
+        let packet = build_ipv4_tcp_packet(500); // 540 bytes, framed 542
+        let framed = ip_datagram_len(false, packet.len());
+        let (mut arena, mut scratch, mut pending) = (BytesMut::new(), Vec::new(), Vec::new());
+
+        build_datagrams(
+            &mut arena,
+            &mut scratch,
+            &mut pending,
+            None,
+            &packet,
+            true,
+            framed, // cap == framed size: still fits, no resegmentation
+        )
+        .expect("frame");
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].len(), framed);
+        assert_eq!(&pending[0][DATAGRAM_FRAMING_OVERHEAD..], &packet[..]);
     }
 }
