@@ -46,9 +46,12 @@ void ezvpn_init_logging(void);
  *   server underlay addresses overlap and must be excluded from the tunnel.
  * out_buf/out_len : caller buffer. On success receives the network-config JSON
  *   (per-family fields are null when that family was not assigned):
- *   {"assigned_ip":"10.0.0.2","netmask":"255.255.255.0","gateway":"10.0.0.1",
- *    "assigned_ip6":"fd00::2","prefix_len6":64,"gateway6":"fd00::1","mtu":1400,
+ *   {"assigned_ip":"10.0.0.2","netmask":"255.255.255.255","gateway":"10.0.0.1",
+ *    "assigned_ip6":"fd00::2","prefix_len6":128,"gateway6":"fd00::1","mtu":1400,
  *    "excluded_routes":["192.168.1.5/32"],"excluded_routes6":[]}
+ *   netmask/prefix_len6 are host masks (the server advertises only its own
+ *   host prefix, not the VPN subnet); the extension must add gateway/gateway6
+ *   as included /32 + /128 routes alongside its split-tunnel routes.
  *   On failure receives an error message. Always NUL-terminated.
  *   If out_buf is too small to hold the full network-config JSON, this is
  *   treated as a failure (returns NULL, no handle leaked) — retry with a larger

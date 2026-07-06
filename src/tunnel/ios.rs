@@ -10,7 +10,7 @@
 //!   computes the underlay-bypass set the desktop `BypassRouteManager` would pin
 //!   (every relay IP plus the server's handshake-advertised candidate underlay
 //!   addresses, filtered to those a routed prefix would capture — including the
-//!   assigned interface subnet, which the extension always routes) and
+//!   server's advertised host prefix, which the extension always routes) and
 //!   [`IosSession::network_config`] returns them as host routes (`/32` / `/128`)
 //!   for the extension to apply as `excludedRoutes`. This is the static,
 //!   handshake-time equivalent of the desktop bootstrap bypass; the server's
@@ -77,15 +77,18 @@ pub struct IosConfig {
 pub struct IosNetworkConfig {
     /// Assigned client VPN IPv4 address.
     pub assigned_ip: Option<Ipv4Addr>,
-    /// Subnet mask for the assigned IPv4 address.
+    /// Netmask for the assigned IPv4 address. Always the host mask
+    /// (`255.255.255.255`): the server advertises only its own host prefix.
     pub netmask: Option<Ipv4Addr>,
-    /// VPN IPv4 gateway (server's in-subnet address).
+    /// VPN IPv4 gateway (the server's VPN address). The extension must add it
+    /// as an included `/32` route — the interface subnet does not cover it.
     pub gateway: Option<Ipv4Addr>,
     /// Assigned client VPN IPv6 address.
     pub assigned_ip6: Option<Ipv6Addr>,
-    /// Prefix length for the assigned IPv6 address.
+    /// Prefix length for the assigned IPv6 address. Always `128`.
     pub prefix_len6: Option<u8>,
-    /// VPN IPv6 gateway (server's in-subnet address).
+    /// VPN IPv6 gateway (the server's VPN address). The extension must add it
+    /// as an included `/128` route.
     pub gateway6: Option<Ipv6Addr>,
     /// Server-dictated tunnel MTU.
     pub mtu: u16,
@@ -149,7 +152,7 @@ impl IosSession {
         // (`add_iroh_bypass_routes`): every relay IP the endpoint may use plus
         // the server's candidate underlay addresses, filtered to those a routed
         // prefix would capture and would therefore self-capture the transport.
-        // The filter includes the assigned interface subnets, which the
+        // The filter includes the server's advertised host prefixes, which the
         // extension always routes even with no configured prefixes. Applied by
         // the extension as `excludedRoutes` (see module docs).
         let mut candidates: Vec<IpAddr> = collect_relay_ips(&endpoint, &cfg.relay_urls)

@@ -356,6 +356,16 @@ fn derived_ip6(network: Ipv6Net, node_id: &EndpointId) -> Ipv6Addr {
     Ipv6Addr::from(net_addr | (u128::from(derive_ip6_suffix(node_id)) & mask))
 }
 
+/// The server's IPv4 host prefix (`ip/32`), as advertised to clients.
+fn host_net4(ip: Ipv4Addr) -> Ipv4Net {
+    Ipv4Net::new(ip, 32).expect("/32 is a valid IPv4 prefix")
+}
+
+/// The server's IPv6 host prefix (`ip/128`), as advertised to clients.
+fn host_net6(ip: Ipv6Addr) -> Ipv6Net {
+    Ipv6Net::new(ip, 128).expect("/128 is a valid IPv6 prefix")
+}
+
 /// Allocation strategy state for the IPv6 pool.
 #[derive(Debug)]
 enum Ip6Alloc {
@@ -1182,7 +1192,12 @@ impl VpnServer {
             return Err(VpnError::IpAssignment("All IP pools exhausted".into()));
         }
 
-        // Build handshake response based on what was allocated
+        // Build handshake response based on what was allocated. Advertise only
+        // the server's host prefix (/32, /128) as the routed network — never
+        // the full VPN subnet. Inter-client traffic is dropped server-side
+        // unconditionally, so the gateway is the only in-VPN destination a
+        // client can reach; advertising the subnet would just route dead
+        // addresses into the tunnel.
         let response = match (assigned_ip, assigned_ip6) {
             // Dual-stack: both IPv4 and IPv6
             (Some(ip4), Some(ip6)) => {
@@ -1190,10 +1205,10 @@ impl VpnServer {
                 let ip6_pool = self.ip6_pool.as_ref().unwrap().read().await;
                 VpnHandshakeResponse::accepted_dual_stack(
                     ip4,
-                    ip_pool.network(),
+                    host_net4(ip_pool.server_ip()),
                     ip_pool.server_ip(),
                     ip6,
-                    ip6_pool.network(),
+                    host_net6(ip6_pool.server_ip()),
                     ip6_pool.server_ip(),
                     self.tun_offload_status.enabled,
                     self.wire_transport,
@@ -1205,7 +1220,7 @@ impl VpnServer {
                 let ip_pool = self.ip_pool.as_ref().unwrap().read().await;
                 VpnHandshakeResponse::accepted(
                     ip4,
-                    ip_pool.network(),
+                    host_net4(ip_pool.server_ip()),
                     ip_pool.server_ip(),
                     self.tun_offload_status.enabled,
                     self.wire_transport,
@@ -1217,7 +1232,7 @@ impl VpnServer {
                 let ip6_pool = self.ip6_pool.as_ref().unwrap().read().await;
                 VpnHandshakeResponse::accepted_ipv6_only(
                     ip6,
-                    ip6_pool.network(),
+                    host_net6(ip6_pool.server_ip()),
                     ip6_pool.server_ip(),
                     self.tun_offload_status.enabled,
                     self.wire_transport,
@@ -2426,6 +2441,16 @@ mod tests {
         let bytes: [u8; 32] = rand::random();
         let secret = iroh::SecretKey::from_bytes(&bytes);
         secret.public()
+    }
+
+    #[test]
+    fn test_advertised_networks_are_server_host_prefixes() {
+        // Clients must only ever be told to route the server itself — never the
+        // full VPN subnet (inter-client traffic is dropped server-side).
+        let ip4: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let ip6: Ipv6Addr = "fd00::1".parse().unwrap();
+        assert_eq!(host_net4(ip4), "10.0.0.1/32".parse::<Ipv4Net>().unwrap());
+        assert_eq!(host_net6(ip6), "fd00::1/128".parse::<Ipv6Net>().unwrap());
     }
 
     #[test]

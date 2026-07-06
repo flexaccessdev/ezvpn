@@ -144,6 +144,8 @@ The response includes different address fields depending on the server's address
 | IPv6-only | `assigned_ip6`, `network6`, `server_ip6` |
 | Dual-stack | All six fields when both pools allocate: `assigned_ip`, `network`, `server_ip`, `assigned_ip6`, `network6`, `server_ip6` |
 
+The `network`/`network6` fields carry the server's host prefixes (`server_ip/32` / `server_ip6/128`), not the configured VPN subnets: the gateway is the only in-VPN destination a client can reach, so only it is advertised for routing (see "Client Isolation").
+
 When `network6` is configured on the server, clients normally receive IPv6 addresses alongside IPv4 (dual-stack) or IPv6-only if `network` is omitted. In dual-stack mode, if one address pool is exhausted, the server can still accept the client with the other address family.
 
 Every accepted response additionally carries the server-dictated settings (see "Server-Dictated Configuration" below): `transport` (`WireTransport`: congestion controller and concrete receive/send windows) and `mtu`.
@@ -488,7 +490,7 @@ and the routing table already reveal locally.
 There are two independent version numbers, checked at two different layers:
 
 - **ALPN/format version** — the advertised ALPN is the fixed value `ezvpn/4`, where `4` is the ALPN/format version. A peer whose ALPN does not match exactly (e.g. a different version segment, or an older token-bearing `ezvpn/4/<token>`) is rejected during QUIC ALPN negotiation, before any application streams are opened. It carries no embedded secret; access control rests on the server's iroh endpoint identity and the auth token.
-- **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `3`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation.
+- **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `4`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation.
 
 ### Client Isolation
 
@@ -498,25 +500,24 @@ The primary reason it is mandatory: client IPs are dynamic and constantly change
 
 In `handle_client_data` (`src/tunnel/server.rs`), after the anti-spoofing source check, the inbound packet's destination IP is looked up in `ip_to_endpoint` / `ip6_to_endpoint`. A hit means the destination is another VPN client (or self), so the packet is dropped (counted by `packets_inter_client_blocked`) instead of being written to the TUN for the kernel to forward back out. Only client-assigned IPs live in those maps, so the server/gateway VPN IP and all external/internet destinations are unaffected — the gateway is the only in-VPN peer a client can reach. The drop is on the inbound side, so client→client packets never reach the TUN and the TUN reader never sees them.
 
-**Pinging your own assigned IP** behaves differently per platform, and this is
-expected/accepted (not fixed):
+**Host-prefix advertisement.** Because the gateway is the only reachable in-VPN
+peer, the handshake's `network`/`network6` fields carry only the server's host
+prefix (`server_ip/32` / `server_ip6/128`) — never the full VPN subnet. The
+client configures its TUN with a host mask and explicitly routes the advertised
+prefixes through the tunnel (`run_once` in `src/tunnel/client.rs`; the explicit
+route is what makes the gateway reachable on Windows, where the TUN has no
+point-to-point destination route, and for IPv6 on every platform). Client-side
+this means traffic to other clients' VPN IPs is not even routed into the tunnel
+by default — it would only be dropped server-side — and the tunnel never claims
+an on-link subnet route that could shadow LAN addressing on the client.
 
-- **Linux** answers a self-ping locally — assigning `10.x.y.z/24` to the TUN
-  installs a `local`-table route so traffic to the host's own VPN address loops
-  back in-kernel and never enters the tunnel. So it works.
-- **macOS** makes the TUN a point-to-point `utun`
-  (`inet <self> --> <gateway> netmask 0xffffff00`). A self-ping matches the
-  on-link `/24` route and is sent out the tunnel to the server, where the client
-  isolation check above drops it (the destination is a client-assigned IP — this
-  client's own). So it does not work.
-
-This is standard macOS VPN behavior, not something we do differently: `utun`
-interfaces are inherently point-to-point, and every macOS VPN (WireGuard,
-OpenVPN, etc.) sets the tunnel up this way. The self-ping difference is a
-consequence of following that platform convention, so there is nothing on our
-side to fix — and pinging your own VPN IP has no real use case anyway (under
-normal routing that traffic goes to the server regardless). Adding a client-side
-loopback route to mask it would be the non-standard move, so we don't.
+**Pinging your own assigned IP** no longer enters the tunnel on any platform:
+with only the gateway's host prefix routed, a self-ping matches no tunnel route
+and is handled by local delivery (Linux's `local`-table route; macOS's own-address
+host route via `lo0`). Before host-prefix advertisement, macOS sent self-pings
+out the tunnel via the on-link subnet route, where the isolation check dropped
+them — that quirk is gone along with the subnet route. Pinging your own VPN IP
+has no real use case anyway, but it now behaves the same everywhere.
 
 ### Auto-Reconnect and Connection Health
 

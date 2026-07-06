@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.12"
+version = "0.0.13"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -23,7 +23,7 @@ env_logger = "0.11"
 etherparse = "0.18"
 futures = "0.3"
 ipnet = { version = "2", features = ["serde"] }
-iroh = "1.0.0"
+iroh = "1.0.1"
 iroh-mdns-address-lookup = "0.4.0"
 noq-proto = "1.0.0"
 log = "0.4"
