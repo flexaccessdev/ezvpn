@@ -1258,7 +1258,7 @@ impl VpnServer {
                 }
                 if let Err(reason) = write_frames(&mut send, &mut batch).await {
                     log::warn!("Failed to write frames to {}: {}", writer_client_id, reason);
-                    break Some(reason);
+                    break Some(reason.to_string());
                 }
             };
             log::trace!("Writer task for {} exiting", writer_client_id);

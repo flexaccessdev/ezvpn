@@ -104,12 +104,18 @@ pub fn ip_frame_len(has_offload: bool, ip_len: usize) -> usize {
 }
 
 /// Append an IP frame to the arena and split it off as a refcounted `Bytes`.
+///
+/// The arena must be empty on entry: `split_to(written)` takes from the
+/// *front*, so residual bytes would be handed out as the frame. The invariant
+/// holds as long as the arena is used exclusively through this function and
+/// [`copy_packet_to_arena`], each of which drains exactly what it appended.
 #[inline]
 pub fn frame_ip_packet(
     arena: &mut BytesMut,
     offload: Option<&VirtioNetHdr>,
     packet: &[u8],
 ) -> VpnResult<Bytes> {
+    debug_assert!(arena.is_empty(), "framing arena must be drained on entry");
     let size = ip_frame_len(offload.is_some(), packet.len());
     if arena.capacity() - arena.len() < size {
         arena.reserve(FRAME_ARENA_CHUNK.max(size));
@@ -215,8 +221,12 @@ pub fn encode_server_addrs_frame(buf: &mut BytesMut, msg: &ServerAddrsMsg) -> Vp
 /// The receive buffer is overwritten by the next frame, so packets bound for
 /// the TUN-writer channel must be detached; the arena amortizes those copies'
 /// allocations across packets, mirroring the framing arena on the send side.
+///
+/// Like [`frame_ip_packet`], the arena must be empty on entry: `split_to`
+/// takes from the front, so residual bytes would corrupt the returned packet.
 #[inline]
 pub fn copy_packet_to_arena(arena: &mut BytesMut, packet: &[u8]) -> Bytes {
+    debug_assert!(arena.is_empty(), "packet arena must be drained on entry");
     if arena.capacity() - arena.len() < packet.len() {
         arena.reserve(FRAME_ARENA_CHUNK.max(packet.len()));
     }
@@ -263,10 +273,10 @@ pub async fn read_frame(recv: &mut RecvStream, buf: &mut [u8]) -> VpnResult<Opti
 /// Zero-copy: `write_all_chunks` hands the refcounted `Bytes` to QUIC, which
 /// packetizes the byte stream itself (no size cap at this layer). Any write
 /// error is fatal — the stream is the tunnel.
-pub async fn write_frames(send: &mut SendStream, pending: &mut Vec<Bytes>) -> Result<(), String> {
+pub async fn write_frames(send: &mut SendStream, pending: &mut Vec<Bytes>) -> VpnResult<()> {
     send.write_all_chunks(pending)
         .await
-        .map_err(|e| format!("QUIC stream write error: {}", e))?;
+        .map_err(|e| VpnError::ConnectionLost(format!("QUIC stream write error: {}", e)))?;
     pending.clear();
     Ok(())
 }

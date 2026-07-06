@@ -900,7 +900,7 @@ pub(crate) async fn run_tunnel(
                             log::warn!("Failed to frame coalesced packet: {}", e);
                         } else if let Err(reason) = write_frames(&mut data_send, &mut pending).await
                         {
-                            return Some(reason);
+                            return Some(reason.to_string());
                         }
                         tun_reader.read_buf(&mut packet_buf).await
                     }
@@ -944,7 +944,7 @@ pub(crate) async fn run_tunnel(
                             } else if let Err(reason) =
                                 write_frames(&mut data_send, &mut pending).await
                             {
-                                return Some(reason);
+                                return Some(reason.to_string());
                             }
                         }
                         if !result.pass_through {
@@ -969,7 +969,7 @@ pub(crate) async fn run_tunnel(
                         continue;
                     }
                     if let Err(reason) = write_frames(&mut data_send, &mut pending).await {
-                        return Some(reason);
+                        return Some(reason.to_string());
                     }
                 }
                 Ok(()) => {}

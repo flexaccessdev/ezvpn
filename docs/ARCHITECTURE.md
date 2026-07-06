@@ -475,8 +475,8 @@ and the routing table already reveal locally.
 
 There are two independent version numbers, checked at two different layers:
 
-- **ALPN/format version** — the advertised ALPN is the fixed value `ezvpn/5`, where `5` is the ALPN/format version (kept in lockstep with the wire protocol version since v5). A peer whose ALPN does not match exactly (e.g. an older `ezvpn/4`, or the token-bearing `ezvpn/4/<token>` of earlier builds) is rejected during QUIC ALPN negotiation, before any application streams are opened. It carries no embedded secret; access control rests on the server's iroh endpoint identity and the auth token.
-- **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `4`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation.
+- **ALPN/format version** — the advertised ALPN is the fixed value `ezvpn/6`, where `6` is the ALPN/format version (kept in lockstep with the wire protocol version since v5). A peer whose ALPN does not match exactly (e.g. the older datagram-based `ezvpn/5`, or the token-bearing `ezvpn/4/<token>` of earlier builds) is rejected during QUIC ALPN negotiation, before any application streams are opened. It carries no embedded secret; access control rests on the server's iroh endpoint identity and the auth token.
+- **Wire protocol version** — `VPN_PROTOCOL_VERSION` (currently `6`) is carried inside the application handshake and is independent of the ALPN version. A peer that negotiates a matching ALPN but sends a mismatched wire protocol version is rejected during the handshake exchange, not during QUIC negotiation.
 
 ### Client Isolation
 
