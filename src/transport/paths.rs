@@ -50,23 +50,32 @@ fn paths_key(paths: &PathList<'_>) -> (bool, Vec<String>) {
 }
 
 /// RAII guard that aborts the background path watcher task on drop.
-pub struct PathWatcherGuard(JoinHandle<()>);
+pub struct PathWatcherGuard(Option<JoinHandle<()>>);
 
 impl Drop for PathWatcherGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
     }
 }
 
 /// Log the current connection path and spawn a background task that logs
 /// updates whenever the selected path changes (e.g., relay -> direct).
 ///
+/// Logging is the task's sole purpose, so when debug logging is disabled the
+/// task is not spawned at all and the returned guard is inert. The current
+/// path remains queryable on demand via [`format_connection_paths`] regardless.
+///
 /// The returned [`PathWatcherGuard`] aborts the background task when dropped.
 /// Callers must keep the guard alive for the duration of the connection.
 pub fn watch_connection_paths(connection: &Connection, label: &str) -> PathWatcherGuard {
+    if !log::log_enabled!(log::Level::Debug) {
+        return PathWatcherGuard(None);
+    }
     let connection = connection.clone();
     let label = label.to_string();
-    PathWatcherGuard(tokio::spawn(async move {
+    PathWatcherGuard(Some(tokio::spawn(async move {
         // The stream yields the current snapshot on the first poll, then a
         // fresh snapshot whenever the open or selected paths change; it ends
         // when the connection closes.
@@ -75,9 +84,9 @@ pub fn watch_connection_paths(connection: &Connection, label: &str) -> PathWatch
         while let Some(paths) = stream.next().await {
             let key = paths_key(&paths);
             if last_key.as_ref() != Some(&key) {
-                log::info!("{}: {}", label, format_connection_paths(&paths));
+                log::debug!("{}: {}", label, format_connection_paths(&paths));
                 last_key = Some(key);
             }
         }
-    }))
+    })))
 }
