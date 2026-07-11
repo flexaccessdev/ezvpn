@@ -70,6 +70,12 @@ shapes in [`ios/ezvpn.h`](../ios/ezvpn.h)):
    `utun` fd (obtained after the extension applies the network settings).
 3. `ezvpn_stop(handle)` — tear down and free the handle.
 
+Plus one optional debug readout: `ezvpn_conn_path(handle, out_buf, out_len)` —
+a point-in-time JSON snapshot of the live iroh path(s) (direct/relay, RTT,
+which is selected), mirroring `ezvpn client status`. The app surfaces it as the
+"Connection path" sheet; callable any time between connect and stop, empty
+while no path is established.
+
 ```
 EzvpnApp (SwiftUI)            PacketTunnel (NEPacketTunnelProvider)
   installs VPN config  ──VPN──▶  startTunnel:
@@ -82,8 +88,8 @@ EzvpnApp (SwiftUI)            PacketTunnel (NEPacketTunnelProvider)
 ## Underlay bypass on iOS
 
 If a routed prefix covers an address iroh's own transport uses — the server's
-underlay address (e.g. the server is on a LAN at `192.168.1.5` and you route
-`192.168.0.0/16`) or, with broad routes, a relay IP — iOS would route iroh's
+public underlay address (e.g. its egress-only GUA IPv6 inside a routed cloud
+prefix) or, with broad/full-tunnel routes, a relay IP — iOS would route iroh's
 own QUIC packets into the tunnel and the connection would self-capture and
 stall.
 
