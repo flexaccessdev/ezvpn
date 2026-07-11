@@ -44,8 +44,8 @@ only differs in who owns the tunnel device and the routing table:
 
 The macOS `utun` fast path (4-byte address-family-prefixed frames) is shared with
 iOS via the `target_vendor = "apple"` cfg, so the read/write hot path is
-identical. The handshake (`perform_handshake`) and datagram loop (`run_tunnel`)
-are used verbatim.
+identical. The handshake (`perform_handshake`) and data-stream loop
+(`run_tunnel`) are used verbatim.
 
 Key source in this repo:
 
@@ -66,7 +66,7 @@ shapes in [`ios/ezvpn.h`](../ios/ezvpn.h)):
    connect, handshake. Returns an opaque handle and writes the assigned network
    config (IPv4 and/or IPv6 addresses, gateway, MTU, and the computed
    `excluded_routes`/`excluded_routes6`) as JSON.
-2. `ezvpn_run(handle, utun_fd)` — start the datagram loop on the OS-provided
+2. `ezvpn_run(handle, utun_fd)` — start the data-stream loop on the OS-provided
    `utun` fd (obtained after the extension applies the network settings).
 3. `ezvpn_stop(handle)` — tear down and free the handle.
 
@@ -82,7 +82,7 @@ EzvpnApp (SwiftUI)            PacketTunnel (NEPacketTunnelProvider)
   start/stop                       ezvpn_connect(json) ──▶ libezvpn
                                    setTunnelNetworkSettings   (iroh connect
                                    ezvpn_run(utun_fd) ─────▶   + handshake
-                                  stopTunnel: ezvpn_stop        + datagram loop)
+                                  stopTunnel: ezvpn_stop        + data-stream loop)
 ```
 
 ## Underlay bypass on iOS

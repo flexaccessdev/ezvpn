@@ -1270,7 +1270,7 @@ impl VpnClient {
     /// Connect to the VPN server with automatic reconnection on failure.
     ///
     /// This method wraps `connect()` with a reconnection loop that handles
-    /// transient failures using exponential backoff (1s → 2s → 4s → ... → 60s max).
+    /// transient failures using exponential backoff (1s → 2s → 4s → ... → 30s max).
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for connections

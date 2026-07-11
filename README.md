@@ -89,6 +89,9 @@ You only need the `ezvpn` binary in your `PATH`.
 curl -sSL https://andrewtheguy.github.io/ezvpn/install.sh | sudo bash
 ```
 
+Prebuilt installer assets currently support Linux `amd64`/`arm64` and Apple
+Silicon macOS (`arm64`). Other macOS architectures can build from source.
+
 ### Windows
 
 Run from an **elevated** (Administrator) PowerShell — the installer places the
@@ -503,8 +506,10 @@ entirely.
 - The data path sends raw IP packets over a single reliable QUIC
   bidirectional stream (the handshake stream, kept open) protected by
   QUIC/TLS 1.3.
-- Each frame is `[len: u32 BE][type][offload_len][offload?][ip_packet]`. The
-  stream is a byte pipe, so an explicit length prefix delimits messages.
+- IP packet frames are `[len: u32 BE][type][offload_len][offload?][ip_packet]`.
+  The stream is a byte pipe, so an explicit length prefix delimits messages.
+  Server address publications use their own frame type (`0x01`) with a JSON
+  body.
 - The initial QUIC path MTU is 1200, the QUIC protocol minimum, so the first
   packets survive any path (cellular, tunnel-in-tunnel, PPPoE). QUIC path-MTU
   discovery probes upward to 1452 right after the handshake. The path MTU only
@@ -565,7 +570,7 @@ Liveness is detected by QUIC:
 - QUIC idle timeout is 30 seconds.
 - The client tears down and reconnects when the connection closes, peer liveness
   fails, or TUN/stream I/O fails.
-- Reconnect backoff starts at 1 second, doubles up to 60 seconds, and adds
+- Reconnect backoff starts at 1 second, doubles up to 30 seconds, and adds
   0-500 ms of jitter.
 
 On reconnect, the client compares the server's network parameters against the
