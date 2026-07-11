@@ -11,6 +11,25 @@ Full-tunnel default routing is supported, but remains more experimental because
 it interacts with broad host routes and the underlay bypass routes needed for
 iroh server and relay addresses.
 
+Three design principles shape the architecture:
+
+- **Easy setup over configuration flexibility.** The friction points of
+  conventional VPNs are engineered away rather than configured around: the
+  server needs no open inbound port and no known or static IP (clients dial its
+  iroh `EndpointId`; no port forwarding, no dynamic DNS), and client VPN IPs
+  are always assigned dynamically, so there is no subnet planning or
+  address-collision management as with static-IP VPNs like WireGuard.
+- **Temporary split-tunnel access, not a permanent overlay.** Clients get
+  ephemeral, dynamic IPs and can reach only the server's network; there is no
+  client-to-client connectivity (see "Client Isolation" below). This is a
+  different principle than Tailscale, which gives clients stable IPs so peers
+  can address one another as one of its use cases. For a permanent VPN
+  bridging two sites with stable subnets, WireGuard is the right tool.
+- **Single responsibility: tunneling only.** Firewall, forwarding/NAT, and DNS
+  configuration are managed outside the VPN connector. The iOS app's in-app
+  split DNS is the one deliberate exception, added because applying DNS inside
+  the tunnel is the only way to accomplish it on iOS.
+
 Anonymity is not a design goal. iroh's relay/discovery infrastructure can
 observe connection metadata when it is used for signaling or for carrying
 encrypted traffic. The tunneled payload is still end-to-end encrypted by

@@ -17,11 +17,25 @@ open inbound ports. Relay fallback is used when a direct path is unavailable.
 
 ## Project Scope
 
-The primary use case for `ezvpn` is easy access to private resources from home
-or another external network without opening inbound ports on the VPN server. A
-typical deployment is a small `ezvpn` server inside a private network, such as
-an AWS VPC, where clients need to reach private AWS resources or instances in
-private/egress-only subnets.
+The goal of `ezvpn` is easy VPN setup without the configuration complexity that
+has always been the bottleneck and friction point of VPN tunnels. It removes
+the two classic pain points:
+
+- **No inbound port to open on the server, and no server IP to know or keep
+  stable.** Clients dial the server's stable iroh `EndpointId`, with
+  hole-punching and relay fallback. An open port is a security concern, and —
+  like a static, reachable IP — is difficult or impossible for home-hosted
+  servers behind dynamic IPs, NAT/CGNAT, or carrier restrictions. With `ezvpn`
+  no port forwarding and no dynamic-DNS setup are needed.
+- **No VPN subnet IP planning.** The server assigns client VPN IPs dynamically,
+  so there is nothing to keep collision-free by hand — unlike static-IP VPNs
+  such as WireGuard, where making sure client subnet IPs do not collide is on
+  you.
+
+`ezvpn` is meant for temporary split-tunnel access to the server's network, not
+a permanent overlay network. A typical deployment is a small `ezvpn` server
+inside a private network, such as an AWS VPC, where clients need to reach
+private AWS resources or instances in private/egress-only subnets.
 
 `ezvpn` is not an anonymity network. If the default iroh relay/discovery
 infrastructure is used, iroh relay operators can observe connection metadata
@@ -73,6 +87,21 @@ another. Here every client only ever talks to the server gateway, so assigned
 IPs carry no such guarantee and the whole class of stale-IP and address-collision
 bookkeeping disappears. So do not use `ezvpn` for site-to-site routing between
 two LANs or for direct client-to-client traffic.
+
+This is a different principle than Tailscale, one of whose use cases is giving
+every client a stable IP so peers can address one another. `ezvpn` deliberately
+keeps client IPs dynamic and clients isolated, trading that capability for a
+conflict-free network with zero address configuration. And for a permanent VPN
+that bridges two sites with stable subnets, WireGuard is the right choice, not
+`ezvpn`.
+
+`ezvpn` also follows a single-responsibility principle: the server and desktop
+client do one thing — tunneling. Firewall, forwarding/NAT, and DNS
+configuration (e.g. conditional forwarding for an internal zone, see
+[docs/Client-Split-DNS.md](docs/Client-Split-DNS.md)) are expected to be
+managed outside the VPN connector. The iOS app is the one deliberate
+exception: it applies split DNS in-app (`NEDNSSettings`), because on iOS
+that is the only way to accomplish it.
 
 Also do not use `ezvpn` when the goal is anonymity. iroh's relays can see relay
 metadata when they are involved, even though the VPN payload remains encrypted.
@@ -623,10 +652,10 @@ For unattended clients under systemd, launchd, or a Windows service, see
 That guide also covers the fixed runtime directory used by `status`, `list`,
 and Unix `stop` under service managers.
 
-## iOS App (Proof of Concept)
+## iOS App
 
-`ezvpn` runs on iOS as a Network Extension, as a proof of concept (dual-stack
-split tunnel, real-device testing; no full tunnel, no App Store packaging). The
+`ezvpn` runs on iOS as a Network Extension (dual-stack split tunnel,
+real-device testing; no full tunnel, no App Store packaging). The
 Rust core builds into `libezvpn.xcframework` here (`./build-ios.sh`, released as
 `libezvpn-ios.xcframework.zip`); the Swift app lives in a separate repo,
 [`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios), which consumes it via a

@@ -14,7 +14,9 @@ Placeholders used below:
 
 The ezvpn desktop client does **not** push DNS or match domains over the tunnel
 (`dns_server` / `--dns-server` configure iroh *discovery* DNS only — see the
-README). So resolving the internal zone, whether on the LAN or over the ezvpn
+README). This is by design, not a missing feature: the connector's single
+responsibility is tunneling, and DNS and firewall policy are managed outside
+it. So resolving the internal zone, whether on the LAN or over the ezvpn
 tunnel, relies on the OS-level conditional forwarding below. When `<RESOLVER_IP>`
 is only reachable over the tunnel, the server must ensure UDP/53 replies come back
 from that same address (e.g. an ipf/NAT redirect rule); the tunnel gateway IP

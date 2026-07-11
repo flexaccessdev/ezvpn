@@ -20,6 +20,12 @@ In scope:
 
 - **Dual-stack split tunnel** — IPv4, IPv6, or both, to explicit routed
   prefixes. Both route lists are optional and independent.
+- **Optional split DNS** — applied in-app by the `ezvpn-ios` extension via
+  `NEDNSSettings.matchDomains`. This is a deliberate exception to ezvpn's
+  tunneling-only single-responsibility principle: unlike the desktop OSes
+  (see [`Client-Split-DNS.md`](Client-Split-DNS.md)), iOS offers no OS-level
+  per-domain DNS mechanism a user could configure outside the app, so
+  applying it inside the tunnel is the only way.
 - **Optional underlay bypass** — automatically carves the few server underlay
   addresses that overlap a routed prefix back out of the tunnel (see below).
 - **Real-device testing** — a Packet Tunnel Provider does not run in the iOS
