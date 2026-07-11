@@ -62,6 +62,9 @@ pub fn local_networks() -> Vec<LocalNetwork> {
         .filter(|iface| iface.is_oper_up() && !iface.is_loopback() && !iface.is_p2p())
         .filter_map(|iface| {
             let (ip, prefix_len) = match &iface.addr {
+                // IPv4 link-local (169.254/16, APIPA) is deliberately kept:
+                // the iOS reference skips only IPv6 link-local, which unlike
+                // APIPA is present on every interface unconditionally.
                 if_addrs::IfAddr::V4(a) => (IpAddr::V4(a.ip), a.prefixlen),
                 if_addrs::IfAddr::V6(a) => {
                     // Link-local lives on every interface and never routes.
