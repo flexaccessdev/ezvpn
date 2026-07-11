@@ -1,7 +1,11 @@
 # Plan: desktop overlap refusal + network-change handling (iOS parity)
 
-Status: **planned, not implemented** — written 2026-07-10, to be implemented in
-a later session. Grounded against the code as of the `improvebypass` branch
+Status: **§1 and §3 implemented (2026-07-10)** — `src/net/local_networks.rs`,
+`VpnError::RouteOverlapsLocalNetwork`, check in `connect()`; `private_scope`
+filter in `BypassRouteManager::update`. §2 pending (§3 did not need it: the
+connect-time refusal covers the startup invariant, and a mid-session network
+change breaks the tunnel, so the reconnect attempt re-runs the §1 check).
+Written 2026-07-10, grounded against the code as of the `improvebypass` branch
 (post `ezvpn_conn_path`, post private-scope iOS bypass fix).
 
 ## Motivation
@@ -100,7 +104,9 @@ backstops residual self-capture.
 
 Update the README "Routing" caveat (the "client inside the same private
 network as the server" bullet currently documents the desktop bypass behavior
-and notes the iOS difference) when this lands.
+and notes the iOS difference) when this lands. *Done — README and
+`docs/ARCHITECTURE.md` ("Underlay Bypass Routes") updated alongside the
+filter.*
 
 ## Suggested order
 
@@ -115,6 +121,10 @@ and notes the iOS difference) when this lands.
 - Exact tun-name exclusion on each OS (utunN on macOS, configurable name on
   Linux/Windows) — thread the actual device name from `TunDevice` into both
   the enumerator and the watcher fingerprint rather than pattern-matching.
+  *Resolved for §1:* the enumerator excludes by the point-to-point flag, not
+  by name (covers tun/utun on every OS), and the check runs before
+  `create_tun_device`, so the client's own tun never exists at check time.
+  Still open for §2's watcher fingerprint.
 - Whether `--wait-on-overlap` should be the default under service managers
   (systemd restart policies may make exit-and-restart good enough).
 - Windows CI coverage for `if-addrs`/`if-watch` behavior.

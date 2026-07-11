@@ -274,6 +274,26 @@ When both `network` and `network6` are configured, each client normally receives
 | macOS | `utunX` | `route add` | root |
 | Windows | `wintun.dll` | `netsh interface route` (VPN routes); `NetTCPIP` PowerShell cmdlets `Find-NetRoute`/`New-NetRoute` (underlay bypass host routes) | Administrator |
 
+### Split-Tunnel Overlap Refusal (Client)
+
+Before creating the TUN device or installing any route, `connect()` refuses to
+start when a configured split-tunnel route overlaps a network the host is
+currently on (`refusing to start: split-tunnel route <cidr> overlaps current
+network <cidr> on <iface>`). Routing the local subnet into the tunnel would cut
+off on-link hosts, including the gateway carrying the tunnel's own underlay.
+On-link subnets are enumerated in `net/local_networks.rs` (skipping loopback,
+point-to-point — which covers tun/utun — not-running interfaces, and IPv6
+link-local); the check runs after the handshake so only address families the
+server actually assigned are considered, and it guards every reconnect attempt.
+The error is non-recoverable: the reconnect loop exits and the user reconnects
+deliberately (iOS parity — the same check lives in ezvpn-ios
+`TunnelCore/LocalNetworks.swift`).
+
+**Desktop carve-out:** default routes and the `/1` half-routes they expand to
+(`prefix_len <= 1`) are exempt. Full tunnel is a supported desktop mode that
+relies on connected-route specificity plus the bypass set below; only a
+*specific* routed prefix overlapping an on-link subnet is refused.
+
 ### Underlay Bypass Routes
 
 iroh's QUIC transport may reach the server (or a relay) over a public address
@@ -291,6 +311,20 @@ is reachable. An ingress+egress server address and an egress-only one (reached
 via stateful NAT/hole-punching) both form direct paths that self-capture without
 the bypass — reachability only governs whether a direct path forms at all, not
 whether a candidate address needs pinning.
+
+**Only global-scope addresses are bypassed.** Private-scope candidates
+(RFC1918/ULA/link-local — the server's LAN addresses) are never bypassed, even
+when a routed prefix covers them — the same filter the iOS client applies to
+its `excludedRoutes` (`overlapping_underlay_excludes`). This is sound because
+of the overlap refusal above: a session only starts when no specific routed
+prefix overlaps the local network, so a private-scope server address inside a
+routed prefix is unreachable off-tunnel anyway; and in full tunnel the
+connected LAN route is more specific than the installed `/1` halves, so the
+local network needs no pinned route either. Bypassing such an address would
+only blackhole a real tunnel destination that shares the server's LAN address
+(e.g. a DNS server on the VPN host). Residual self-capture — iroh probing a
+private candidate into the tunnel — dies in the data path: `run_tunnel` drops
+TUN packets carrying a local iroh UDP port, so the probe never validates.
 
 **Two address sources, no path-snapshot watch.** The client learns the addresses
 to bypass from exactly two sources:
