@@ -604,7 +604,10 @@ restart or allocation state changes.
 - `relay_urls` / `--relay-url` configure custom relay servers for failover and
   connection hints.
 - `dns_server` / `--dns-server` configure the iroh discovery server. This is
-  not VPN DNS and does not affect client DNS resolution.
+  not VPN DNS and does not affect client DNS resolution. The client does not push
+  DNS or match domains over the tunnel; to resolve an internal zone through a
+  resolver reachable over the tunnel, set OS-level conditional forwarding —
+  see [docs/CLIENT-SPLIT-DNS.md](docs/CLIENT-SPLIT-DNS.md).
 - Server and client relay/discovery settings must match.
 - If `dns_server = "none"` disables DNS discovery, clients and server must
   connect through a common relay or same-LAN mDNS discovery.
