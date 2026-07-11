@@ -377,7 +377,7 @@ impl VpnClient {
 
         // Refuse to start when a configured split-tunnel route overlaps a
         // network this host is currently on (iOS parity; see
-        // docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md §1). Runs before
+        // docs/Desktop-Overlap-and-Network-Change-Plan.md §1). Runs before
         // any TUN/route setup so every reconnect attempt is guarded with
         // nothing to unwind, and after the handshake so only families the
         // server actually assigned are checked — a route for an unassigned
@@ -558,7 +558,7 @@ impl VpnClient {
         // LAN traffic starts hairpinning through the tunnel, while the QUIC
         // session may survive the network switch, so the reconnect loop's
         // connect-time check would never re-run (§2 of
-        // docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md). On conflict the
+        // docs/Desktop-Overlap-and-Network-Change-Plan.md). On conflict the
         // watcher records the typed refusal error and closes the connection;
         // `run_tunnel` unwinds through its normal cleanup path and the error
         // is surfaced below. Skipped when every configured route is
@@ -1503,7 +1503,7 @@ impl BypassRouteManager {
     ///
     /// User-visible caveat: the pinned address is reachable only over the
     /// underlay, not through the VPN, so a resource on that same host must be
-    /// addressed by its VPN-internal IP. Documented in `docs/ARCHITECTURE.md`
+    /// addressed by its VPN-internal IP. Documented in `docs/Architecture.md`
     /// ("Underlay Bypass Routes") and the README "Routing" section.
     async fn update(&mut self, required_ips: HashSet<IpAddr>) {
         // Only bypass iroh peer IPs that a VPN route would otherwise capture.
@@ -1655,7 +1655,7 @@ impl Drop for AbortOnDropTask {
 /// conflicting subnet (arriving home with the VPN still up) goes unnoticed.
 /// Polling is deliberate: the event-driven watcher crates are event-driven
 /// only on the deprioritized platforms and would poll on macOS anyway (see
-/// docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md §2).
+/// docs/Desktop-Overlap-and-Network-Change-Plan.md §2).
 #[cfg(not(target_os = "ios"))]
 const LOCAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(5);
 

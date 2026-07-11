@@ -63,7 +63,7 @@ Current state, for orientation:
   subnet is refused.
 - Error policy: non-recoverable → `run_with_reconnect` exits with the message
   (iOS parity: the user reconnects deliberately). Optional later flag
-  `--wait-on-overlap` for service deployments (RUNNING-AS-A-SERVICE.md): park
+  `--wait-on-overlap` for service deployments (Running-as-a-Service.md): park
   instead of exit, resume when the watcher (§2) reports the conflict gone.
 
 ## 2. Network-change handling (overlap-driven self-stop)
@@ -144,7 +144,7 @@ backstops residual self-capture.
 Update the README "Routing" caveat (the "client inside the same private
 network as the server" bullet currently documents the desktop bypass behavior
 and notes the iOS difference) when this lands. *Done — README and
-`docs/ARCHITECTURE.md` ("Underlay Bypass Routes") updated alongside the
+`docs/Architecture.md` ("Underlay Bypass Routes") updated alongside the
 filter.*
 
 ## Suggested order

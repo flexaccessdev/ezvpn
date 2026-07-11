@@ -5,7 +5,7 @@
 //! Routing a subnet the host is currently on into the tunnel would cut off
 //! on-link hosts, including the gateway carrying the tunnel's own underlay,
 //! so `VpnClient::connect` refuses to start on a conflict (see
-//! `docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md` §1).
+//! `docs/Desktop-Overlap-and-Network-Change-Plan.md` §1).
 
 use crate::error::VpnError;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};

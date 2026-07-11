@@ -468,7 +468,7 @@ common ways a split-tunnel route overlaps a server address:
   desktop; there the connected LAN route is more specific than the `/1`
   halves, so the server's private LAN address stays reachable off-tunnel with
   no pinned route — private-scope addresses are never bypassed on either
-  platform (see `docs/IOS-POC.md`).
+  platform (see `docs/iOS-App.md`).
 - **A routed IPv6 prefix contains the server's public IPv6.** Cloud servers
   typically sit inside the same broad IPv6 CIDR as the resources you route (e.g.
   an AWS VPC prefix), so routing that CIDR captures the server's own public
@@ -607,7 +607,7 @@ restart or allocation state changes.
   not VPN DNS and does not affect client DNS resolution. The client does not push
   DNS or match domains over the tunnel; to resolve an internal zone through a
   resolver reachable over the tunnel, set OS-level conditional forwarding —
-  see [docs/CLIENT-SPLIT-DNS.md](docs/CLIENT-SPLIT-DNS.md).
+  see [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
 - Server and client relay/discovery settings must match.
 - If `dns_server = "none"` disables DNS discovery, clients and server must
   connect through a common relay or same-LAN mDNS discovery.
@@ -618,7 +618,7 @@ See the relay and discovery comments in `vpn_server.toml.example` and
 ## Running as a Service
 
 For unattended clients under systemd, launchd, or a Windows service, see
-[`docs/RUNNING-AS-A-SERVICE.md`](docs/RUNNING-AS-A-SERVICE.md).
+[`docs/Running-as-a-Service.md`](docs/Running-as-a-Service.md).
 
 That guide also covers the fixed runtime directory used by `status`, `list`,
 and Unix `stop` under service managers.
@@ -632,10 +632,10 @@ Rust core builds into `libezvpn.xcframework` here (`./build-ios.sh`, released as
 [`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios), which consumes it via a
 Swift package binary target.
 
-See [`docs/IOS-POC.md`](docs/IOS-POC.md) for scope, how it reuses the core, the C
+See [`docs/iOS-App.md`](docs/iOS-App.md) for scope, how it reuses the core, the C
 interface, and build steps.
 
 ## Architecture
 
 Detailed internals, flow diagrams, client isolation rules, and reconnect
-consistency checks live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+consistency checks live in [`docs/Architecture.md`](docs/Architecture.md).

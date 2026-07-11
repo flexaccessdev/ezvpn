@@ -1,8 +1,8 @@
-# iOS App (Proof of Concept)
+# iOS App
 
-`ezvpn` can run on iOS as a Network Extension. This is a **proof of concept**:
-it tunnels real traffic on a physical device, but it is intentionally scoped and
-not prepared for App Store distribution.
+`ezvpn` can run on iOS as a Network Extension. It tunnels real traffic on a
+physical device and is intentionally scoped: it is not prepared for App Store
+distribution.
 
 The iOS client is split across two repositories:
 
@@ -119,7 +119,7 @@ are not handled (re-applying `NEPacketTunnelNetworkSettings` mid-session is
 disruptive).
 
 **Caveat** (same as desktop — see the README "Routing" section and
-`docs/ARCHITECTURE.md`): a bypassed server underlay IP is reachable only over the
+`docs/Architecture.md`): a bypassed server underlay IP is reachable only over the
 underlay while connected. To reach the server *through* the tunnel, use its
 VPN-internal gateway IP, not the public address that doubles as the transport
 endpoint.
