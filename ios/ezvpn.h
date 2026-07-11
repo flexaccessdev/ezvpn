@@ -75,6 +75,25 @@ EzvpnHandle *ezvpn_connect(const char *config_json, char *out_buf, size_t out_le
 int ezvpn_run(EzvpnHandle *handle, int tun_fd);
 
 /*
+ * Snapshot the live connection's iroh path(s) as JSON into out_buf, mirroring
+ * `ezvpn client status`:
+ *   {"paths":[
+ *     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
+ *     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}]}
+ * A point-in-time snapshot of how the client currently reaches the server,
+ * showing ALL discovered paths (not just the selected one). kind is "direct",
+ * "relay", or "other" (forward-compatible catch-all); selected marks the path
+ * iroh routes over right now. The array is EMPTY while the connection is down,
+ * so only offer this while the tunnel is up.
+ *
+ * Returns 1 on success (full JSON written), 0 if out_buf was too small (the
+ * JSON is truncated; retry larger), and -1 for a NULL handle. out_buf is always
+ * NUL-terminated when usable (non-NULL, out_len > 0); the NULL-handle return
+ * writes an empty string.
+ */
+int ezvpn_conn_path(const EzvpnHandle *handle, char *out_buf, size_t out_len);
+
+/*
  * Stop the tunnel and free the handle. After this call the handle is invalid.
  * Passing NULL is a safe no-op.
  */

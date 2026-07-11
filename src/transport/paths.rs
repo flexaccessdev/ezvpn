@@ -38,6 +38,60 @@ pub fn format_connection_paths(paths: &PathList<'_>) -> String {
     }
 }
 
+/// Which kind of transport a connection path uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnPathKind {
+    /// A direct peer-to-peer path (holepunched UDP).
+    Direct,
+    /// A path relayed through an iroh relay server.
+    Relay,
+    /// Any other transport iroh reports (forward-compatible catch-all).
+    Other,
+}
+
+/// A single connection path snapshot for status display, decoupled from iroh's
+/// borrowed [`PathList`] so it can be stored and shown on demand (the iOS app's
+/// "connection path" sheet via `ezvpn_conn_path`, mirroring
+/// `ezvpn client status`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnPath {
+    pub kind: ConnPathKind,
+    /// Human line like `Direct 1.2.3.4:52186 (rtt 1ms)` or
+    /// `Relay https://… (rtt 42ms)`.
+    pub display: String,
+    /// Whether iroh currently routes traffic over this path.
+    pub selected: bool,
+}
+
+/// Snapshot the current path(s) of a live connection for a status UI, showing
+/// *all* paths (not just the selected one) so a direct path iroh has discovered
+/// but not selected is still visible. [`Connection::paths`] is itself a
+/// point-in-time snapshot, so this needs no background watcher. Empty while the
+/// connection is down.
+pub fn connection_paths(conn: &Connection) -> Vec<ConnPath> {
+    conn.paths()
+        .iter()
+        .map(|path| {
+            let rtt = path.rtt();
+            let selected = path.is_selected();
+            let (kind, display) = match path.remote_addr() {
+                TransportAddr::Ip(addr) => {
+                    (ConnPathKind::Direct, format!("Direct {addr} (rtt {rtt:.0?})"))
+                }
+                TransportAddr::Relay(url) => {
+                    (ConnPathKind::Relay, format!("Relay {url} (rtt {rtt:.0?})"))
+                }
+                other => (ConnPathKind::Other, format!("{other:?} (rtt {rtt:.0?})")),
+            };
+            ConnPath {
+                kind,
+                display,
+                selected,
+            }
+        })
+        .collect()
+}
+
 /// Key identifying the full path topology (all paths plus which is selected),
 /// excluding the volatile RTT, so we only log when the path set actually
 /// changes — including when a non-selected direct candidate appears or goes.

@@ -10,6 +10,9 @@
 //!    network settings); spawns the data-stream loop on the embedded runtime.
 //! 3. [`ezvpn_stop`] — abort the loop, close the endpoint, free the handle.
 //!
+//! [`ezvpn_conn_path`] is an optional debug readout: an on-demand snapshot of
+//! the live iroh path(s) (relay/direct), mirroring `ezvpn client status`.
+//!
 //! All functions are null-safe and never unwind across the FFI boundary (the
 //! release profile is `panic = "abort"`, so a panic terminates the extension
 //! process rather than crossing into Swift).
@@ -61,6 +64,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 use crate::error::VpnResult;
+use crate::transport::paths::{ConnPathKind, connection_paths};
 use crate::tunnel::ios::{IosConfig, IosSession};
 
 /// Opaque handle owned by the Swift side. Created by [`ezvpn_connect`], freed by
@@ -71,6 +75,9 @@ pub struct EzvpnHandle {
     session: Option<IosSession>,
     /// The running tunnel task, present after [`ezvpn_run`].
     task: Option<tokio::task::JoinHandle<VpnResult<()>>>,
+    /// Clone of the live iroh connection, kept so [`ezvpn_conn_path`] can
+    /// snapshot its paths on demand after `ezvpn_run` consumed the session.
+    connection: iroh::endpoint::Connection,
 }
 
 #[derive(Deserialize)]
@@ -209,14 +216,67 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
     })
     .to_string();
 
+    let connection = session.connection();
     Ok((
         EzvpnHandle {
             runtime,
             session: Some(session),
             task: None,
+            connection,
         },
         result_json,
     ))
+}
+
+/// Snapshot the live connection's iroh path(s) as JSON into `out_buf`,
+/// mirroring `ezvpn client status`:
+///
+/// ```json
+/// { "paths": [
+///     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
+///     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}
+/// ] }
+/// ```
+///
+/// A **point-in-time** snapshot of how the client currently reaches the server,
+/// showing *all* discovered paths (not just the selected one); `kind` is
+/// `"direct"`, `"relay"`, or `"other"` (a forward-compatible catch-all) and
+/// `selected` marks the path iroh routes over right now. The array is **empty**
+/// while the connection is down.
+///
+/// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
+/// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
+/// handle. `out_buf` is always NUL-terminated when usable (non-null,
+/// `out_len > 0`): the null-handle return writes an empty string.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`ezvpn_connect`] and not yet
+/// passed to [`ezvpn_stop`]. `out_buf` must point to at least `out_len`
+/// writable bytes (may be null only if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ezvpn_conn_path(
+    handle: *const EzvpnHandle,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if handle.is_null() {
+        write_cstr(out_buf, out_len, "");
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    let paths: Vec<_> = connection_paths(&handle.connection)
+        .into_iter()
+        .map(|p| {
+            let kind = match p.kind {
+                ConnPathKind::Direct => "direct",
+                ConnPathKind::Relay => "relay",
+                ConnPathKind::Other => "other",
+            };
+            serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
+        })
+        .collect();
+    let json = serde_json::json!({ "paths": paths }).to_string();
+    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 
 /// Start the tunnel data loop on `tun_fd` (the extension's `utun` fd).

@@ -214,6 +214,12 @@ impl IosSession {
         })
     }
 
+    /// A clone of the live iroh connection, for on-demand path snapshots
+    /// (`ezvpn_conn_path`) after [`Self::run`] has consumed the session.
+    pub fn connection(&self) -> Connection {
+        self.connection.clone()
+    }
+
     /// The network parameters for the extension's tunnel settings, for whichever
     /// families the server assigned (IPv4, IPv6, or both).
     pub fn network_config(&self) -> VpnResult<IosNetworkConfig> {
