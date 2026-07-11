@@ -400,7 +400,8 @@ the gateway is the only in-VPN destination a client can reach (inter-client
 traffic is dropped server-side anyway).
 Add extra non-VPN destinations with repeatable `--route` and `--route6`; those
 routes are forwarded by the server host according to its routing,
-forwarding/NAT, and firewall configuration.
+forwarding/NAT, and firewall configuration (see
+[Server NAT and Firewall](#server-nat-and-firewall)).
 
 Split tunnel example:
 
@@ -537,6 +538,44 @@ entirely.
 > bypass is stable for the session; use the VPN IP for in-tunnel access. (Pinning
 > the server's *direct* address requires a server built with this feature; older
 > servers still bypass relays only.)
+
+## Server NAT and Firewall
+
+Per the single-responsibility principle, `ezvpn` never touches the server
+host's firewall or NAT. To let clients reach hosts beyond the server itself,
+configure the host once with your normal OS tooling:
+
+1. Enable IP forwarding (e.g. `net.ipv4.ip_forward=1` /
+   `net.ipv6.conf.all.forwarding=1` via `sysctl`).
+2. NAT the VPN prefix out the egress interface, unless the surrounding network
+   already routes the VPN prefix back to the server host:
+
+   ```bash
+   # iptables example, masquerading the server config's `network` prefix
+   iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+   ```
+
+Because the rules key on the VPN prefix (the server config's `network` /
+`network6`), they are inert while the tunnel is down — so they can simply be
+**permanent** (`sysctl.conf`, persistent nftables/iptables config, or your
+distro's firewall service). There is no need for up/down lifecycle hooks that
+add and remove rules with the interface, as in WireGuard's typical `wg-quick`
+`PostUp`/`PostDown` pattern.
+
+Two things you do **not** need firewall rules for:
+
+- **Blocking client-to-client traffic.** The server unconditionally drops
+  inter-client packets in userspace before they reach the TUN device, so even
+  if a client widens its routed CIDR to cover the whole VPN subnet (instead of
+  the default gateway-only `/32`/`/128`), packets to other clients' VPN IPs
+  never leave the tunnel process. See "Client Isolation" in
+  [docs/Architecture.md](docs/Architecture.md).
+- **Allowing inbound connections.** The server dials out through iroh; no
+  inbound port needs to be opened or allowed.
+
+DNS is likewise managed outside the tunnel: to resolve an internal zone
+through a resolver reachable over the VPN, set OS-level conditional forwarding
+on each client — see [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
 
 ## Protocol, MTU, and GSO
 
