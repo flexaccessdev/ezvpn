@@ -76,6 +76,18 @@ pub enum VpnError {
     /// Server's VPN network configuration changed across a reconnect.
     #[error("Server VPN configuration changed: {0}")]
     ServerConfigChanged(String),
+
+    /// A configured split-tunnel route overlaps a network this host is on.
+    /// Routing the local subnet into the tunnel would cut off on-link hosts,
+    /// including the gateway carrying the tunnel's own underlay, so the
+    /// client refuses to start (message format matches the iOS check in
+    /// ezvpn-ios TunnelCore/LocalNetworks.swift).
+    #[error("refusing to start: split-tunnel route {route} overlaps current network {local} on {interface}")]
+    RouteOverlapsLocalNetwork {
+        route: ipnet::IpNet,
+        local: ipnet::IpNet,
+        interface: String,
+    },
 }
 
 impl VpnError {
@@ -122,6 +134,9 @@ impl VpnError {
     ///   the established session; reconfiguring would mean inconsistent routing/
     ///   TUN state, so we quit instead. (A change to just the assigned client
     ///   IP is not fatal — it rebuilds in place; see `check_config_consistency`.)
+    /// - `RouteOverlapsLocalNetwork` - a configured split-tunnel route
+    ///   overlaps the network the host is currently on; won't change without
+    ///   user action or a network change (the user reconnects deliberately)
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
@@ -132,3 +147,23 @@ impl VpnError {
 
 /// Result type alias for VPN operations.
 pub type VpnResult<T> = Result<T, VpnError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_route_overlap_error_message_and_policy() {
+        let err = VpnError::RouteOverlapsLocalNetwork {
+            route: "192.168.0.0/16".parse().unwrap(),
+            local: "192.168.1.0/24".parse().unwrap(),
+            interface: "en0".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "refusing to start: split-tunnel route 192.168.0.0/16 \
+             overlaps current network 192.168.1.0/24 on en0"
+        );
+        assert!(!err.is_recoverable());
+    }
+}

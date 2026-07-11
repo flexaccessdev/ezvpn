@@ -411,10 +411,15 @@ the host route is pinned with `New-NetRoute`.
 
 The bypass routes are installed for the addresses iroh **may use to carry the
 tunnel** — the server's *candidate* underlay addresses (every address iroh
-enumerates, across IPv4 *and* IPv6 and including **private** ones — a peer that
-connects from the same private network uses the private address for transport),
-plus any relay the connection can fall back to — and **only for those that fall
-inside one of your routed CIDRs**. A common example is the server's AWS public
+enumerates, across IPv4 *and* IPv6), plus any relay the connection can fall
+back to — and **only for the global-scope ones that fall inside one of your
+routed CIDRs**. Private-scope candidates (RFC1918/ULA/link-local — the
+server's LAN addresses) are never bypassed, matching iOS: the overlap refusal
+above means such an address is unreachable off-tunnel in any session that
+starts (and in full tunnel the connected LAN route already keeps the local
+subnet off the tunnel), so bypassing it would only blackhole a real tunnel
+destination sharing the server's LAN IP — e.g. a DNS server on the VPN host,
+which stays reachable *through* the tunnel instead. A common example is the server's AWS public
 IPv6 when you route a `2600:1f13:adc::/…` prefix that contains it. `ezvpn` pins a
 `/32`/`/128` bypass host route for each such address so the QUIC tunnel's own
 underlay packets are not fed back into the tunnel (which would deadlock the
@@ -450,15 +455,20 @@ common ways a split-tunnel route overlaps a server address:
 
 - **The client is inside the same private network as the server.** If you route
   a private prefix (e.g. `172.31.0.0/16`) and connect from within that network,
-  the server's private LAN address falls inside the routed prefix — and that is
-  exactly the address iroh uses for transport, so it gets the host bypass. Every
-  other host in the prefix still routes through the VPN. (**iOS differs here**:
-  the app refuses to start when a routed prefix overlaps the local network, so a
-  private-scope server address is never reachable off-tunnel in a session that
-  starts — the iOS client therefore never bypasses private-scope addresses, and
-  a service sharing the server's LAN IP, e.g. a DNS server on the VPN host,
-  stays reachable *through* the tunnel. Only global-scope addresses get the
-  carve-out on iOS; see `docs/IOS-POC.md`.)
+  the client **refuses to start** — like iOS, a specific routed prefix that
+  overlaps a network the host is on is rejected at connect (`refusing to
+  start: split-tunnel route … overlaps current network … on …`), because
+  routing the local subnet into the tunnel would cut off on-link hosts,
+  including the gateway carrying the tunnel's own underlay. The same check
+  runs mid-session: if a conflicting network appears while connected (e.g.
+  arriving home with the VPN to the home network still up), the client stops
+  itself with the same message instead of hairpinning local traffic through
+  the tunnel. Unlike iOS, full
+  tunnel (default routes and their `/1` halves) is exempt from the refusal on
+  desktop; there the connected LAN route is more specific than the `/1`
+  halves, so the server's private LAN address stays reachable off-tunnel with
+  no pinned route — private-scope addresses are never bypassed on either
+  platform (see `docs/IOS-POC.md`).
 - **A routed IPv6 prefix contains the server's public IPv6.** Cloud servers
   typically sit inside the same broad IPv6 CIDR as the resources you route (e.g.
   an AWS VPC prefix), so routing that CIDR captures the server's own public

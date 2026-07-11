@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.18"
+version = "0.0.19"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -50,6 +50,12 @@ daemonix = "0.1"
 # instead of assuming C:\ when the env var is missing.
 [target.'cfg(windows)'.dependencies]
 known-folders = "1"
+
+# Desktop-only: on-link subnet enumeration for the connect-time split-tunnel
+# overlap refusal (src/net/local_networks.rs). iOS has its own Swift port of
+# this check in ezvpn-ios TunnelCore.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+if-addrs = "0.15"
 
 [dev-dependencies]
 mock_instant = "0.5"

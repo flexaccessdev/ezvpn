@@ -25,6 +25,8 @@ use crate::net::device::{
 };
 #[cfg(not(target_os = "ios"))]
 use crate::control::{ClientConnectedInfo, ClientStatusHandle};
+#[cfg(not(target_os = "ios"))]
+use crate::net::local_networks::{has_refusable_routes, local_networks, overlap_error};
 use crate::error::{VpnError, VpnResult};
 #[cfg(not(target_os = "ios"))]
 use crate::runtime::{LockRole, VpnLock};
@@ -373,6 +375,29 @@ impl VpnClient {
         // device or routes so nothing is set up on the fatal path.
         self.check_config_consistency(&server_info)?;
 
+        // Refuse to start when a configured split-tunnel route overlaps a
+        // network this host is currently on (iOS parity; see
+        // docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md §1). Runs before
+        // any TUN/route setup so every reconnect attempt is guarded with
+        // nothing to unwind, and after the handshake so only families the
+        // server actually assigned are checked — a route for an unassigned
+        // family is never installed (see `will_add_routes` below). Default
+        // routes and their /1 halves are exempt: full tunnel is supported
+        // on desktop.
+        let overlap_routes4: &[Ipv4Net] = if server_info.assigned_ip.is_some() {
+            &self.config.routes
+        } else {
+            &[]
+        };
+        let overlap_routes6: &[Ipv6Net] = if server_info.assigned_ip6.is_some() {
+            &self.config.routes6
+        } else {
+            &[]
+        };
+        if let Some(err) = overlap_error(overlap_routes4, overlap_routes6, &local_networks()) {
+            return Err(err);
+        }
+
         // Create TUN device
         let tun_device = self.create_tun_device(&server_info)?;
 
@@ -528,6 +553,31 @@ impl VpnClient {
             );
         }
 
+        // Watch for the on-link networks changing underneath the running
+        // session — the come-home case: the routed subnet appears on-link and
+        // LAN traffic starts hairpinning through the tunnel, while the QUIC
+        // session may survive the network switch, so the reconnect loop's
+        // connect-time check would never re-run (§2 of
+        // docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md). On conflict the
+        // watcher records the typed refusal error and closes the connection;
+        // `run_tunnel` unwinds through its normal cleanup path and the error
+        // is surfaced below. Skipped when every configured route is
+        // full-tunnel-exempt: nothing could ever conflict. The guard aborts
+        // the watcher when `connect()` returns.
+        let overlap_detected: Arc<Mutex<Option<VpnError>>> = Arc::new(Mutex::new(None));
+        let _overlap_watch: Option<AbortOnDropTask> =
+            if has_refusable_routes(overlap_routes4, overlap_routes6) {
+                Some(spawn_local_network_overlap_watch(
+                    overlap_routes4.to_vec(),
+                    overlap_routes6.to_vec(),
+                    tun_device.name().to_string(),
+                    connection.clone(),
+                    overlap_detected.clone(),
+                ))
+            } else {
+                None
+            };
+
         // Run the VPN packet loop (tunneled over the reliable data stream).
         // Hand the still-armed guard to `run_tunnel`, which disarms it only
         // after its own setup can no longer return early (past
@@ -548,6 +598,18 @@ impl VpnClient {
         // Session ended; reflect disconnection (reconnect, if enabled, will
         // publish a fresh connected status).
         self.status.set_disconnected();
+
+        // A mid-session overlap ended the session by closing the connection;
+        // surface the watcher's typed refusal (non-recoverable, so the
+        // reconnect loop exits) instead of the generic `ConnectionLost` that
+        // close produced.
+        if let Some(err) = overlap_detected
+            .lock()
+            .expect("overlap slot poisoned")
+            .take()
+        {
+            return Err(err);
+        }
         result
     }
 
@@ -1286,7 +1348,7 @@ impl VpnClient {
     /// Only recoverable errors (see [`VpnError::is_recoverable`]) trigger retries:
     /// - `ConnectionLost`, `Network`, `Signaling` → retry with backoff
     /// - `AuthenticationFailed`, `Config`, `TunDevice`, `ServerConfigChanged`,
-    ///   etc. → exit immediately
+    ///   `RouteOverlapsLocalNetwork`, etc. → exit immediately
     ///
     /// This prevents infinite retry loops on permanent failures like invalid tokens.
     pub async fn run_with_reconnect(
@@ -1426,6 +1488,19 @@ impl BypassRouteManager {
     /// covered by a VPN route. So a bypass pins *only that one transport
     /// endpoint*, never other hosts in the routed prefix; the rest still tunnels.
     ///
+    /// Private-scope addresses (RFC1918/ULA/link-local — the server's LAN
+    /// addresses) are never bypassed, even when a routed prefix covers them
+    /// (same filter as the iOS `overlapping_underlay_excludes`). The
+    /// connect-time overlap refusal guarantees a session only starts when no
+    /// specific routed prefix overlaps the local network, so such an address
+    /// is unreachable off-tunnel anyway — and in full tunnel the connected
+    /// LAN route is more specific than the installed `/1` halves, so the
+    /// local network needs no pinned route either. Bypassing one would only
+    /// blackhole a real tunnel destination that shares the server's LAN
+    /// address (e.g. a DNS server on the VPN host). Residual self-capture
+    /// (iroh probing such an address into the tunnel) dies in the data path:
+    /// `run_tunnel` drops TUN packets carrying a local iroh UDP port.
+    ///
     /// User-visible caveat: the pinned address is reachable only over the
     /// underlay, not through the VPN, so a resource on that same host must be
     /// addressed by its VPN-internal IP. Documented in `docs/ARCHITECTURE.md`
@@ -1439,6 +1514,13 @@ impl BypassRouteManager {
         let required_ips: HashSet<IpAddr> = required_ips
             .into_iter()
             .filter(|ip| {
+                if private_scope(ip) {
+                    log::debug!(
+                        "Skipping bypass route for {} (private scope; kept in tunnel)",
+                        ip
+                    );
+                    return false;
+                }
                 let needed = self.ip_covered_by_vpn_routes(*ip);
                 if !needed {
                     log::debug!(
@@ -1566,6 +1648,62 @@ impl Drop for AbortOnDropTask {
             handle.abort();
         }
     }
+}
+
+/// Poll interval for the mid-session on-link network watch. One `getifaddrs`
+/// sweep per poll — cheap at this cadence — and it bounds how long a newly
+/// conflicting subnet (arriving home with the VPN still up) goes unnoticed.
+/// Polling is deliberate: the event-driven watcher crates are event-driven
+/// only on the deprioritized platforms and would poll on macOS anyway (see
+/// docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md §2).
+#[cfg(not(target_os = "ios"))]
+const LOCAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawn the mid-session overlap watcher (§2): poll the on-link networks and,
+/// when the set changes, re-run the split-tunnel conflict check against the
+/// same family-gated routes the connect-time check used. On conflict the
+/// session cannot safely continue, so the watcher records the typed refusal
+/// in `detected` for `connect()` to surface and closes the QUIC connection —
+/// which unwinds `run_tunnel` through its normal cleanup path (racing
+/// `run_tunnel` with a `select!` instead would leak its spawned tasks, which
+/// are aborted only on its normal exit).
+///
+/// The returned guard aborts the watcher on drop; `connect()` holds it across
+/// `run_tunnel` so the watcher never outlives the session.
+#[cfg(not(target_os = "ios"))]
+fn spawn_local_network_overlap_watch(
+    routes4: Vec<Ipv4Net>,
+    routes6: Vec<Ipv6Net>,
+    tun_name: String,
+    connection: Connection,
+    detected: Arc<Mutex<Option<VpnError>>>,
+) -> AbortOnDropTask {
+    AbortOnDropTask::new(tokio::spawn(async move {
+        // The enumerator already excludes the client's own tun by the
+        // point-to-point flag (macOS/Linux); filtering by device name as well
+        // covers platforms where the flag mapping is less certain (wintun).
+        let sweep = move || {
+            let mut locals = local_networks();
+            locals.retain(|l| l.interface != tun_name);
+            locals
+        };
+        let mut last = sweep();
+        loop {
+            tokio::time::sleep(LOCAL_NETWORK_POLL_INTERVAL).await;
+            let locals = sweep();
+            if locals == last {
+                continue;
+            }
+            log::debug!("On-link networks changed: {:?}", locals);
+            last = locals;
+            if let Some(err) = overlap_error(&routes4, &routes6, &last) {
+                log::error!("Local network conflict appeared mid-session: {}", err);
+                *detected.lock().expect("overlap slot poisoned") = Some(err);
+                connection.close(0u32.into(), b"split-tunnel route overlaps local network");
+                return;
+            }
+        }
+    }))
 }
 
 /// Run the bypass route manager task.
@@ -1735,7 +1873,6 @@ pub(crate) fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> 
 /// network: RFC1918 / link-local IPv4, ULA / link-local IPv6. Global (GUA /
 /// public) addresses are NOT private scope — including e.g. an AWS egress-only
 /// GUA IPv6, which the transport genuinely uses and must stay on the underlay.
-#[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
 fn private_scope(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(a) => a.is_private() || a.is_link_local(),
@@ -1753,7 +1890,7 @@ fn private_scope(ip: &IpAddr) -> bool {
 ///
 /// Private-scope addresses (RFC1918/ULA/link-local — the server's LAN
 /// addresses) are deliberately NEVER excluded, even when a routed prefix covers
-/// them: the iOS app refuses to start when a routed prefix overlaps the local
+/// them: both clients refuse to start when a routed prefix overlaps the local
 /// network, so in any session that starts at all such an address is unreachable
 /// off-tunnel — excluding it would only blackhole a real tunnel destination
 /// that shares the server's LAN address (e.g. a DNS server on the VPN host).
@@ -1765,8 +1902,9 @@ fn private_scope(ip: &IpAddr) -> bool {
 /// Returns `(IPv4 /32 strings, IPv6 /128 strings)`. Uses the same
 /// `ipnet::contains` membership test as the desktop `BypassRouteManager`.
 ///
-/// Only the iOS connect path consumes this (desktop uses `BypassRouteManager`),
-/// so it is dead code on non-iOS builds outside the unit tests.
+/// Only the iOS connect path consumes this (desktop applies the same
+/// `private_scope` filter inside `BypassRouteManager::update`), so it is dead
+/// code on non-iOS builds outside the unit tests.
 #[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
 pub(crate) fn overlapping_underlay_excludes(
     server_addrs: &[IpAddr],
@@ -1978,6 +2116,32 @@ mod tests {
         mgr.update(HashSet::from([pinned])).await;
         assert_eq!(mgr.active_routes.len(), 1);
         assert!(mgr.active_routes.contains_key(&pinned));
+    }
+
+    /// Private-scope addresses (the server's LAN addresses) are never
+    /// bypassed, even when a routed prefix covers them — the desktop adoption
+    /// of the iOS `overlapping_underlay_excludes` filter, sound now that the
+    /// connect-time overlap refusal exists. The filter runs before
+    /// `add_bypass_route`, so covered private addresses trigger no real OS
+    /// route operations and are not even recorded as intended bypasses.
+    #[tokio::test]
+    async fn test_update_never_bypasses_private_scope_addresses() {
+        let mut mgr = bypass_manager(&["172.31.0.0/16", "0.0.0.0/1"], &["fd12::/16", "::/1"]);
+
+        mgr.update(HashSet::from([
+            "172.31.5.6".parse().unwrap(),  // RFC1918, inside routed prefix
+            "10.22.33.10".parse().unwrap(), // RFC1918, inside the /1 half-route
+            "169.254.7.8".parse().unwrap(), // IPv4 link-local
+            "fd12::5".parse().unwrap(),     // ULA, inside routed prefix
+            "fe80::1".parse().unwrap(),     // IPv6 link-local
+        ]))
+        .await;
+
+        assert!(mgr.active_routes.is_empty(), "private-scope address bypassed");
+        assert!(
+            mgr.collected.lock().unwrap().is_empty(),
+            "private-scope address recorded as intended bypass"
+        );
     }
 
     #[test]
