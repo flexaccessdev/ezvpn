@@ -1,10 +1,10 @@
 # Plan: desktop overlap refusal + network-change handling (iOS parity)
 
-Status: **§1 and §3 implemented (2026-07-10)** — `src/net/local_networks.rs`,
-`VpnError::RouteOverlapsLocalNetwork`, check in `connect()`; `private_scope`
-filter in `BypassRouteManager::update`. §2 pending (§3 did not need it: the
-connect-time refusal covers the startup invariant, and a mid-session network
-change breaks the tunnel, so the reconnect attempt re-runs the §1 check).
+Status: **§1, §2, and §3 implemented (2026-07-10)** —
+`src/net/local_networks.rs`, `VpnError::RouteOverlapsLocalNetwork`, check in
+`connect()`; `spawn_local_network_overlap_watch` poller (overlap-driven
+self-stop; the always-on park-and-resume future phase is NOT implemented);
+`private_scope` filter in `BypassRouteManager::update`.
 Written 2026-07-10, grounded against the code as of the `improvebypass` branch
 (post `ezvpn_conn_path`, post private-scope iOS bypass fix).
 

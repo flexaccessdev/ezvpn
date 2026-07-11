@@ -294,6 +294,19 @@ deliberately (iOS parity — the same check lives in ezvpn-ios
 relies on connected-route specificity plus the bypass set below; only a
 *specific* routed prefix overlapping an on-link subnet is refused.
 
+**Mid-session watch (the come-home case).** The connect-time check cannot
+catch a conflicting subnet that appears *under* a running session — arrive
+home with the VPN still up and the QUIC session may survive the network
+switch, silently hairpinning home-LAN traffic through the tunnel. So while
+any non-exempt route is configured, `connect()` also runs a watcher
+(`spawn_local_network_overlap_watch`) that polls the on-link networks every
+5 s (one `getifaddrs` sweep; polling by design — the event-driven watcher
+crates poll on macOS anyway, the prioritized platform) and re-runs the same
+conflict check when the set changes. On conflict it records the same
+non-recoverable error and closes the QUIC connection, so the data loop
+unwinds through its normal cleanup, the routes and TUN are torn down, and the
+client exits with the refusal message instead of redialing.
+
 ### Underlay Bypass Routes
 
 iroh's QUIC transport may reach the server (or a relay) over a public address

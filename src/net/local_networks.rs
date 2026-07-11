@@ -7,8 +7,17 @@
 //! so `VpnClient::connect` refuses to start on a conflict (see
 //! `docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md` §1).
 
+use crate::error::VpnError;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::net::IpAddr;
+
+/// Prefixes at or below this length are the full-tunnel mechanism — default
+/// routes and the `/1` half-routes `expand_default_route*` installs — and are
+/// exempt from the overlap check. Full tunnel is a supported desktop mode
+/// that relies on connected-route specificity plus the global-scope bypass
+/// set; only a *specific* routed prefix overlapping an on-link subnet is
+/// refused (deliberate divergence from iOS, which refuses default routes).
+const EXEMPT_MAX_PREFIX_LEN: u8 = 1;
 
 /// One network the host is attached to: the on-link subnet of an up,
 /// running, non-loopback interface. Point-to-point links carry no on-link
@@ -69,11 +78,7 @@ pub fn local_networks() -> Vec<LocalNetwork> {
 
 /// The first configured split-tunnel route that overlaps a network the host
 /// is currently on. Routes are checked in order, IPv4 then IPv6 (iOS
-/// parity). Default routes and the /1 half-routes they expand to are exempt
-/// (`prefix_len() <= 1`): full tunnel is a supported desktop mode that
-/// relies on connected-route specificity plus the bypass set, so only a
-/// *specific* routed prefix overlapping an on-link subnet is refused — the
-/// deliberate divergence from iOS, which refuses default routes too.
+/// parity); full-tunnel prefixes are exempt (see [`EXEMPT_MAX_PREFIX_LEN`]).
 pub fn split_tunnel_conflict(
     routes: &[Ipv4Net],
     routes6: &[Ipv6Net],
@@ -82,7 +87,7 @@ pub fn split_tunnel_conflict(
     let routes4 = routes.iter().copied().map(IpNet::V4);
     let routes6 = routes6.iter().copied().map(IpNet::V6);
     for route in routes4.chain(routes6) {
-        if route.prefix_len() <= 1 {
+        if route.prefix_len() <= EXEMPT_MAX_PREFIX_LEN {
             continue;
         }
         if let Some(local) = locals.iter().find(|l| overlaps(&route, &l.net)) {
@@ -90,6 +95,31 @@ pub fn split_tunnel_conflict(
         }
     }
     None
+}
+
+/// [`split_tunnel_conflict`] mapped to the typed refusal error. Shared by the
+/// connect-time check and the mid-session watcher so both surface the exact
+/// same error for a given conflict.
+pub fn overlap_error(
+    routes: &[Ipv4Net],
+    routes6: &[Ipv6Net],
+    locals: &[LocalNetwork],
+) -> Option<VpnError> {
+    split_tunnel_conflict(routes, routes6, locals).map(|(route, local)| {
+        VpnError::RouteOverlapsLocalNetwork {
+            route,
+            local: local.net,
+            interface: local.interface,
+        }
+    })
+}
+
+/// Whether any configured route is subject to the overlap check at all (i.e.
+/// not full-tunnel-exempt). When false the mid-session watcher has nothing
+/// that could ever conflict and need not run.
+pub fn has_refusable_routes(routes: &[Ipv4Net], routes6: &[Ipv6Net]) -> bool {
+    routes.iter().any(|r| r.prefix_len() > EXEMPT_MAX_PREFIX_LEN)
+        || routes6.iter().any(|r| r.prefix_len() > EXEMPT_MAX_PREFIX_LEN)
 }
 
 /// Two prefixes overlap iff one contains the other's network address.
@@ -197,6 +227,29 @@ mod tests {
             split_tunnel_conflict(&v4(&["10.0.0.0/8", "192.168.0.0/16"]), &[], &locals).unwrap();
         assert_eq!(route.to_string(), "10.0.0.0/8");
         assert_eq!(local.interface, "en1");
+    }
+
+    #[test]
+    fn test_overlap_error_maps_conflict_to_typed_error() {
+        let err = overlap_error(&v4(&["192.168.0.0/16"]), &[], &home()).unwrap();
+        assert_eq!(
+            err.to_string(),
+            "refusing to start: split-tunnel route 192.168.0.0/16 \
+             overlaps current network 192.168.1.0/24 on en0"
+        );
+        assert!(overlap_error(&v4(&["10.0.0.0/8"]), &[], &home()).is_none());
+    }
+
+    #[test]
+    fn test_has_refusable_routes() {
+        assert!(!has_refusable_routes(&[], &[]));
+        // Full-tunnel prefixes are exempt, so nothing is refusable.
+        assert!(!has_refusable_routes(
+            &v4(&["0.0.0.0/0", "0.0.0.0/1", "128.0.0.0/1"]),
+            &v6(&["::/0", "::/1", "8000::/1"])
+        ));
+        assert!(has_refusable_routes(&v4(&["10.0.0.0/8"]), &[]));
+        assert!(has_refusable_routes(&[], &v6(&["fd00::/8"])));
     }
 
     #[test]

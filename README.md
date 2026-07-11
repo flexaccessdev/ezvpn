@@ -459,7 +459,11 @@ common ways a split-tunnel route overlaps a server address:
   overlaps a network the host is on is rejected at connect (`refusing to
   start: split-tunnel route … overlaps current network … on …`), because
   routing the local subnet into the tunnel would cut off on-link hosts,
-  including the gateway carrying the tunnel's own underlay. Unlike iOS, full
+  including the gateway carrying the tunnel's own underlay. The same check
+  runs mid-session: if a conflicting network appears while connected (e.g.
+  arriving home with the VPN to the home network still up), the client stops
+  itself with the same message instead of hairpinning local traffic through
+  the tunnel. Unlike iOS, full
   tunnel (default routes and their `/1` halves) is exempt from the refusal on
   desktop; there the connected LAN route is more specific than the `/1`
   halves, so the server's private LAN address stays reachable off-tunnel with

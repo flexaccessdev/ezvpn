@@ -26,7 +26,7 @@ use crate::net::device::{
 #[cfg(not(target_os = "ios"))]
 use crate::control::{ClientConnectedInfo, ClientStatusHandle};
 #[cfg(not(target_os = "ios"))]
-use crate::net::local_networks::{local_networks, split_tunnel_conflict};
+use crate::net::local_networks::{has_refusable_routes, local_networks, overlap_error};
 use crate::error::{VpnError, VpnResult};
 #[cfg(not(target_os = "ios"))]
 use crate::runtime::{LockRole, VpnLock};
@@ -394,14 +394,8 @@ impl VpnClient {
         } else {
             &[]
         };
-        if let Some((route, local)) =
-            split_tunnel_conflict(overlap_routes4, overlap_routes6, &local_networks())
-        {
-            return Err(VpnError::RouteOverlapsLocalNetwork {
-                route,
-                local: local.net,
-                interface: local.interface,
-            });
+        if let Some(err) = overlap_error(overlap_routes4, overlap_routes6, &local_networks()) {
+            return Err(err);
         }
 
         // Create TUN device
@@ -559,6 +553,31 @@ impl VpnClient {
             );
         }
 
+        // Watch for the on-link networks changing underneath the running
+        // session — the come-home case: the routed subnet appears on-link and
+        // LAN traffic starts hairpinning through the tunnel, while the QUIC
+        // session may survive the network switch, so the reconnect loop's
+        // connect-time check would never re-run (§2 of
+        // docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md). On conflict the
+        // watcher records the typed refusal error and closes the connection;
+        // `run_tunnel` unwinds through its normal cleanup path and the error
+        // is surfaced below. Skipped when every configured route is
+        // full-tunnel-exempt: nothing could ever conflict. The guard aborts
+        // the watcher when `connect()` returns.
+        let overlap_detected: Arc<Mutex<Option<VpnError>>> = Arc::new(Mutex::new(None));
+        let _overlap_watch: Option<AbortOnDropTask> =
+            if has_refusable_routes(overlap_routes4, overlap_routes6) {
+                Some(spawn_local_network_overlap_watch(
+                    overlap_routes4.to_vec(),
+                    overlap_routes6.to_vec(),
+                    tun_device.name().to_string(),
+                    connection.clone(),
+                    overlap_detected.clone(),
+                ))
+            } else {
+                None
+            };
+
         // Run the VPN packet loop (tunneled over the reliable data stream).
         // Hand the still-armed guard to `run_tunnel`, which disarms it only
         // after its own setup can no longer return early (past
@@ -579,6 +598,18 @@ impl VpnClient {
         // Session ended; reflect disconnection (reconnect, if enabled, will
         // publish a fresh connected status).
         self.status.set_disconnected();
+
+        // A mid-session overlap ended the session by closing the connection;
+        // surface the watcher's typed refusal (non-recoverable, so the
+        // reconnect loop exits) instead of the generic `ConnectionLost` that
+        // close produced.
+        if let Some(err) = overlap_detected
+            .lock()
+            .expect("overlap slot poisoned")
+            .take()
+        {
+            return Err(err);
+        }
         result
     }
 
@@ -1617,6 +1648,62 @@ impl Drop for AbortOnDropTask {
             handle.abort();
         }
     }
+}
+
+/// Poll interval for the mid-session on-link network watch. One `getifaddrs`
+/// sweep per poll — cheap at this cadence — and it bounds how long a newly
+/// conflicting subnet (arriving home with the VPN still up) goes unnoticed.
+/// Polling is deliberate: the event-driven watcher crates are event-driven
+/// only on the deprioritized platforms and would poll on macOS anyway (see
+/// docs/DESKTOP-OVERLAP-AND-NETWORK-CHANGE-PLAN.md §2).
+#[cfg(not(target_os = "ios"))]
+const LOCAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawn the mid-session overlap watcher (§2): poll the on-link networks and,
+/// when the set changes, re-run the split-tunnel conflict check against the
+/// same family-gated routes the connect-time check used. On conflict the
+/// session cannot safely continue, so the watcher records the typed refusal
+/// in `detected` for `connect()` to surface and closes the QUIC connection —
+/// which unwinds `run_tunnel` through its normal cleanup path (racing
+/// `run_tunnel` with a `select!` instead would leak its spawned tasks, which
+/// are aborted only on its normal exit).
+///
+/// The returned guard aborts the watcher on drop; `connect()` holds it across
+/// `run_tunnel` so the watcher never outlives the session.
+#[cfg(not(target_os = "ios"))]
+fn spawn_local_network_overlap_watch(
+    routes4: Vec<Ipv4Net>,
+    routes6: Vec<Ipv6Net>,
+    tun_name: String,
+    connection: Connection,
+    detected: Arc<Mutex<Option<VpnError>>>,
+) -> AbortOnDropTask {
+    AbortOnDropTask::new(tokio::spawn(async move {
+        // The enumerator already excludes the client's own tun by the
+        // point-to-point flag (macOS/Linux); filtering by device name as well
+        // covers platforms where the flag mapping is less certain (wintun).
+        let sweep = move || {
+            let mut locals = local_networks();
+            locals.retain(|l| l.interface != tun_name);
+            locals
+        };
+        let mut last = sweep();
+        loop {
+            tokio::time::sleep(LOCAL_NETWORK_POLL_INTERVAL).await;
+            let locals = sweep();
+            if locals == last {
+                continue;
+            }
+            log::debug!("On-link networks changed: {:?}", locals);
+            last = locals;
+            if let Some(err) = overlap_error(&routes4, &routes6, &last) {
+                log::error!("Local network conflict appeared mid-session: {}", err);
+                *detected.lock().expect("overlap slot poisoned") = Some(err);
+                connection.close(0u32.into(), b"split-tunnel route overlaps local network");
+                return;
+            }
+        }
+    }))
 }
 
 /// Run the bypass route manager task.
