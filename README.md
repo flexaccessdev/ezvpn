@@ -573,9 +573,12 @@ Two things you do **not** need firewall rules for:
 - **Allowing inbound connections.** The server dials out through iroh; no
   inbound port needs to be opened or allowed.
 
-DNS is likewise managed outside the tunnel: to resolve an internal zone
-through a resolver reachable over the VPN, set OS-level conditional forwarding
-on each client — see [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
+On the client side, DNS is likewise managed outside the tunnel: to resolve an
+internal zone through a resolver reachable over the VPN, set OS-level
+conditional forwarding on each client — see
+[docs/Client-Split-DNS.md](docs/Client-Split-DNS.md). The exception is iOS,
+where the app applies DNS conditional forwarding in-tunnel itself (see
+[docs/iOS-App.md](docs/iOS-App.md)).
 
 ## Protocol, MTU, and GSO
 
