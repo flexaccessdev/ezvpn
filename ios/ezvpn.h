@@ -44,6 +44,11 @@ void ezvpn_init_logging(void);
  *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"]}
  *   routes/routes6 are the split-tunnel prefixes; they are used to compute which
  *   server underlay addresses overlap and must be excluded from the tunnel.
+ *   Only global-scope (public) addresses are ever excluded; the server's
+ *   private/LAN addresses stay tunneled (the app must refuse to start when a
+ *   routed prefix overlaps the local network, so they are unreachable
+ *   off-tunnel anyway, and excluding them would blackhole tunnel destinations
+ *   that share the server's LAN address, e.g. a DNS server on the VPN host).
  * out_buf/out_len : caller buffer. On success receives the network-config JSON
  *   (per-family fields are null when that family was not assigned):
  *   {"assigned_ip":"10.0.0.2","netmask":"255.255.255.255","gateway":"10.0.0.1",

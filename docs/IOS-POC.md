@@ -90,16 +90,27 @@ stall.
 The core computes the bypass set automatically at connect, mirroring the
 desktop bootstrap (`add_iroh_bypass_routes`): it resolves every relay the
 endpoint may use (the configured relay URLs, or the default relay map) and adds
-the server's handshake-advertised underlay candidate addresses (`server_addrs`,
-which include private/LAN/ULA addresses), then intersects that candidate set
-with the effective routed prefixes — the configured routes plus the assigned
-interface subnets, which the extension always routes. Each overlap is returned
-as a host route (`/32` / `/128`) and the extension applies them as
-`excludedRoutes`, so the OS keeps those packets on the underlay
-(Wi-Fi/cellular). This is the declarative iOS equivalent of the desktop
-`BypassRouteManager`. Only the static handshake-time set is used; dynamic
-mid-session address updates are not handled (re-applying
-`NEPacketTunnelNetworkSettings` mid-session is disruptive).
+the server's handshake-advertised underlay candidate addresses (`server_addrs`),
+then intersects that candidate set with the effective routed prefixes — the
+configured routes plus the assigned interface subnets, which the extension
+always routes. Each **global-scope** overlap (public IPv4, GUA IPv6 — e.g. an
+AWS egress-only address) is returned as a host route (`/32` / `/128`) and the
+extension applies them as `excludedRoutes`, so the OS keeps those packets on
+the underlay (Wi-Fi/cellular).
+
+Private-scope server addresses (RFC1918/ULA/link-local) are **never** bypassed:
+the app refuses to start when a routed prefix overlaps the local network, so in
+any session that starts they are unreachable off-tunnel — bypassing them would
+only blackhole real tunnel destinations that share the server's LAN address
+(e.g. a DNS server running on the VPN host). The residual self-capture risk is
+handled in the data path: the tunnel loop drops TUN packets carrying a local
+iroh UDP port, so a probe toward such an address dies before encapsulation and
+iroh never validates that path.
+
+This is the declarative iOS equivalent of the desktop `BypassRouteManager`.
+Only the static handshake-time set is used; dynamic mid-session address updates
+are not handled (re-applying `NEPacketTunnelNetworkSettings` mid-session is
+disruptive).
 
 **Caveat** (same as desktop — see the README "Routing" section and
 `docs/ARCHITECTURE.md`): a bypassed server underlay IP is reachable only over the
