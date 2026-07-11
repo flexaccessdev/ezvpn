@@ -398,6 +398,18 @@ The server's VPN address (`/32` / `/128`) is always routed by default: the
 server advertises only its own host prefix, never the full VPN subnet, since
 the gateway is the only in-VPN destination a client can reach (inter-client
 traffic is dropped server-side anyway).
+
+This always-installed gateway host route is exempt from the split-tunnel
+overlap refusal described below — the check guards only configured
+`--route`/`--route6` prefixes, on desktop and iOS alike. So in the very rare
+case where the server's VPN gateway IP falls inside the subnet the client is
+currently on (e.g. VPN `network = 10.0.0.0/24` while the client sits on a
+`10.0.0.0/24` LAN), the session still starts, and the more-specific
+`/32`/`/128` shadows that single LAN address for the duration of the session —
+the rest of the LAN is unaffected, but if that address is the LAN router
+doubling as the client's DNS server, local DNS goes into the tunnel with it.
+Avoid this by picking a server VPN `network` prefix unlikely to collide with
+the LANs your clients connect from.
 Add extra non-VPN destinations with repeatable `--route` and `--route6`; those
 routes are forwarded by the server host according to its routing,
 forwarding/NAT, and firewall configuration (see

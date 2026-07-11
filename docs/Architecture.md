@@ -313,6 +313,17 @@ deliberately (iOS parity — the same check lives in ezvpn-ios
 relies on connected-route specificity plus the bypass set below; only a
 *specific* routed prefix overlapping an on-link subnet is refused.
 
+**Gateway host-route exemption (both platforms):** the check covers only the
+*configured* split-tunnel routes. The server-advertised gateway host prefix
+(`/32`/`/128`), which is always routed, is not checked — on desktop it is
+installed after the check without being part of it, and on iOS the check runs
+before the handshake, so the gateway is not yet known. In the very rare case
+where the server's VPN gateway IP falls inside an on-link subnet, the session
+starts and the more-specific host route shadows that single local address for
+the duration of the session (the rest of the subnet is unaffected). The fix is
+server-side: choose a VPN `network` prefix unlikely to collide with the LANs
+clients connect from.
+
 **Mid-session watch (the come-home case).** The connect-time check cannot
 catch a conflicting subnet that appears *under* a running session — arrive
 home with the VPN still up and the QUIC session may survive the network
