@@ -63,8 +63,12 @@ Current state, for orientation:
 ## 2. Network-change handling
 
 - Watcher: the `if-watch` crate — async stream of interface-address `Up`/`Down`
-  events (netlink on Linux, PF_ROUTE/SystemConfiguration on macOS, address
-  change notifications on Windows).
+  events. Event-driven only on Linux (netlink), Windows, and Android; on
+  **macOS/iOS it has no native backend and falls back to polling every 10s**, so
+  detection there lags an address change by up to ~10 s. If immediate detection
+  matters on macOS/iOS, swap in a route/link monitor instead — a `PF_ROUTE`
+  socket, or `SCDynamicStore`/`NWPathMonitor` (the latter is what the iOS app
+  already uses for its `pathKey`).
 - Reduce events to a fingerprint like iOS `pathKey`: the set of
   (interface, subnet) for physical interfaces, **excluding the client's own
   tun** — that exclusion is what prevents a self-inflicted disconnect when the
