@@ -1270,7 +1270,7 @@ impl VpnClient {
     /// Connect to the VPN server with automatic reconnection on failure.
     ///
     /// This method wraps `connect()` with a reconnection loop that handles
-    /// transient failures using exponential backoff (1s → 2s → 4s → ... → 60s max).
+    /// transient failures using exponential backoff (1s → 2s → 4s → ... → 30s max).
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for connections
@@ -1731,15 +1731,39 @@ pub(crate) fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> 
     endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
 }
 
-/// Server underlay addresses in `server_addrs` that fall within a routed prefix,
-/// as host CIDRs. In a split tunnel these would self-capture (the tunnel would
+/// True for addresses that are only ever reachable on a directly attached
+/// network: RFC1918 / link-local IPv4, ULA / link-local IPv6. Global (GUA /
+/// public) addresses are NOT private scope — including e.g. an AWS egress-only
+/// GUA IPv6, which the transport genuinely uses and must stay on the underlay.
+#[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
+fn private_scope(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => a.is_private() || a.is_link_local(),
+        IpAddr::V6(a) => a.is_unique_local() || a.is_unicast_link_local(),
+    }
+}
+
+/// The *global-scope* underlay addresses in `server_addrs` that fall within a
+/// routed prefix, as host CIDRs. These would self-capture (the tunnel would
 /// route iroh's own transport packets to the server back into itself); on iOS
 /// they are applied as `excludedRoutes` so the OS keeps them on the underlay.
+/// With broad/full-tunnel routes the relay IPs and the server's public
+/// addresses (including an egress-only GUA IPv6) are the transport's own
+/// destinations, so the carve-out is what keeps the session alive.
+///
+/// Private-scope addresses (RFC1918/ULA/link-local — the server's LAN
+/// addresses) are deliberately NEVER excluded, even when a routed prefix covers
+/// them: the iOS app refuses to start when a routed prefix overlaps the local
+/// network, so in any session that starts at all such an address is unreachable
+/// off-tunnel — excluding it would only blackhole a real tunnel destination
+/// that shares the server's LAN address (e.g. a DNS server on the VPN host).
+/// The residual self-capture risk (iroh probing that address into the tunnel)
+/// is handled in the data path: `run_tunnel` drops TUN packets carrying a local
+/// iroh UDP port, so the probe dies before encapsulation and the path never
+/// validates.
 ///
 /// Returns `(IPv4 /32 strings, IPv6 /128 strings)`. Uses the same
-/// `ipnet::contains` membership test as the desktop `BypassRouteManager`. The
-/// relay set is deliberately ignored: full tunnel is out of scope on iOS, so a
-/// public relay address never overlaps the private routed prefixes.
+/// `ipnet::contains` membership test as the desktop `BypassRouteManager`.
 ///
 /// Only the iOS connect path consumes this (desktop uses `BypassRouteManager`),
 /// so it is dead code on non-iOS builds outside the unit tests.
@@ -1752,6 +1776,9 @@ pub(crate) fn overlapping_underlay_excludes(
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
     for ip in server_addrs {
+        if private_scope(ip) {
+            continue;
+        }
         match ip {
             IpAddr::V4(a) if routes4.iter().any(|n| n.contains(a)) => v4.push(format!("{a}/32")),
             IpAddr::V6(a) if routes6.iter().any(|n| n.contains(a)) => v6.push(format!("{a}/128")),
@@ -1820,22 +1847,44 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
 
     #[test]
-    fn overlapping_excludes_keeps_only_routed_underlay_addresses() {
+    fn overlapping_excludes_bypasses_public_but_never_private_underlay_addresses() {
         let server_addrs: Vec<IpAddr> = [
-            "192.168.1.5",        // private v4, inside routed prefix -> excluded
-            "44.230.20.120",      // public v4, outside routes      -> dropped
-            "fd12::5",            // ULA v6, inside routed prefix    -> excluded
-            "2606:4700::1",       // public v6, outside routes       -> dropped
+            "192.168.1.5",   // private v4, inside routed prefix -> kept in tunnel (DNS case)
+            "44.230.20.120", // public v4, inside routed prefix  -> bypassed
+            "8.8.8.8",       // public v4, outside routes        -> dropped
+            "fd12::5",       // ULA v6, inside routed prefix     -> kept in tunnel
+            "2606:4700::1",  // public (GUA) v6, inside routed prefix -> bypassed
         ]
         .iter()
         .map(|s| s.parse().unwrap())
         .collect();
-        let routes4: Vec<Ipv4Net> = vec!["192.168.0.0/16".parse().unwrap()];
-        let routes6: Vec<Ipv6Net> = vec!["fd12::/16".parse().unwrap()];
+        let routes4: Vec<Ipv4Net> =
+            vec!["192.168.0.0/16".parse().unwrap(), "44.230.20.0/24".parse().unwrap()];
+        let routes6: Vec<Ipv6Net> =
+            vec!["fd12::/16".parse().unwrap(), "2606:4700::/32".parse().unwrap()];
 
         let (v4, v6) = overlapping_underlay_excludes(&server_addrs, &routes4, &routes6);
-        assert_eq!(v4, vec!["192.168.1.5/32".to_string()]);
-        assert_eq!(v6, vec!["fd12::5/128".to_string()]);
+        assert_eq!(v4, vec!["44.230.20.120/32".to_string()]);
+        assert_eq!(v6, vec!["2606:4700::1/128".to_string()]);
+    }
+
+    #[test]
+    fn overlapping_excludes_full_tunnel_bypasses_only_global_addresses() {
+        // Default routes cover everything. The public v4 and the egress-only
+        // GUA v6 must be carved out (the transport uses them), but the server's
+        // LAN address stays tunneled or it would blackhole LAN destinations
+        // that share it (e.g. a DNS server on the VPN host).
+        let server_addrs: Vec<IpAddr> =
+            ["10.22.33.10", "44.230.20.120", "2600:1f14:abc::1", "fd12::5"]
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect();
+        let routes4: Vec<Ipv4Net> = vec!["0.0.0.0/0".parse().unwrap()];
+        let routes6: Vec<Ipv6Net> = vec!["::/0".parse().unwrap()];
+
+        let (v4, v6) = overlapping_underlay_excludes(&server_addrs, &routes4, &routes6);
+        assert_eq!(v4, vec!["44.230.20.120/32".to_string()]);
+        assert_eq!(v6, vec!["2600:1f14:abc::1/128".to_string()]);
     }
 
     #[test]

@@ -177,18 +177,14 @@ parse_args() {
         esac
     done
 
-    # If RELEASE_TAG not set via args, check environment variable or fetch latest
+    # If RELEASE_TAG was not set via args or environment, fetch latest
     if [ -z "$RELEASE_TAG" ]; then
-        if [ -n "${RELEASE_TAG_ENV:-}" ]; then
-            RELEASE_TAG="$RELEASE_TAG_ENV"
+        if [ "$PREFER_PRERELEASE" = true ]; then
+            print_info "Fetching latest prerelease tag from GitHub..."
+            RELEASE_TAG=$(get_latest_prerelease_tag)
         else
-            if [ "$PREFER_PRERELEASE" = true ]; then
-                print_info "Fetching latest prerelease tag from GitHub..."
-                RELEASE_TAG=$(get_latest_prerelease_tag)
-            else
-                print_info "Fetching latest release tag from GitHub..."
-                RELEASE_TAG=$(get_latest_release_tag)
-            fi
+            print_info "Fetching latest release tag from GitHub..."
+            RELEASE_TAG=$(get_latest_release_tag)
         fi
     fi
 }

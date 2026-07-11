@@ -56,12 +56,14 @@ network = "10.0.0.0/24"
 # "sequential" (default): Server gets the first IP (e.g., fd00::1), clients
 #                         get fd00::2, fd00::3, ... in connection order.
 #
-# "node-id":              Stateless deterministic addressing. Each client's
-#                         64-bit host suffix is derived (SHA-256) from its
-#                         iroh node id, so a client always gets the same
-#                         address across reconnects and server restarts —
-#                         no allocation state is kept. The server's address
-#                         is likewise derived from the server's node id.
+# "node-id":              Stateless deterministic addressing. Each 64-bit host
+#                         suffix is derived (SHA-256) from an iroh node id, so
+#                         the same client node id gets the same address across
+#                         reconnects and server restarts — no allocation state
+#                         is kept. Current clients use ephemeral node ids, so
+#                         this is stable only for clients that reuse the same
+#                         iroh identity. The server's address is likewise
+#                         derived from the server's node id.
 #                         Requires 'network6' of /64 or wider (prefix <= 64)
 #                         and cannot be combined with 'server_ip6' (the
 #                         server address is derived, not configured).

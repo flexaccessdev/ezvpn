@@ -44,8 +44,8 @@ only differs in who owns the tunnel device and the routing table:
 
 The macOS `utun` fast path (4-byte address-family-prefixed frames) is shared with
 iOS via the `target_vendor = "apple"` cfg, so the read/write hot path is
-identical. The handshake (`perform_handshake`) and datagram loop (`run_tunnel`)
-are used verbatim.
+identical. The handshake (`perform_handshake`) and data-stream loop
+(`run_tunnel`) are used verbatim.
 
 Key source in this repo:
 
@@ -66,9 +66,15 @@ shapes in [`ios/ezvpn.h`](../ios/ezvpn.h)):
    connect, handshake. Returns an opaque handle and writes the assigned network
    config (IPv4 and/or IPv6 addresses, gateway, MTU, and the computed
    `excluded_routes`/`excluded_routes6`) as JSON.
-2. `ezvpn_run(handle, utun_fd)` — start the datagram loop on the OS-provided
+2. `ezvpn_run(handle, utun_fd)` — start the data-stream loop on the OS-provided
    `utun` fd (obtained after the extension applies the network settings).
 3. `ezvpn_stop(handle)` — tear down and free the handle.
+
+Plus one optional debug readout: `ezvpn_conn_path(handle, out_buf, out_len)` —
+a point-in-time JSON snapshot of the live iroh path(s) (direct/relay, RTT,
+which is selected), mirroring `ezvpn client status`. The app surfaces it as the
+"Connection path" sheet; callable any time between connect and stop, empty
+while no path is established.
 
 ```
 EzvpnApp (SwiftUI)            PacketTunnel (NEPacketTunnelProvider)
@@ -76,30 +82,41 @@ EzvpnApp (SwiftUI)            PacketTunnel (NEPacketTunnelProvider)
   start/stop                       ezvpn_connect(json) ──▶ libezvpn
                                    setTunnelNetworkSettings   (iroh connect
                                    ezvpn_run(utun_fd) ─────▶   + handshake
-                                  stopTunnel: ezvpn_stop        + datagram loop)
+                                  stopTunnel: ezvpn_stop        + data-stream loop)
 ```
 
 ## Underlay bypass on iOS
 
 If a routed prefix covers an address iroh's own transport uses — the server's
-underlay address (e.g. the server is on a LAN at `192.168.1.5` and you route
-`192.168.0.0/16`) or, with broad routes, a relay IP — iOS would route iroh's
+public underlay address (e.g. its egress-only GUA IPv6 inside a routed cloud
+prefix) or, with broad/full-tunnel routes, a relay IP — iOS would route iroh's
 own QUIC packets into the tunnel and the connection would self-capture and
 stall.
 
 The core computes the bypass set automatically at connect, mirroring the
 desktop bootstrap (`add_iroh_bypass_routes`): it resolves every relay the
 endpoint may use (the configured relay URLs, or the default relay map) and adds
-the server's handshake-advertised underlay candidate addresses (`server_addrs`,
-which include private/LAN/ULA addresses), then intersects that candidate set
-with the effective routed prefixes — the configured routes plus the assigned
-interface subnets, which the extension always routes. Each overlap is returned
-as a host route (`/32` / `/128`) and the extension applies them as
-`excludedRoutes`, so the OS keeps those packets on the underlay
-(Wi-Fi/cellular). This is the declarative iOS equivalent of the desktop
-`BypassRouteManager`. Only the static handshake-time set is used; dynamic
-mid-session address updates are not handled (re-applying
-`NEPacketTunnelNetworkSettings` mid-session is disruptive).
+the server's handshake-advertised underlay candidate addresses (`server_addrs`),
+then intersects that candidate set with the effective routed prefixes — the
+configured routes plus the assigned interface subnets, which the extension
+always routes. Each **global-scope** overlap (public IPv4, GUA IPv6 — e.g. an
+AWS egress-only address) is returned as a host route (`/32` / `/128`) and the
+extension applies them as `excludedRoutes`, so the OS keeps those packets on
+the underlay (Wi-Fi/cellular).
+
+Private-scope server addresses (RFC1918/ULA/link-local) are **never** bypassed:
+the app refuses to start when a routed prefix overlaps the local network, so in
+any session that starts they are unreachable off-tunnel — bypassing them would
+only blackhole real tunnel destinations that share the server's LAN address
+(e.g. a DNS server running on the VPN host). The residual self-capture risk is
+handled in the data path: the tunnel loop drops TUN packets carrying a local
+iroh UDP port, so a probe toward such an address dies before encapsulation and
+iroh never validates that path.
+
+This is the declarative iOS equivalent of the desktop `BypassRouteManager`.
+Only the static handshake-time set is used; dynamic mid-session address updates
+are not handled (re-applying `NEPacketTunnelNetworkSettings` mid-session is
+disruptive).
 
 **Caveat** (same as desktop — see the README "Routing" section and
 `docs/ARCHITECTURE.md`): a bypassed server underlay IP is reachable only over the

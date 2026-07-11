@@ -9,13 +9,19 @@
 //! - does **not** install OS bypass routes itself. Instead [`IosSession::connect`]
 //!   computes the underlay-bypass set the desktop `BypassRouteManager` would pin
 //!   (every relay IP plus the server's handshake-advertised candidate underlay
-//!   addresses, filtered to those a routed prefix would capture — including the
-//!   server's advertised host prefix, which the extension always routes) and
-//!   [`IosSession::network_config`] returns them as host routes (`/32` / `/128`)
-//!   for the extension to apply as `excludedRoutes`. This is the static,
-//!   handshake-time equivalent of the desktop bootstrap bypass; the server's
-//!   periodic mid-session address publications are not applied (re-plumbing
-//!   `NEPacketTunnelNetworkSettings` mid-session is disruptive);
+//!   addresses, filtered to the **global-scope** ones a routed prefix would
+//!   capture — including the server's advertised host prefix, which the
+//!   extension always routes) and [`IosSession::network_config`] returns them as
+//!   host routes (`/32` / `/128`) for the extension to apply as
+//!   `excludedRoutes`. Private-scope server addresses (RFC1918/ULA/link-local)
+//!   are never bypassed: the app refuses to start when a routed prefix overlaps
+//!   the local network, so they are unreachable off-tunnel in any session that
+//!   starts, and bypassing them would blackhole tunnel destinations sharing the
+//!   server's LAN address (see
+//!   [`crate::tunnel::client::overlapping_underlay_excludes`]). This is the
+//!   static, handshake-time equivalent of the desktop bootstrap bypass; the
+//!   server's periodic mid-session address publications are not applied
+//!   (re-plumbing `NEPacketTunnelNetworkSettings` mid-session is disruptive);
 //! - does **not** take the single-instance lock or open a control socket.
 //!
 //! It reuses the portable data plane wholesale: the same handshake
@@ -155,11 +161,13 @@ impl IosSession {
 
         // Compute the underlay bypass set, mirroring the desktop bootstrap
         // (`add_iroh_bypass_routes`): every relay IP the endpoint may use plus
-        // the server's candidate underlay addresses, filtered to those a routed
-        // prefix would capture and would therefore self-capture the transport.
-        // The filter includes the server's advertised host prefixes, which the
-        // extension always routes even with no configured prefixes. Applied by
-        // the extension as `excludedRoutes` (see module docs).
+        // the server's candidate underlay addresses, filtered to the
+        // global-scope ones a routed prefix would capture and would therefore
+        // self-capture the transport (private-scope addresses are never
+        // bypassed — see `overlapping_underlay_excludes`). The filter includes
+        // the server's advertised host prefixes, which the extension always
+        // routes even with no configured prefixes. Applied by the extension as
+        // `excludedRoutes` (see module docs).
         let mut candidates: Vec<IpAddr> = collect_relay_ips(&endpoint, &cfg.relay_urls)
             .await
             .into_iter()
@@ -204,6 +212,12 @@ impl IosSession {
             excluded_routes,
             excluded_routes6,
         })
+    }
+
+    /// A clone of the live iroh connection, for on-demand path snapshots
+    /// (`ezvpn_conn_path`) after [`Self::run`] has consumed the session.
+    pub fn connection(&self) -> Connection {
+        self.connection.clone()
     }
 
     /// The network parameters for the extension's tunnel settings, for whichever

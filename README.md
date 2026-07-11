@@ -89,6 +89,9 @@ You only need the `ezvpn` binary in your `PATH`.
 curl -sSL https://andrewtheguy.github.io/ezvpn/install.sh | sudo bash
 ```
 
+Prebuilt installer assets currently support Linux `amd64`/`arm64` and Apple
+Silicon macOS (`arm64`). Other macOS architectures can build from source.
+
 ### Windows
 
 Run from an **elevated** (Administrator) PowerShell — the installer places the
@@ -449,7 +452,13 @@ common ways a split-tunnel route overlaps a server address:
   a private prefix (e.g. `172.31.0.0/16`) and connect from within that network,
   the server's private LAN address falls inside the routed prefix — and that is
   exactly the address iroh uses for transport, so it gets the host bypass. Every
-  other host in the prefix still routes through the VPN.
+  other host in the prefix still routes through the VPN. (**iOS differs here**:
+  the app refuses to start when a routed prefix overlaps the local network, so a
+  private-scope server address is never reachable off-tunnel in a session that
+  starts — the iOS client therefore never bypasses private-scope addresses, and
+  a service sharing the server's LAN IP, e.g. a DNS server on the VPN host,
+  stays reachable *through* the tunnel. Only global-scope addresses get the
+  carve-out on iOS; see `docs/IOS-POC.md`.)
 - **A routed IPv6 prefix contains the server's public IPv6.** Cloud servers
   typically sit inside the same broad IPv6 CIDR as the resources you route (e.g.
   an AWS VPC prefix), so routing that CIDR captures the server's own public
@@ -497,8 +506,10 @@ entirely.
 - The data path sends raw IP packets over a single reliable QUIC
   bidirectional stream (the handshake stream, kept open) protected by
   QUIC/TLS 1.3.
-- Each frame is `[len: u32 BE][type][offload_len][offload?][ip_packet]`. The
-  stream is a byte pipe, so an explicit length prefix delimits messages.
+- IP packet frames are `[len: u32 BE][type][offload_len][offload?][ip_packet]`.
+  The stream is a byte pipe, so an explicit length prefix delimits messages.
+  Server address publications use their own frame type (`0x01`) with a JSON
+  body.
 - The initial QUIC path MTU is 1200, the QUIC protocol minimum, so the first
   packets survive any path (cellular, tunnel-in-tunnel, PPPoE). QUIC path-MTU
   discovery probes upward to 1452 right after the handshake. The path MTU only
@@ -559,7 +570,7 @@ Liveness is detected by QUIC:
 - QUIC idle timeout is 30 seconds.
 - The client tears down and reconnects when the connection closes, peer liveness
   fails, or TUN/stream I/O fails.
-- Reconnect backoff starts at 1 second, doubles up to 60 seconds, and adds
+- Reconnect backoff starts at 1 second, doubles up to 30 seconds, and adds
   0-500 ms of jitter.
 
 On reconnect, the client compares the server's network parameters against the
