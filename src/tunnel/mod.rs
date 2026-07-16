@@ -11,8 +11,9 @@ pub mod stream;
 #[cfg(not(target_os = "ios"))]
 pub mod server;
 
-// The slim iOS connect path: drives an OS-provided utun fd, no routes/lock.
-#[cfg(target_os = "ios")]
+// The slim Apple Network Extension connect path: drives an OS-provided utun fd,
+// with routing and interface configuration owned by the iOS/macOS app extension.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod ios;
 
 #[cfg(not(target_os = "ios"))]

@@ -510,7 +510,7 @@ common ways a split-tunnel route overlaps a server address:
   desktop; there the connected LAN route is more specific than the `/1`
   halves, so the server's private LAN address stays reachable off-tunnel with
   no pinned route — private-scope addresses are never bypassed on either
-  platform (see `docs/iOS-App.md`).
+  platform (see `docs/Apple-App.md`).
 - **A routed IPv6 prefix contains the server's public IPv6.** Cloud servers
   typically sit inside the same broad IPv6 CIDR as the resources you route (e.g.
   an AWS VPC prefix), so routing that CIDR captures the server's own public
@@ -590,7 +590,7 @@ internal zone through a resolver reachable over the VPN, set OS-level
 conditional forwarding on each client — see
 [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md). The exception is iOS,
 where the app applies DNS conditional forwarding in-tunnel itself (see
-[docs/iOS-App.md](docs/iOS-App.md)).
+[docs/Apple-App.md](docs/Apple-App.md)).
 
 ## Protocol, MTU, and GSO
 
@@ -706,16 +706,16 @@ For unattended clients under systemd, launchd, or a Windows service, see
 That guide also covers the fixed runtime directory used by `status`, `list`,
 and Unix `stop` under service managers.
 
-## iOS App
+## Apple App
 
-`ezvpn` runs on iOS as a Network Extension (dual-stack split tunnel,
-real-device testing; no full tunnel, no App Store packaging). The
-Rust core builds into `libezvpn.xcframework` here (`./build-ios.sh`, released as
-`libezvpn-ios.xcframework.zip`); the Swift app lives in a separate repo,
+`ezvpn` runs on iOS and macOS as a Network Extension app extension (dual-stack
+split tunnel; no iOS Simulator support, full tunnel, or App Store packaging).
+The Rust core builds into `libezvpn.xcframework` here (`./build-apple.sh`,
+released as `libezvpn-apple.xcframework.zip`); the Swift app lives in a separate repo,
 [`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios), which consumes it via a
 Swift package binary target.
 
-See [`docs/iOS-App.md`](docs/iOS-App.md) for scope, how it reuses the core, the C
+See [`docs/Apple-App.md`](docs/Apple-App.md) for scope, how it reuses the core, the C
 interface, and build steps.
 
 ## Architecture

@@ -1,4 +1,4 @@
-//! C FFI surface for the iOS Network Extension (`aarch64-apple-ios`).
+//! C FFI surface for iOS and macOS Network Extension app extensions.
 //!
 //! The extension links `libezvpn.a` and drives the tunnel in three calls:
 //!
