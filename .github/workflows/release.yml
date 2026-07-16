@@ -151,9 +151,32 @@ jobs:
           name: release-windows-amd64
           path: target/release/ezvpn-windows-amd64.exe
 
+  build-windows-lib:
+    needs: setup
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ezvpn.dll + header
+        # Mirrors build-apple: build-windows.ps1 builds the C-ABI cdylib into
+        # ezvpn.dll (amd64) and stages it with the C header in dist/windows. That
+        # zip becomes the release asset the ezvpn-windows app downloads by default
+        # (pinned by URL + checksum), the Windows analog of the xcframework zip.
+        # wintun.dll is intentionally NOT bundled here — this is a CLI/binary repo;
+        # ezvpn-windows fetches wintun.dll from wintun.net itself.
+        shell: pwsh
+        run: ./build-windows.ps1 -Profile release -Target x86_64-pc-windows-msvc
+      - name: Package ezvpn.dll + header
+        shell: pwsh
+        run: Compress-Archive -Path dist/windows/ezvpn.dll, dist/windows/ezvpn.h -DestinationPath dist/windows/ezvpn-windows.dll.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-lib
+          path: dist/windows/ezvpn-windows.dll.zip
+
   publish-release:
-    needs: [setup, build-linux, build-macos, build-apple, build-windows]
-    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-apple.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    needs: [setup, build-linux, build-macos, build-apple, build-windows, build-windows-lib]
+    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-apple.result == 'success' && needs.build-windows-lib.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
