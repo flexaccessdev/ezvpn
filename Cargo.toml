@@ -4,7 +4,7 @@ version = "0.0.20"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
-repository = "https://github.com/andrewtheguy/ezvpn"
+repository = "https://github.com/flexaccessdev/ezvpn"
 
 [lib]
 name = "ezvpn"
