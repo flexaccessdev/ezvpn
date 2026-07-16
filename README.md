@@ -115,7 +115,7 @@ You only need the `ezvpn` binary in your `PATH`.
 ### Linux and macOS
 
 ```bash
-curl -sSL https://andrewtheguy.github.io/ezvpn/install.sh | sudo bash
+curl -sSL https://flexaccessdev.github.io/ezvpn/install.sh | sudo bash
 ```
 
 Prebuilt installer assets currently support Linux `amd64`/`arm64` and Apple
@@ -128,7 +128,7 @@ binary systemwide in `%ProgramData%\ezvpn` (the same location used for config an
 runtime files) and updates the machine `PATH`:
 
 ```powershell
-irm https://andrewtheguy.github.io/ezvpn/install.ps1 | iex
+irm https://flexaccessdev.github.io/ezvpn/install.ps1 | iex
 ```
 
 Windows also requires `wintun.dll` from the official WireGuard project:
@@ -149,21 +149,21 @@ missing or is not in a valid search path.
 Install a specific release tag:
 
 ```bash
-curl -sSL https://andrewtheguy.github.io/ezvpn/install.sh | sudo bash -s <RELEASE_TAG>
+curl -sSL https://flexaccessdev.github.io/ezvpn/install.sh | sudo bash -s <RELEASE_TAG>
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://andrewtheguy.github.io/ezvpn/install.ps1))) <RELEASE_TAG>
+& ([scriptblock]::Create((irm https://flexaccessdev.github.io/ezvpn/install.ps1))) <RELEASE_TAG>
 ```
 
 Install the latest prerelease:
 
 ```bash
-curl -sSL https://andrewtheguy.github.io/ezvpn/install.sh | sudo bash -s -- --prerelease
+curl -sSL https://flexaccessdev.github.io/ezvpn/install.sh | sudo bash -s -- --prerelease
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://andrewtheguy.github.io/ezvpn/install.ps1))) -PreRelease
+& ([scriptblock]::Create((irm https://flexaccessdev.github.io/ezvpn/install.ps1))) -PreRelease
 ```
 
 </details>
@@ -712,7 +712,7 @@ and Unix `stop` under service managers.
 split tunnel; no iOS Simulator support, full tunnel, or App Store packaging).
 The Rust core builds into `libezvpn.xcframework` here (`./build-apple.sh`,
 released as `libezvpn-apple.xcframework.zip`); the Swift app lives in a separate repo,
-[`ezvpn-apple`](https://github.com/andrewtheguy/ezvpn-apple), which consumes it via a
+[`ezvpn-apple`](https://github.com/flexaccessdev/ezvpn-apple), which consumes it via a
 Swift package binary target.
 
 See [`docs/Apple-App.md`](docs/Apple-App.md) for scope, how it reuses the core, the C

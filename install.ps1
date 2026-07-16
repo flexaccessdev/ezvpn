@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 
 # ezvpn installer for Windows
-# Downloads latest binary from: https://github.com/andrewtheguy/ezvpn/releases
+# Downloads latest binary from: https://github.com/flexaccessdev/ezvpn/releases
 #
 # Usage: .\install.ps1 [RELEASE_TAG] [-PreRelease] [-DownloadOnly]
 # Or set $env:RELEASE_TAG environment variable
@@ -25,7 +25,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$REPO_OWNER = "andrewtheguy"
+$REPO_OWNER = "flexaccessdev"
 $REPO_NAME = "ezvpn"
 
 # Function to print colored messages

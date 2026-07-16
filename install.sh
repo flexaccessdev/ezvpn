@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ezvpn installer for Linux and Mac
-# Downloads latest binary from: https://github.com/andrewtheguy/ezvpn/releases
+# Downloads latest binary from: https://github.com/flexaccessdev/ezvpn/releases
 # Installs to /usr/local/bin (requires root/sudo)
 #
 # Usage: sudo ./install.sh [RELEASE_TAG] [--prerelease]
@@ -9,7 +9,7 @@
 
 set -e
 
-REPO_OWNER="andrewtheguy"
+REPO_OWNER="flexaccessdev"
 REPO_NAME="ezvpn"
 DOWNLOAD_ONLY=false
 PREFER_PRERELEASE=false
