@@ -25,7 +25,7 @@ generally also works as `<RESOLVER_IP>` without such a rule.
 > **iOS** is not covered here — iOS has no per-domain DNS UI and its split-DNS is
 > applied inside the tunnel by the ezvpn iOS app (`NEDNSSettings.matchDomains`),
 > or via a DoT configuration profile off-VPN. See the
-> [ezvpn-ios](https://github.com/andrewtheguy/ezvpn-ios) README (Split DNS /
+> [ezvpn-apple](https://github.com/andrewtheguy/ezvpn-apple) README (Split DNS /
 > conditional forwarding).
 
 ## Windows 11

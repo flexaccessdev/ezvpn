@@ -305,7 +305,7 @@ point-to-point — which covers tun/utun — not-running interfaces, and IPv6
 link-local); the check runs after the handshake so only address families the
 server actually assigned are considered, and it guards every reconnect attempt.
 The error is non-recoverable: the reconnect loop exits and the user reconnects
-deliberately (iOS parity — the same check lives in ezvpn-ios
+deliberately (iOS parity — the same check lives in ezvpn-apple
 `TunnelCore/LocalNetworks.swift`).
 
 **Desktop carve-out:** default routes and the `/1` half-routes they expand to

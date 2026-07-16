@@ -4,10 +4,10 @@
 # (aarch64-apple-darwin), then bundle both slices into libezvpn.xcframework in
 # dist/apple, staged with the C header. This is the canonical local build output;
 # the CI release workflow zips it into libezvpn-apple.xcframework.zip. The sibling
-# Xcode project (../ezvpn-ios) links it via its own Swift package — by default a
+# Xcode project (../ezvpn-apple) links it via its own Swift package — by default a
 # pinned release download, or this dist/apple build (reached through a committed
 # symlink) when EZVPN_LOCAL_XCFRAMEWORK is set. This script only produces
-# dist/apple; it does not write into ../ezvpn-ios.
+# dist/apple; it does not write into ../ezvpn-apple.
 #
 # A Packet Tunnel Provider does not run in the iOS Simulator, so there is no
 # simulator slice. Native macOS uses the app-extension slice. An .xcframework
@@ -64,7 +64,7 @@ echo "Staged: $XCFRAMEWORK"
 echo "        $DIST/ezvpn.h"
 echo
 echo "For local Apple Network Extension FFI dev, build the app against this xcframework with:"
-echo "    cd ../ezvpn-ios"
+echo "    cd ../ezvpn-apple"
 echo "    EZVPN_LOCAL_XCFRAMEWORK=1 xcodegen generate"
 echo "    EZVPN_LOCAL_XCFRAMEWORK=1 xcodebuild -project Ezvpn.xcodeproj \\"
 echo "        -scheme EzvpnApp -destination 'generic/platform=iOS' build"

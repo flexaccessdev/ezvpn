@@ -14,7 +14,7 @@ The iOS app has two behaviors the desktop CLI client lacks:
 
 1. **Overlap refusal** — it refuses to start when a configured split-tunnel
    prefix overlaps the network the device is currently on
-   (`splitTunnelConflict` in ezvpn-ios `Packages/TunnelCore`). Routing the
+   (`splitTunnelConflict` in ezvpn-apple `Packages/TunnelCore`). Routing the
    local subnet into the tunnel would cut off on-link hosts, including the
    gateway carrying the tunnel's own underlay.
 2. **Disconnect on network change** — an `NWPathMonitor` fingerprint of the
@@ -44,7 +44,7 @@ Current state, for orientation:
 ## 1. Overlap refusal at connect
 
 - New `src/net/local_networks.rs`: enumerate on-link subnets — a Rust port of
-  ezvpn-ios `TunnelCore/LocalNetworks.swift`. Use the `if-addrs` crate
+  ezvpn-apple `TunnelCore/LocalNetworks.swift`. Use the `if-addrs` crate
   (Linux/macOS/Windows in one API; `getifaddrs` via `libc` is a Unix-only
   alternative). Same filters as the Swift code: skip loopback, point-to-point,
   the client's own tun (by name), IPv6 link-local.

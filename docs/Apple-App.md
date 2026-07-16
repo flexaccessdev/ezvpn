@@ -11,7 +11,7 @@ The Apple client is split across two repositories:
   (static-library slices for `aarch64-apple-ios` and `aarch64-apple-darwin`)
   plus a small C FFI. This is where the Apple Network Extension Rust code and
   build script live.
-- **[`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios)** — the Swift Xcode
+- **[`ezvpn-apple`](https://github.com/andrewtheguy/ezvpn-apple)** — the Swift Xcode
   project: a SwiftUI container app and the `NEPacketTunnelProvider` app
   extension that links `libezvpn.xcframework` (consumed via a Swift package
   binary target). Build/sign/run instructions live in that repo's README.
@@ -143,12 +143,12 @@ From this repo:
 
 This builds the `aarch64-apple-ios` and `aarch64-apple-darwin` slices and bundles them into
 `dist/apple/libezvpn.xcframework` alongside the header. The CI release workflow
-zips it into the `libezvpn-apple.xcframework.zip` release asset, which `ezvpn-ios`
+zips it into the `libezvpn-apple.xcframework.zip` release asset, which `ezvpn-apple`
 downloads by default (pinned by URL+checksum in its Swift package). For local
-FFI dev, `ezvpn-ios` links this `dist/apple` build directly via a committed symlink
+FFI dev, `ezvpn-apple` links this `dist/apple` build directly via a committed symlink
 when `EZVPN_LOCAL_XCFRAMEWORK` is set — see that repo's README.
 
-Then follow the [`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios) README
+Then follow the [`ezvpn-apple`](https://github.com/andrewtheguy/ezvpn-apple) README
 to generate the Xcode project, set your signing team, and run on a device or Mac. Note
 that the Network Extension (`packet-tunnel-provider`) capability requires a paid
 Apple Developer account.

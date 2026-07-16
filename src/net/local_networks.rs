@@ -1,5 +1,5 @@
 //! On-link local-network enumeration and the connect-time split-tunnel
-//! overlap check — the desktop port of ezvpn-ios
+//! overlap check — the desktop port of ezvpn-apple
 //! `TunnelCore/LocalNetworks.swift`.
 //!
 //! Routing a subnet the host is currently on into the tunnel would cut off

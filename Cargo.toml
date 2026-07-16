@@ -53,7 +53,7 @@ known-folders = "1"
 
 # Desktop-only: on-link subnet enumeration for the connect-time split-tunnel
 # overlap refusal (src/net/local_networks.rs). iOS has its own Swift port of
-# this check in ezvpn-ios TunnelCore.
+# this check in ezvpn-apple TunnelCore.
 [target.'cfg(not(target_os = "ios"))'.dependencies]
 if-addrs = "0.15"
 

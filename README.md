@@ -712,7 +712,7 @@ and Unix `stop` under service managers.
 split tunnel; no iOS Simulator support, full tunnel, or App Store packaging).
 The Rust core builds into `libezvpn.xcframework` here (`./build-apple.sh`,
 released as `libezvpn-apple.xcframework.zip`); the Swift app lives in a separate repo,
-[`ezvpn-ios`](https://github.com/andrewtheguy/ezvpn-ios), which consumes it via a
+[`ezvpn-apple`](https://github.com/andrewtheguy/ezvpn-apple), which consumes it via a
 Swift package binary target.
 
 See [`docs/Apple-App.md`](docs/Apple-App.md) for scope, how it reuses the core, the C

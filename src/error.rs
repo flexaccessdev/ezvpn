@@ -81,7 +81,7 @@ pub enum VpnError {
     /// Routing the local subnet into the tunnel would cut off on-link hosts,
     /// including the gateway carrying the tunnel's own underlay, so the
     /// client refuses to start (message format matches the iOS check in
-    /// ezvpn-ios TunnelCore/LocalNetworks.swift).
+    /// ezvpn-apple TunnelCore/LocalNetworks.swift).
     #[error("refusing to start: split-tunnel route {route} overlaps current network {local} on {interface}")]
     RouteOverlapsLocalNetwork {
         route: ipnet::IpNet,
