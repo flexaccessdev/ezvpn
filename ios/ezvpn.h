@@ -1,8 +1,8 @@
 /*
- * ezvpn.h — C interface to libezvpn for the iOS Network Extension.
+ * ezvpn.h — C interface to libezvpn for Apple Network Extension app extensions.
  *
- * Build the library with ./build-ios.sh (produces
- * dist/ios/libezvpn.xcframework, which embeds a copy of this header).
+ * Build the library with ./build-apple.sh (produces
+ * dist/apple/libezvpn.xcframework, which embeds a copy of this header).
  *
  * Lifecycle (call from your NEPacketTunnelProvider):
  *

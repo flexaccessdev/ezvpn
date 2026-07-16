@@ -195,16 +195,22 @@ impl TunOffloadStatus {
     }
 }
 
+#[cfg(target_vendor = "apple")]
+enum DarwinBacking {
+    #[cfg(target_os = "macos")]
+    Device(AsyncDevice),
+    Fd(OwnedFd),
+}
+
 /// A managed TUN device with async I/O.
 pub struct TunDevice {
     /// The underlying async TUN device (desktop: created by the `tun` crate).
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(target_vendor = "apple"))]
     device: AsyncDevice,
-    /// iOS: the OS-provided `utun` fd handed to us by the
-    /// `NEPacketTunnelProvider`. We own a `dup` of it; [`Self::split`] dups
-    /// again for the reader/writer halves.
-    #[cfg(target_os = "ios")]
-    fd: OwnedFd,
+    /// Darwin TUN backing: a `tun`-created device for the macOS CLI, or the
+    /// OS-provided `utun` fd handed to an iOS/macOS `NEPacketTunnelProvider`.
+    #[cfg(target_vendor = "apple")]
+    backing: DarwinBacking,
     /// Device name.
     name: String,
     /// Configured MTU.
@@ -280,7 +286,10 @@ impl TunDevice {
         }
 
         Ok(Self {
+            #[cfg(not(target_vendor = "apple"))]
             device,
+            #[cfg(target_os = "macos")]
+            backing: DarwinBacking::Device(device),
             name,
             mtu: config.mtu,
             vnet_hdr_enabled: cfg!(target_os = "linux"),
@@ -288,7 +297,7 @@ impl TunDevice {
         })
     }
 
-    /// Wrap an OS-provided `utun` file descriptor (iOS Network Extension).
+    /// Wrap an OS-provided `utun` file descriptor (Apple Network Extension).
     ///
     /// The `NEPacketTunnelProvider` creates the tunnel interface and configures
     /// its addresses/routes/MTU via `NEPacketTunnelNetworkSettings`; it then
@@ -296,18 +305,18 @@ impl TunDevice {
     /// `dup` of that fd and drives it with the shared Darwin fast path (4-byte
     /// address-family-prefixed frames — the same format macOS `utun` uses).
     ///
-    /// No offload: iOS has no kernel GSO, so the data path uses software GRO,
-    /// exactly like macOS.
-    #[cfg(target_os = "ios")]
+    /// No offload: iOS/macOS app-extension utun paths have no kernel GSO, so
+    /// the data path uses software GRO.
+    #[cfg(target_vendor = "apple")]
     pub fn from_raw_fd(fd: RawFd, mtu: u16) -> VpnResult<Self> {
         // Own a private dup so our lifetime is independent of the caller's fd.
         let owned = duplicate_fd(fd)?;
         Ok(Self {
-            fd: owned,
-            name: "utun-ios".to_string(),
+            backing: DarwinBacking::Fd(owned),
+            name: "utun".to_string(),
             mtu,
             vnet_hdr_enabled: false,
-            offload_status: TunOffloadStatus::disabled("iOS utun has no kernel offload"),
+            offload_status: TunOffloadStatus::disabled("Apple utun has no kernel offload"),
         })
     }
 
@@ -339,16 +348,17 @@ impl TunDevice {
         #[cfg(target_vendor = "apple")]
         {
             // Source the raw fd from whichever backing store this platform uses:
-            // the `tun`-crate device on macOS, the OS-provided fd on iOS.
-            #[cfg(not(target_os = "ios"))]
-            let raw_fd = self.device.as_raw_fd();
-            #[cfg(target_os = "ios")]
-            let raw_fd = self.fd.as_raw_fd();
+            // the `tun`-crate device for the macOS CLI, or the OS-provided fd
+            // in an iOS/macOS Network Extension.
+            let raw_fd = match &self.backing {
+                #[cfg(target_os = "macos")]
+                DarwinBacking::Device(device) => device.as_raw_fd(),
+                DarwinBacking::Fd(fd) => fd.as_raw_fd(),
+            };
 
             let DarwinTunHalves { reader, writer } = DarwinTunHalves::from_raw_fd(raw_fd)?;
             // The halves hold their own dup of the fd; release our handle.
-            #[cfg(not(target_os = "ios"))]
-            drop(self.device);
+            drop(self.backing);
 
             Ok((
                 TunReader {
