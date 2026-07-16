@@ -293,6 +293,11 @@ When both `network` and `network6` are configured, each client normally receives
 | macOS | `utunX` | `route add` | root |
 | Windows | `wintun.dll` | `netsh interface route` (VPN routes); `NetTCPIP` PowerShell cmdlets `Find-NetRoute`/`New-NetRoute` (underlay bypass host routes) | Administrator |
 
+The GUI clients build on this same per-platform TUN/route code. On Apple the OS
+hands the extension a `utun` fd (`docs/Apple-App.md`); on Windows the native GUI
+P/Invokes `ezvpn.dll`, which drives the desktop `VpnClient` (wintun + `netsh`)
+in-process (`docs/Windows-App.md`).
+
 ### Split-Tunnel Overlap Refusal (Client)
 
 Before creating the TUN device or installing any route, `connect()` refuses to
