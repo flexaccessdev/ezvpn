@@ -10,7 +10,9 @@ repository = "https://github.com/andrewtheguy/ezvpn"
 name = "ezvpn"
 # rlib: consumed by the desktop bin (src/main.rs) and tests.
 # staticlib: linked into Apple Network Extensions (iOS and native macOS).
-crate-type = ["rlib", "staticlib"]
+# cdylib: `ezvpn.dll`, P/Invoked by the native Windows GUI (`ezvpn-windows`)
+#   via the C FFI in `src/ffi_windows.rs`. Built by `build-windows.ps1`.
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 anyhow = "1"

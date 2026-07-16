@@ -38,3 +38,9 @@ pub mod runtime;
 // Apple Network Extension C FFI surface consumed by the iOS/macOS app extension.
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod ffi;
+
+// Windows C FFI surface consumed by the native Windows GUI (`ezvpn-windows`),
+// P/Invoked from .NET. Wraps the desktop `VpnClient` (which owns the wintun
+// adapter and routing table), unlike the fd-based Apple `ffi` module.
+#[cfg(target_os = "windows")]
+pub mod ffi_windows;
