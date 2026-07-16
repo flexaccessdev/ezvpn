@@ -37,6 +37,20 @@ use tun::{AbstractDevice, AsyncDevice, Configuration};
 #[cfg(not(target_vendor = "apple"))]
 use tun::{DeviceReader, DeviceWriter};
 
+// Brings `Command::creation_flags` into scope for the blocking `std::process::Command`
+// spawns below (tokio's `Command` exposes the same method inherently on Windows).
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt as _;
+
+/// `CREATE_NO_WINDOW` process-creation flag.
+///
+/// The tunnel runs in-process inside the WinUI GUI app, which has no console.
+/// Spawning a console subprocess (`netsh`, `powershell`) from a windowed process
+/// otherwise flashes a transient console window on screen each time a route is
+/// added/removed or the gateway is queried. This flag suppresses that window.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[cfg(target_vendor = "apple")]
 use std::io;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -1247,6 +1261,7 @@ async fn add_route_generic<R: Route>(tun_name: &str, route: &R) -> VpnResult<Rou
         let args = route.windows_add_args(tun_name);
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = Command::new("netsh")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(&args_ref)
             .output()
             .await
@@ -1299,6 +1314,7 @@ async fn remove_route_generic<R: Route>(tun_name: &str, route: &R) -> VpnResult<
         let args = route.windows_delete_args(tun_name);
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = Command::new("netsh")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(&args_ref)
             .output()
             .await
@@ -1361,7 +1377,10 @@ fn remove_route_sync_generic<R: Route>(tun_name: &str, route: &R) {
     {
         let args = route.windows_delete_args(tun_name);
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let result = std::process::Command::new("netsh").args(&args_ref).output();
+        let result = std::process::Command::new("netsh")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(&args_ref)
+            .output();
 
         match result {
             Ok(output) if output.status.success() => {
@@ -1602,6 +1621,7 @@ fn configure_tun_ipv6(tun_name: &str, addr: Ipv6Addr, prefix_len: u8) -> VpnResu
 #[cfg(target_os = "windows")]
 fn configure_tun_ipv6(tun_name: &str, addr: Ipv6Addr, prefix_len: u8) -> VpnResult<()> {
     let output = std::process::Command::new("netsh")
+        .creation_flags(CREATE_NO_WINDOW)
         .args([
             "interface",
             "ipv6",
@@ -2286,6 +2306,7 @@ fn windows_powershell_path() -> std::path::PathBuf {
 #[cfg(target_os = "windows")]
 async fn run_powershell(script: &str) -> VpnResult<std::process::Output> {
     Command::new(windows_powershell_path())
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .await
@@ -2296,6 +2317,7 @@ async fn run_powershell(script: &str) -> VpnResult<std::process::Output> {
 #[cfg(target_os = "windows")]
 fn run_powershell_sync(script: &str) -> std::io::Result<std::process::Output> {
     std::process::Command::new(windows_powershell_path())
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
 }
