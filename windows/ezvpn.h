@@ -47,10 +47,10 @@ void ezvpn_init_logging(void);
  *
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_token":"<47-char token>",
- *    "relay_urls":[],"relay_only":false,"dns_server":null,
+ *    "relay_urls":[],"relay_only":false,
  *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"],
  *    "instance":"default","auto_reconnect":true,"max_reconnect_attempts":null}
- *   auth_token / dns_server / max_reconnect_attempts may be null. relay_urls,
+ *   auth_token / max_reconnect_attempts may be null. relay_urls,
  *   relay_only, routes, routes6, instance, and auto_reconnect are optional.
  *   routes/routes6 are the split-tunnel prefixes routed through the tunnel; the
  *   server's advertised gateway host prefix is always routed in addition.

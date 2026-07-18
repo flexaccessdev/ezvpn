@@ -313,7 +313,7 @@ impl VpnClient {
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for the connection
-    /// * `relay_urls` - Optional relay URLs to use as connection hints. When DNS
+    /// * `relay_urls` - Optional relay URLs to use as connection hints. When peer
     ///   discovery is disabled, relay URLs are required for the connection to succeed.
     ///   iroh will attempt hole punching for direct P2P connections, falling back
     ///   to relay transport if needed.
@@ -615,7 +615,7 @@ impl VpnClient {
 
     /// Resolve the server's `EndpointAddr` with relay hints if available.
     ///
-    /// When DNS discovery is disabled, relay URLs are required for the
+    /// When peer discovery is disabled, relay URLs are required for the
     /// connection to succeed. iroh uses the relay for initial connection
     /// routing while still attempting hole punching for direct P2P.
     fn resolve_server_addr(&self, relay_urls: &[String]) -> VpnResult<EndpointAddr> {
@@ -1336,7 +1336,7 @@ impl VpnClient {
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for connections
-    /// * `relay_urls` - Optional relay URLs to use as connection hints. When DNS
+    /// * `relay_urls` - Optional relay URLs to use as connection hints. When peer
     ///   discovery is disabled, relay URLs are required for the connection to succeed.
     /// * `max_attempts` - Maximum total connection attempts (None = unlimited).
     ///   This counts all attempts including the initial one:

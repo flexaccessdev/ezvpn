@@ -149,18 +149,12 @@ secret_file = "./vpn-server.key"
 #     "https://relay1.example.com",
 #     "https://relay2.example.com",
 # ]
-
-# Custom DNS server URL for iroh endpoint discovery (pkarr), or "none" to disable DNS discovery.
-# This is NOT VPN DNS and does not affect client DNS resolution.
-# Must match client's dns_server configuration.
-# NOTE: URL must include the /pkarr path
-# dns_server = "https://dns.example.com/pkarr"
 #
-# Set to "none" to disable DNS-based peer discovery entirely.
-# When disabled, clients and server must use one of these methods to connect:
-#   1. Common relay server - both specify the same relay_urls
-#   2. mDNS - automatic discovery on the same local network
-# dns_server = "none"
+# iroh peer discovery (the n0 discovery service) is used automatically when the
+# default relays are in use. It is NOT configurable and is NOT real/VPN DNS.
+# When a custom relay is configured (relay_urls above), the relay doubles as the
+# rendezvous point and the discovery service is disabled automatically. mDNS
+# (same-LAN discovery) is always on.
 
 # NOTE: There is no [iroh.transport] section. QUIC transport settings are
 # fixed constants on both ends: CUBIC congestion control, 8 MB receive/send

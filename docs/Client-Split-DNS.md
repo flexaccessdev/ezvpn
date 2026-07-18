@@ -13,7 +13,7 @@ Placeholders used below:
 | `<INTERNAL_ZONE>` | The internal zone to route, e.g. `internal.example`. |
 
 The ezvpn desktop client does **not** push DNS or match domains over the tunnel
-(`dns_server` / `--dns-server` configure iroh *discovery* DNS only — see the
+(iroh peer *discovery* is not real DNS and is unrelated to this — see the
 README). This is by design, not a missing feature: the connector's single
 responsibility is tunneling, and DNS and firewall policy are managed outside
 it. So resolving the internal zone, whether on the LAN or over the ezvpn

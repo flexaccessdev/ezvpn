@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use iroh::{
     Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
-    address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
+    address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, presets},
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
@@ -14,7 +14,6 @@ use log::info;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
 
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -122,19 +121,19 @@ fn warn_if_socket_buffer_capped() {
 
 /// Create a base endpoint builder with common configuration.
 ///
+/// iroh peer discovery (the n0 discovery service — pkarr publishing + DNS-based
+/// lookup) is enabled only when using the default relays. A custom relay doubles
+/// as the rendezvous point, so discovery is disabled automatically whenever one
+/// is configured. (This is iroh peer discovery, not real DNS resolution.)
+///
 /// # Arguments
 /// * `relay_mode` - The relay mode to use
 /// * `relay_only` - If true, only use relay connections (no direct P2P).
-/// * `dns_server` - Optional custom DNS server URL (e.g., "https://dns.example.com"), or "none" to disable DNS discovery
-/// * `secret_key` - Optional secret key (required for publishing to custom DNS server)
-pub fn create_endpoint_builder(
-    relay_mode: RelayMode,
-    relay_only: bool,
-    dns_server: Option<&str>,
-    secret_key: Option<&SecretKey>,
-) -> Result<EndpointBuilder> {
+pub fn create_endpoint_builder(relay_mode: RelayMode, relay_only: bool) -> Result<EndpointBuilder> {
     warn_if_socket_buffer_capped();
     let transport_config = build_quic_transport_config()?;
+    // Check before `relay_mode` is moved into the builder below.
+    let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     // iroh 1.0 requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
@@ -148,32 +147,15 @@ pub fn create_endpoint_builder(
     }
 
     if !relay_only {
-        // DNS-based peer discovery (can be disabled via dns_server="none")
-        match dns_server {
-            Some("none") => {
-                // Explicitly disabled
-                info!("DNS discovery disabled (dns_server=none)");
-            }
-            Some(dns_url) => {
-                // Custom DNS server with publishing and resolving via HTTP (pkarr)
-                let pkarr_url: Url = dns_url.parse().context("Invalid DNS server URL")?;
-                if secret_key.is_some() {
-                    info!("Using custom DNS server: {}", dns_url);
-                    builder = builder
-                        .address_lookup(PkarrPublisher::builder(pkarr_url.clone()))
-                        .address_lookup(PkarrResolver::builder(pkarr_url));
-                } else {
-                    // Custom DNS server, resolve only via HTTP (no secret = can't publish)
-                    info!("Using custom DNS server (resolve only): {}", dns_url);
-                    builder = builder.address_lookup(PkarrResolver::builder(pkarr_url));
-                }
-            }
-            None => {
-                // Default n0 DNS
-                builder = builder
-                    .address_lookup(PkarrPublisher::n0_dns())
-                    .address_lookup(DnsAddressLookup::n0_dns());
-            }
+        if using_custom_relay {
+            // Custom relay doubles as the rendezvous point, so the n0 discovery
+            // service is unnecessary and is disabled automatically.
+            info!("Peer discovery disabled (custom relay in use)");
+        } else {
+            // Default n0 discovery (DNS-based lookup + pkarr publishing)
+            builder = builder
+                .address_lookup(PkarrPublisher::n0_dns())
+                .address_lookup(DnsAddressLookup::n0_dns());
         }
         // mDNS always enabled for local network discovery
         builder = builder.address_lookup(MdnsAddressLookup::builder());
@@ -187,14 +169,13 @@ pub async fn create_server_endpoint(
     relay_urls: &[String],
     relay_only: bool,
     secret: Option<SecretKey>,
-    dns_server: Option<&str>,
 ) -> Result<Endpoint> {
     let relay_mode = parse_relay_mode(relay_urls)?;
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder = create_endpoint_builder(relay_mode, relay_only, dns_server, secret.as_ref())?
-        .alpns(vec![VPN_ALPN.to_vec()]);
+    let mut builder =
+        create_endpoint_builder(relay_mode, relay_only)?.alpns(vec![VPN_ALPN.to_vec()]);
 
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
@@ -226,14 +207,13 @@ pub async fn create_server_endpoint(
 pub async fn create_client_endpoint(
     relay_urls: &[String],
     relay_only: bool,
-    dns_server: Option<&str>,
     secret_key: Option<&SecretKey>,
 ) -> Result<Endpoint> {
     let relay_mode = parse_relay_mode(relay_urls)?;
     let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     print_relay_status(relay_urls, relay_only, using_custom_relay);
 
-    let mut builder = create_endpoint_builder(relay_mode, relay_only, dns_server, secret_key)?;
+    let mut builder = create_endpoint_builder(relay_mode, relay_only)?;
 
     // Set the secret key for persistent identity (used for authentication)
     if let Some(secret) = secret_key {
