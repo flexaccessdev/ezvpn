@@ -699,8 +699,7 @@ restart or allocation state changes.
   [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
 - When a custom relay is configured, it doubles as the rendezvous point and the
   discovery service is disabled automatically; clients and server then connect
-  through their common relay (or same-LAN mDNS, which is always on). Server and
-  client relay settings must match.
+  through their common relay. Server and client relay settings must match.
 
 See the relay and discovery comments in `vpn_server.toml.example` and
 `vpn_client.toml.example` for exact TOML syntax.
