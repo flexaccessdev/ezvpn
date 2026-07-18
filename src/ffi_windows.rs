@@ -29,7 +29,7 @@
 //!
 //! ## Config JSON (input to `ezvpn_start`)
 //!
-//! `auth_token`/`dns_server`/`max_reconnect_attempts` may be null. `relay_urls`,
+//! `auth_token`/`max_reconnect_attempts` may be null. `relay_urls`,
 //! `relay_only`, `routes`, `routes6`, `instance`, and `auto_reconnect` are all
 //! optional (with the defaults shown).
 //!
@@ -39,7 +39,6 @@
 //!   "auth_token": "<47-char ezvpn token>",
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_only": false,
-//!   "dns_server": "https://dns.example/pkarr",
 //!   "routes": ["10.0.0.0/8"],
 //!   "routes6": ["fd00::/8"],
 //!   "instance": "default",
@@ -99,8 +98,6 @@ struct FfiWinConfig {
     relay_urls: Vec<String>,
     #[serde(default)]
     relay_only: bool,
-    #[serde(default)]
-    dns_server: Option<String>,
     #[serde(default)]
     routes: Vec<String>,
     #[serde(default)]
@@ -203,7 +200,6 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
 
     let relay_urls = cfg.relay_urls;
     let relay_only = cfg.relay_only;
-    let dns_server = cfg.dns_server;
     let instance = cfg.instance;
     let auto_reconnect = cfg.auto_reconnect;
     let max_attempts = cfg.max_reconnect_attempts.and_then(NonZeroU32::new);
@@ -232,13 +228,7 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
             };
 
             runtime.block_on(async move {
-                let endpoint = match create_client_endpoint(
-                    &relay_urls,
-                    relay_only,
-                    dns_server.as_deref(),
-                    None,
-                )
-                .await
+                let endpoint = match create_client_endpoint(&relay_urls, relay_only, None).await
                 {
                     Ok(e) => e,
                     Err(e) => {

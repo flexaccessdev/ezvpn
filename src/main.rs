@@ -158,10 +158,6 @@ enum ClientAction {
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
 
-        /// Custom DNS server URL for peer discovery
-        #[arg(long)]
-        dns_server: Option<String>,
-
         /// Authentication token to send to server
         #[arg(long)]
         auth_token: Option<String>,
@@ -318,7 +314,6 @@ fn main() -> Result<()> {
                     default_config,
                     server_node_id,
                     relay_urls,
-                    dns_server,
                     auth_token,
                     auth_token_file,
                     routes,
@@ -336,7 +331,6 @@ fn main() -> Result<()> {
                 default_config,
                 server_node_id,
                 relay_urls,
-                dns_server,
                 auth_token,
                 auth_token_file,
                 routes,
@@ -468,7 +462,6 @@ fn prepare_client_start(
     default_config: bool,
     server_node_id: Option<String>,
     relay_urls: Vec<String>,
-    dns_server: Option<String>,
     auth_token: Option<String>,
     auth_token_file: Option<PathBuf>,
     routes: Vec<String>,
@@ -513,7 +506,6 @@ fn prepare_client_start(
             routes,
             routes6,
             relay_urls,
-            dns_server,
             auto_reconnect_opt,
             max_reconnect_attempts,
         )
@@ -919,7 +911,6 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         &resolved.relay_urls,
         false, // relay_only - direct P2P preferred for VPN performance
         Some(secret_key),
-        resolved.dns_server.as_deref(),
     )
     .await
     .context("Failed to create iroh endpoint")?;
@@ -1003,7 +994,6 @@ async fn run_vpn_client(
     let endpoint = create_client_endpoint(
         &resolved.relay_urls,
         false, // relay_only - direct P2P preferred for VPN performance
-        resolved.dns_server.as_deref(),
         None, // No persistent secret key - ephemeral
     )
     .await

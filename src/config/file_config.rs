@@ -46,7 +46,6 @@ pub struct ServerAuthConfig {
 pub struct VpnServerIrohConfig {
     pub secret_file: Option<PathBuf>,
     pub relay_urls: Option<Vec<String>>,
-    pub dns_server: Option<String>,
 }
 
 /// VPN routes the client installs once connected. `[network]` section.
@@ -71,7 +70,6 @@ pub struct ClientAuthConfig {
 pub struct VpnClientIrohConfig {
     pub server_node_id: Option<String>,
     pub relay_urls: Option<Vec<String>>,
-    pub dns_server: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -324,7 +322,6 @@ pub struct ResolvedVpnServerConfig {
     pub ip6_strategy: Ip6Strategy,
     pub secret_file: Option<PathBuf>,
     pub relay_urls: Vec<String>,
-    pub dns_server: Option<String>,
     pub auth_tokens: Vec<String>,
     pub auth_tokens_file: Option<PathBuf>,
 }
@@ -368,7 +365,6 @@ impl ResolvedVpnServerConfig {
             ip6_strategy: net.ip6_strategy,
             secret_file: iroh.secret_file.clone(),
             relay_urls: iroh.relay_urls.clone().unwrap_or_default(),
-            dns_server: iroh.dns_server.clone(),
             auth_tokens: auth.auth_tokens.clone().unwrap_or_default(),
             auth_tokens_file: auth.auth_tokens_file.clone(),
         })
@@ -383,7 +379,6 @@ pub struct ResolvedVpnClientConfig {
     pub routes: Vec<String>,
     pub routes6: Vec<String>,
     pub relay_urls: Vec<String>,
-    pub dns_server: Option<String>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -396,7 +391,6 @@ pub struct VpnClientConfigBuilder {
     routes: Option<Vec<String>>,
     routes6: Option<Vec<String>>,
     relay_urls: Option<Vec<String>>,
-    dns_server: Option<String>,
     auto_reconnect: Option<bool>,
     max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -421,9 +415,6 @@ impl VpnClientConfigBuilder {
                 }
                 if iroh.relay_urls.is_some() {
                     self.relay_urls = iroh.relay_urls.clone();
-                }
-                if iroh.dns_server.is_some() {
-                    self.dns_server = iroh.dns_server.clone();
                 }
             }
             if cfg.auth.auth_token.is_some() {
@@ -457,7 +448,6 @@ impl VpnClientConfigBuilder {
         routes: Vec<String>,
         routes6: Vec<String>,
         relay_urls: Vec<String>,
-        dns_server: Option<String>,
         auto_reconnect: Option<bool>,
         max_reconnect_attempts: Option<NonZeroU32>,
     ) -> Self {
@@ -478,9 +468,6 @@ impl VpnClientConfigBuilder {
         }
         if !relay_urls.is_empty() {
             self.relay_urls = Some(relay_urls);
-        }
-        if dns_server.is_some() {
-            self.dns_server = dns_server;
         }
         if auto_reconnect.is_some() {
             self.auto_reconnect = auto_reconnect;
@@ -522,7 +509,6 @@ impl VpnClientConfigBuilder {
             routes,
             routes6,
             relay_urls: self.relay_urls.unwrap_or_default(),
-            dns_server: self.dns_server,
             auto_reconnect: self.auto_reconnect.unwrap_or(true),
             max_reconnect_attempts: self.max_reconnect_attempts,
         })
@@ -618,7 +604,6 @@ auth_token = "token"
 [iroh]
 server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
 relay_urls = ["https://relay.example.com"]
-dns_server = "none"
 "#,
         )
         .unwrap();
@@ -628,7 +613,6 @@ dns_server = "none"
             iroh.relay_urls.as_deref(),
             Some(&["https://relay.example.com".to_string()][..])
         );
-        assert_eq!(iroh.dns_server.as_deref(), Some("none"));
 
         let resolved = VpnClientConfigBuilder::new()
             .apply_defaults()
@@ -636,7 +620,6 @@ dns_server = "none"
             .build()
             .unwrap();
         assert_eq!(resolved.relay_urls, ["https://relay.example.com"]);
-        assert_eq!(resolved.dns_server.as_deref(), Some("none"));
     }
 
     /// A typo in a top-level key must be rejected, not silently ignored.

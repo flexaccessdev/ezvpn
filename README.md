@@ -321,7 +321,6 @@ machine-readable output.
 | `--route <CIDR>` | Additional IPv4 route through the VPN; repeatable |
 | `--route6 <CIDR>` | Additional IPv6 route through the VPN; repeatable |
 | `--relay-url <URL>` | Custom relay URL; repeatable |
-| `--dns-server <URL\|none>` | Custom iroh discovery server, or disable DNS discovery |
 | `--auto-reconnect` | Force-enable reconnect |
 | `--no-auto-reconnect` | Disable reconnect |
 | `--max-reconnect-attempts <N>` | Limit reconnect attempts |
@@ -691,14 +690,17 @@ restart or allocation state changes.
 
 - `relay_urls` / `--relay-url` configure custom relay servers for failover and
   connection hints.
-- `dns_server` / `--dns-server` configure the iroh discovery server. This is
-  not VPN DNS and does not affect client DNS resolution. The client does not push
-  DNS or match domains over the tunnel; to resolve an internal zone through a
-  resolver reachable over the tunnel, set OS-level conditional forwarding —
-  see [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
-- Server and client relay/discovery settings must match.
-- If `dns_server = "none"` disables DNS discovery, clients and server must
-  connect through a common relay or same-LAN mDNS discovery.
+- iroh peer discovery (the n0 discovery service — pkarr + DNS-based lookup) is
+  used automatically when the default relays are in use. It is not configurable.
+  This is iroh peer discovery, not real/VPN DNS: it does not affect client DNS
+  resolution, and the client does not push DNS or match domains over the tunnel.
+  To resolve an internal zone through a resolver reachable over the tunnel, set
+  OS-level conditional forwarding — see
+  [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
+- When a custom relay is configured, it doubles as the rendezvous point and the
+  discovery service is disabled automatically; clients and server then connect
+  through their common relay (or same-LAN mDNS, which is always on). Server and
+  client relay settings must match.
 
 See the relay and discovery comments in `vpn_server.toml.example` and
 `vpn_client.toml.example` for exact TOML syntax.
