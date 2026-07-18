@@ -9,7 +9,6 @@ use iroh::{
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, presets},
 };
-use iroh_mdns_address_lookup::MdnsAddressLookup;
 use log::info;
 use std::path::Path;
 use std::sync::Arc;
@@ -157,8 +156,6 @@ pub fn create_endpoint_builder(relay_mode: RelayMode, relay_only: bool) -> Resul
                 .address_lookup(PkarrPublisher::n0_dns())
                 .address_lookup(DnsAddressLookup::n0_dns());
         }
-        // mDNS always enabled for local network discovery
-        builder = builder.address_lookup(MdnsAddressLookup::builder());
     }
 
     Ok(builder)
