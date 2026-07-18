@@ -708,24 +708,28 @@ and Unix `stop` under service managers.
 
 ## Apple App
 
-`ezvpn` runs on iOS and macOS as a Network Extension app extension (dual-stack
-split tunnel; no iOS Simulator support, full tunnel, or App Store packaging).
-The Rust core builds into `libezvpn.xcframework` here (`./build-apple.sh`,
-released as `libezvpn-apple.xcframework.zip`); the Swift app lives in a separate repo,
-[`ezvpn-apple`](https://github.com/flexaccessdev/ezvpn-apple), which consumes it via a
-Swift package binary target.
+[`ezvpn-apple`](https://github.com/flexaccessdev/ezvpn-apple) is a native SwiftUI
+GUI client for iOS and macOS that connects to an `ezvpn` server built from this
+repo (dual-stack split tunnel, optional tunnel DNS on iOS only including
+split-DNS match domains; no full tunnel or App Store distribution). The
+packet-tunnel provider ships as an app extension on iOS and a system extension
+on macOS; macOS is distributed as a signed, notarized Developer ID `.dmg` (no
+Apple Developer account needed to run it), while iOS must be built and signed
+under your own team (no TestFlight, no Simulator). The Rust core builds into `libezvpn.xcframework` here
+(`./build-apple.sh`, released as `libezvpn-apple.xcframework.zip`), which the
+Swift app consumes via a Swift package binary target.
 
 See [`docs/Apple-App.md`](docs/Apple-App.md) for scope, how it reuses the core, the C
 interface, and build steps.
 
 ## Windows App
 
-`ezvpn` also runs on Windows behind a native WinUI 3 GUI (dual-stack split
-tunnel; no in-app split DNS, Store packaging, or code signing). The Rust core
-builds into `ezvpn.dll` here (`./build-windows.ps1`, released as
-`ezvpn-windows.dll.zip`); the .NET app lives in a separate repo,
-[`ezvpn-windows`](https://github.com/flexaccessdev/ezvpn-windows), which P/Invokes
-it. Unlike the Apple extension (which is handed a `utun` fd), the Windows FFI
+[`ezvpn-windows`](https://github.com/flexaccessdev/ezvpn-windows) is a native
+WinUI 3 GUI client for Windows that connects to an `ezvpn` server built from this
+repo (dual-stack split tunnel; no in-app split DNS, Store packaging, or code
+signing). The Rust core builds into `ezvpn.dll` here (`./build-windows.ps1`,
+released as `ezvpn-windows.dll.zip`), which the .NET app P/Invokes.
+Unlike the Apple extension (which is handed a `utun` fd), the Windows FFI
 wraps the desktop `VpnClient`, which creates the wintun adapter and routes
 itself, so it runs elevated and needs `wintun.dll` alongside `ezvpn.dll`.
 

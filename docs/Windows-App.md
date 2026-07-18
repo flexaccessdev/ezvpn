@@ -1,7 +1,7 @@
 # Windows App
 
-`ezvpn` can run on Windows behind a native GUI. Like the Apple client, the
-Windows client is split across two repositories:
+A native Windows GUI client that connects to an `ezvpn` server built from this
+repo. Like the Apple client, the Windows client is split across two repositories:
 
 - **This repo (`ezvpn`)** — the Rust core, packaged as `ezvpn.dll` (a C-ABI
   `cdylib`) plus a small C FFI (`src/ffi_windows.rs`, header `windows/ezvpn.h`).
@@ -10,8 +10,8 @@ Windows client is split across two repositories:
   solution: a **WinUI 3** app that P/Invokes `ezvpn.dll`. Build/run/install
   instructions live in that repo's README.
 
-It is intentionally scoped for development-signed personal use, like
-`ezvpn-apple`.
+It is intentionally scoped for development-signed personal use — the MSI is
+unsigned.
 
 ## Scope
 

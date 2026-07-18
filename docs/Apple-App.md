@@ -1,9 +1,12 @@
 # Apple App
 
-`ezvpn` can run on iOS and native macOS as a Network Extension app extension.
-It tunnels real traffic on a physical iOS device or Apple Silicon Mac and is
-intentionally scoped for development-signed personal use, not App Store or
-Developer ID distribution.
+A native SwiftUI GUI client for iOS and macOS that connects to an `ezvpn` server
+built from this repo. The packet-tunnel provider ships as a Network Extension —
+an **app extension on iOS** and a **system extension on macOS** (the packaging
+Apple requires for Developer ID distribution outside the App Store). macOS is
+distributed as a signed, notarized Developer ID `.dmg` (no Apple Developer
+account needed to run it); iOS installs only via a development-signed build to a
+registered device (no App Store or TestFlight).
 
 The Apple client is split across two repositories:
 
@@ -12,9 +15,10 @@ The Apple client is split across two repositories:
   plus a small C FFI. This is where the Apple Network Extension Rust code and
   build script live.
 - **[`ezvpn-apple`](https://github.com/flexaccessdev/ezvpn-apple)** — the Swift Xcode
-  project: a SwiftUI container app and the `NEPacketTunnelProvider` app
-  extension that links `libezvpn.xcframework` (consumed via a Swift package
-  binary target). Build/sign/run instructions live in that repo's README.
+  project: a SwiftUI app and the packet-tunnel provider (`NEPacketTunnelProvider`,
+  app extension on iOS / system extension on macOS) that links
+  `libezvpn.xcframework` (consumed via a Swift package binary target).
+  Build/sign/run instructions live in that repo's README.
 
 ## Scope
 
@@ -22,10 +26,10 @@ In scope:
 
 - **Dual-stack split tunnel** — IPv4, IPv6, or both, to explicit routed
   prefixes. Both route lists are optional and independent.
-- **Optional tunnel DNS** — applied in-app by the extension via `NEDNSSettings`.
-  iOS additionally supports conditional forwarding with `matchDomains` because
-  it ignores installed DNS profiles while a VPN is active. macOS keeps its
-  system DNS profiles active, so the app exposes only global tunnel DNS there.
+- **Optional tunnel DNS (iOS only)** — applied in-app by the extension via
+  `NEDNSSettings`, including conditional forwarding with `matchDomains` because
+  iOS ignores installed DNS profiles while a VPN is active. The macOS build
+  leaves the system's DNS configuration untouched.
 - **Optional underlay bypass** — automatically carves the few server underlay
   addresses that overlap a routed prefix back out of the tunnel (see below).
 - **Native Apple testing** — a Packet Tunnel Provider does not run in the iOS
@@ -34,9 +38,9 @@ In scope:
 Out of scope (by design):
 
 - **Full tunnel** (`0.0.0.0/0` / `::/0`) — not offered by the Apple app.
-- **App Store / TestFlight / Developer ID** distribution and background
-  reconnect polish. Development-signed macOS builds use an app extension;
-  system extensions are a distribution concern, not the debug flow.
+- **App Store / TestFlight** submission — iOS is development-signed only. macOS
+  *is* distributed outside the App Store via a Developer ID-signed, notarized
+  `.dmg` (the tunnel ships as a system extension).
 
 ## How it reuses the core
 
@@ -149,6 +153,8 @@ FFI dev, `ezvpn-apple` links this `dist/apple` build directly via a committed sy
 when `EZVPN_LOCAL_XCFRAMEWORK` is set — see that repo's README.
 
 Then follow the [`ezvpn-apple`](https://github.com/flexaccessdev/ezvpn-apple) README
-to generate the Xcode project, set your signing team, and run on a device or Mac. Note
-that the Network Extension (`packet-tunnel-provider`) capability requires a paid
-Apple Developer account.
+to generate the Xcode project, set your signing team, and run on a device or Mac.
+Building from source uses the Network Extension (`packet-tunnel-provider`)
+capability, which requires a paid Apple Developer account (non-wildcard App IDs
+under your own team). Running the prebuilt, notarized macOS `.dmg` from the
+`ezvpn-apple` releases needs no Apple Developer account.
