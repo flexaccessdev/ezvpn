@@ -6,7 +6,7 @@ Windows client is split across two repositories:
 - **This repo (`ezvpn`)** — the Rust core, packaged as `ezvpn.dll` (a C-ABI
   `cdylib`) plus a small C FFI (`src/ffi_windows.rs`, header `windows/ezvpn.h`).
   This is where the Windows FFI Rust code and build script live.
-- **[`ezvpn-windows`](https://github.com/andrewtheguy/ezvpn-windows)** — the .NET
+- **[`ezvpn-windows`](https://github.com/flexaccessdev/ezvpn-windows)** — the .NET
   solution: a **WinUI 3** app that P/Invokes `ezvpn.dll`. Build/run/install
   instructions live in that repo's README.
 
@@ -116,5 +116,5 @@ dev, set `EZVPN_LOCAL_DLL=1` when building `ezvpn-windows` to link this
 `dist/windows` build directly.
 
 Then follow the
-[`ezvpn-windows`](https://github.com/andrewtheguy/ezvpn-windows) README to build
+[`ezvpn-windows`](https://github.com/flexaccessdev/ezvpn-windows) README to build
 and run the app or the MSI installer.
