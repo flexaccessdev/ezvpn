@@ -6,7 +6,7 @@
 # the CI release workflow zips it into libezvpn-apple.xcframework.zip. The sibling
 # Xcode project (../ezvpn-apple) links it via its own Swift package — by default a
 # pinned release download, or this dist/apple build (reached through a committed
-# symlink) when EZVPN_LOCAL_XCFRAMEWORK is set. This script only produces
+# symlink) when EZVPN_LOCAL_XCFRAMEWORK is exactly 1. This script only produces
 # dist/apple; it does not write into ../ezvpn-apple.
 #
 # A Packet Tunnel Provider does not run in the iOS Simulator, so there is no
@@ -67,7 +67,7 @@ echo "For local Apple Network Extension FFI dev, build the app against this xcfr
 echo "    cd ../ezvpn-apple"
 echo "    EZVPN_LOCAL_XCFRAMEWORK=1 xcodegen generate"
 echo "    EZVPN_LOCAL_XCFRAMEWORK=1 xcodebuild -project Ezvpn.xcodeproj \\"
-echo "        -scheme EzvpnApp -destination 'generic/platform=iOS' build"
+echo "        -scheme Ezvpn -destination 'generic/platform=iOS' build"
 echo "    EZVPN_LOCAL_XCFRAMEWORK=1 xcodebuild -project Ezvpn.xcodeproj \\"
-echo "        -scheme EzvpnApp -destination 'platform=macOS,arch=arm64' build"
+echo "        -scheme Ezvpn -destination 'platform=macOS,arch=arm64' build"
 echo "Done."

@@ -150,7 +150,7 @@ This builds the `aarch64-apple-ios` and `aarch64-apple-darwin` slices and bundle
 zips it into the `libezvpn-apple.xcframework.zip` release asset, which `ezvpn-apple`
 downloads by default (pinned by URL+checksum in its Swift package). For local
 FFI dev, `ezvpn-apple` links this `dist/apple` build directly via a committed symlink
-when `EZVPN_LOCAL_XCFRAMEWORK` is set — see that repo's README.
+when `EZVPN_LOCAL_XCFRAMEWORK=1` (exactly) — see that repo's README.
 
 Then follow the [`ezvpn-apple`](https://github.com/flexaccessdev/ezvpn-apple) README
 to generate the Xcode project, set your signing team, and run on a device or Mac.
