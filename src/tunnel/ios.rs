@@ -44,13 +44,13 @@ use std::sync::Arc;
 
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use rand::Rng;
 
 use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
-use crate::transport::endpoint::create_client_endpoint;
+use crate::transport::endpoint::{RelayConfig, create_client_endpoint};
 use crate::tunnel::client::{
     ServerInfo, collect_local_iroh_udp_ports, collect_relay_ips, overlapping_underlay_excludes,
     perform_handshake, run_tunnel,
@@ -64,10 +64,8 @@ pub struct IosConfig {
     pub server_node_id: String,
     /// Optional ezvpn auth token.
     pub auth_token: Option<String>,
-    /// Relay URL hints. When empty, iroh uses its default relay map.
-    pub relay_urls: Vec<String>,
-    /// Force relay-only transport (skip hole punching). Usually false.
-    pub relay_only: bool,
+    /// Relay configuration (custom relays double as dial hints).
+    pub relay_config: RelayConfig,
     /// IPv4 prefixes routed through the tunnel (the split-tunnel `includedRoutes`).
     /// Used to compute which server underlay addresses overlap and must be
     /// bypassed.
@@ -128,7 +126,7 @@ impl IosSession {
     /// so the server may assign a different IP on each connect — acceptable for
     /// the MVP.
     pub async fn connect(cfg: &IosConfig) -> VpnResult<Self> {
-        let endpoint = create_client_endpoint(&cfg.relay_urls, cfg.relay_only, None)
+        let endpoint = create_client_endpoint(&cfg.relay_config, None)
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to create iroh endpoint: {e}")))?;
 
@@ -138,11 +136,8 @@ impl IosSession {
             .map_err(|e| VpnError::config_with_source("Invalid server node ID", e))?;
 
         let mut addr = EndpointAddr::new(server_id);
-        for relay in &cfg.relay_urls {
-            let url: RelayUrl = relay
-                .parse()
-                .map_err(|e| VpnError::config_with_source(format!("Invalid relay URL: {relay}"), e))?;
-            addr = addr.with_relay_url(url);
+        for url in cfg.relay_config.custom_urls() {
+            addr = addr.with_relay_url(url.clone());
         }
 
         let connection = endpoint
@@ -168,7 +163,7 @@ impl IosSession {
         // the server's advertised host prefixes, which the extension always
         // routes even with no configured prefixes. Applied by the extension as
         // `excludedRoutes` (see module docs).
-        let mut candidates: Vec<IpAddr> = collect_relay_ips(&endpoint, &cfg.relay_urls)
+        let mut candidates: Vec<IpAddr> = collect_relay_ips(&endpoint, &cfg.relay_config)
             .await
             .into_iter()
             .collect();

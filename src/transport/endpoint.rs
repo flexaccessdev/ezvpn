@@ -13,8 +13,70 @@ use log::info;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait between rounds of re-attempting registration on custom
+/// relays that were unreachable at server startup.
+pub const RELAY_REGISTER_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Relay configuration, resolved once from the raw config strings.
+///
+/// This is the single source of the default-vs-custom distinction. iroh's
+/// default relay map comes with n0 peer discovery; a custom relay set doubles
+/// as the rendezvous point instead (discovery is disabled), so the server must
+/// hold a registration on every custom relay ([`create_server_endpoints`]) and
+/// the client must dial with the relay URLs as hints.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RelayConfig {
+    /// iroh's default relay map, with n0 peer discovery.
+    #[default]
+    Default,
+    /// Custom relay set (parsed, sorted, deduped). Never empty.
+    Custom(Vec<RelayUrl>),
+}
+
+impl RelayConfig {
+    /// Parse raw config strings; empty input selects the default relays.
+    /// Fails on the first malformed URL, so config typos surface at resolve
+    /// time instead of at each use site.
+    pub fn from_urls(urls: &[String]) -> Result<Self> {
+        if urls.is_empty() {
+            return Ok(Self::Default);
+        }
+        let mut parsed = urls
+            .iter()
+            .map(|url| {
+                url.parse::<RelayUrl>()
+                    .with_context(|| format!("Invalid relay URL: {url}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        parsed.sort();
+        parsed.dedup();
+        Ok(Self::Custom(parsed))
+    }
+
+    /// The custom relay URLs; empty for [`RelayConfig::Default`].
+    pub fn custom_urls(&self) -> &[RelayUrl] {
+        match self {
+            Self::Default => &[],
+            Self::Custom(urls) => urls,
+        }
+    }
+
+    pub fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+
+    /// The corresponding iroh [`RelayMode`].
+    pub fn relay_mode(&self) -> RelayMode {
+        match self {
+            Self::Default => RelayMode::Default,
+            Self::Custom(urls) => RelayMode::Custom(RelayMap::from_iter(urls.iter().cloned())),
+        }
+    }
+}
 
 /// Load secret key from file (base64 encoded).
 pub fn load_secret(path: &Path) -> Result<SecretKey> {
@@ -44,31 +106,12 @@ pub fn secret_to_endpoint_id(secret: &SecretKey) -> EndpointId {
     secret.public()
 }
 
-/// Parse relay URL strings into a RelayMode.
-pub fn parse_relay_mode(relay_urls: &[String]) -> Result<RelayMode> {
-    if relay_urls.is_empty() {
-        Ok(RelayMode::Default)
-    } else {
-        let parsed_urls: Vec<RelayUrl> = relay_urls
-            .iter()
-            .map(|url| url.parse().context(format!("Invalid relay URL: {}", url)))
-            .collect::<Result<Vec<_>>>()?;
-        let relay_map = RelayMap::from_iter(parsed_urls);
-        Ok(RelayMode::Custom(relay_map))
-    }
-}
-
 /// Print relay configuration status messages.
-pub fn print_relay_status(relay_urls: &[String], relay_only: bool, using_custom_relay: bool) {
-    if using_custom_relay {
-        if relay_urls.len() == 1 {
-            info!("Using custom relay server");
-        } else {
-            info!("Using {} custom relay servers", relay_urls.len());
-        }
-    }
-    if relay_only {
-        info!("Relay-only mode: all traffic will go through the relay server");
+pub fn print_relay_status(relay_config: &RelayConfig) {
+    match relay_config.custom_urls().len() {
+        0 => {}
+        1 => info!("Using custom relay server"),
+        n => info!("Using {} custom relay servers", n),
     }
 }
 
@@ -121,55 +164,41 @@ fn warn_if_socket_buffer_capped() {
 /// lookup) is enabled only when using the default relays. A custom relay doubles
 /// as the rendezvous point, so discovery is disabled automatically whenever one
 /// is configured. (This is iroh peer discovery, not real DNS resolution.)
-///
-/// # Arguments
-/// * `relay_mode` - The relay mode to use
-/// * `relay_only` - If true, only use relay connections (no direct P2P).
-pub fn create_endpoint_builder(relay_mode: RelayMode, relay_only: bool) -> Result<EndpointBuilder> {
+pub fn create_endpoint_builder(relay_config: &RelayConfig) -> Result<EndpointBuilder> {
     warn_if_socket_buffer_capped();
     let transport_config = build_quic_transport_config()?;
-    // Check before `relay_mode` is moved into the builder below.
-    let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
     // iroh 1.0 requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
     let mut builder = Endpoint::builder(presets::Empty)
-        .relay_mode(relay_mode)
+        .relay_mode(relay_config.relay_mode())
         .transport_config(transport_config)
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
 
-    if relay_only {
-        builder = builder.clear_ip_transports();
-    }
-
-    if !relay_only {
-        if using_custom_relay {
-            // Custom relay doubles as the rendezvous point, so the n0 discovery
-            // service is unnecessary and is disabled automatically.
-            info!("Peer discovery disabled (custom relay in use)");
-        } else {
-            // Default n0 discovery (DNS-based lookup + pkarr publishing)
-            builder = builder
-                .address_lookup(PkarrPublisher::n0_dns())
-                .address_lookup(DnsAddressLookup::n0_dns());
-        }
+    if relay_config.is_custom() {
+        // Custom relay doubles as the rendezvous point, so the n0 discovery
+        // service is unnecessary and is disabled automatically.
+        info!("Peer discovery disabled (custom relay in use)");
+    } else {
+        // Default n0 discovery (DNS-based lookup + pkarr publishing)
+        builder = builder
+            .address_lookup(PkarrPublisher::n0_dns())
+            .address_lookup(DnsAddressLookup::n0_dns());
     }
 
     Ok(builder)
 }
 
-/// Create a server endpoint with optional persistent identity.
+/// Create a single server endpoint with optional persistent identity.
+///
+/// Servers with custom relays need one endpoint *per relay* — use
+/// [`create_server_endpoints`], which owns that policy; this creates one
+/// endpoint for exactly the relay set in `relay_config`.
 pub async fn create_server_endpoint(
-    relay_urls: &[String],
-    relay_only: bool,
+    relay_config: &RelayConfig,
     secret: Option<SecretKey>,
 ) -> Result<Endpoint> {
-    let relay_mode = parse_relay_mode(relay_urls)?;
-    let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
-    print_relay_status(relay_urls, relay_only, using_custom_relay);
-
-    let mut builder =
-        create_endpoint_builder(relay_mode, relay_only)?.alpns(vec![VPN_ALPN.to_vec()]);
+    let mut builder = create_endpoint_builder(relay_config)?.alpns(vec![VPN_ALPN.to_vec()]);
 
     if let Some(secret) = secret {
         builder = builder.secret_key(secret);
@@ -196,18 +225,138 @@ pub async fn create_server_endpoint(
     Ok(endpoint)
 }
 
+/// Create the VPN server's iroh endpoint set, plus a channel delivering
+/// endpoints for custom relays that register after startup.
+///
+/// - **Default relays**: one endpoint on the default relay map; the returned
+///   receiver is already closed.
+/// - **Custom relays**: one endpoint per relay, all sharing the server
+///   identity, so the server is reachable regardless of which configured relay
+///   a client can access (iroh gives each endpoint a single home relay, and
+///   relays do not forward to each other). Registrations run concurrently and
+///   each is bounded by [`RELAY_CONNECT_TIMEOUT`], so an unreachable relay can
+///   never stall startup. This fails only when *every* relay is unreachable;
+///   relays that failed while at least one succeeded are retried in a
+///   background task every [`RELAY_REGISTER_RETRY_INTERVAL`] and delivered
+///   through the receiver once they come back (see `VpnServer::run`).
+pub async fn create_server_endpoints(
+    relay_config: &RelayConfig,
+    secret: SecretKey,
+) -> Result<(Vec<Endpoint>, mpsc::Receiver<Endpoint>)> {
+    // Only the retry task holds a sender, so with nothing to retry the server
+    // sees the channel as already closed.
+    let (late_endpoint_tx, late_endpoint_rx) = mpsc::channel(1);
+
+    let RelayConfig::Custom(relay_urls) = relay_config else {
+        let endpoint = create_server_endpoint(&RelayConfig::Default, Some(secret)).await?;
+        return Ok((vec![endpoint], late_endpoint_rx));
+    };
+    print_relay_status(relay_config);
+
+    let attempts = futures::future::join_all(relay_urls.iter().map(|relay_url| {
+        let secret = secret.clone();
+        async move {
+            let result = register_on_custom_relay(relay_url, secret).await;
+            (relay_url.clone(), result)
+        }
+    }))
+    .await;
+
+    let mut endpoints = Vec::new();
+    let mut failed_relays = Vec::new();
+    for (relay_url, result) in attempts {
+        match result {
+            Ok(endpoint) => {
+                info!("Server registered on custom relay {}", relay_url);
+                endpoints.push(endpoint);
+            }
+            Err(e) => {
+                log::warn!(
+                    "Could not register server on custom relay {}: {:#} \
+                     (will keep retrying in the background)",
+                    relay_url,
+                    e
+                );
+                failed_relays.push(relay_url);
+            }
+        }
+    }
+    if endpoints.is_empty() {
+        anyhow::bail!("Failed to register the VPN server on any configured custom relay");
+    }
+    if !failed_relays.is_empty() {
+        tokio::spawn(retry_failed_relay_registrations(
+            failed_relays,
+            secret,
+            late_endpoint_tx,
+        ));
+    }
+    Ok((endpoints, late_endpoint_rx))
+}
+
+/// One time-bounded registration attempt against a single custom relay.
+async fn register_on_custom_relay(relay_url: &RelayUrl, secret: SecretKey) -> Result<Endpoint> {
+    let relay_config = RelayConfig::Custom(vec![relay_url.clone()]);
+    match tokio::time::timeout(
+        RELAY_CONNECT_TIMEOUT,
+        create_server_endpoint(&relay_config, Some(secret)),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "relay registration timed out after {}s",
+            RELAY_CONNECT_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Keep re-attempting registration on custom relays that were unreachable at
+/// startup, handing each recovered endpoint to the running server through
+/// `late_endpoint_tx`. Exits once every relay has registered (closing the
+/// channel) or the server has shut down (send fails).
+async fn retry_failed_relay_registrations(
+    mut failed_relays: Vec<RelayUrl>,
+    secret: SecretKey,
+    late_endpoint_tx: mpsc::Sender<Endpoint>,
+) {
+    while !failed_relays.is_empty() {
+        tokio::time::sleep(RELAY_REGISTER_RETRY_INTERVAL).await;
+        let mut still_failed = Vec::new();
+        for relay_url in failed_relays {
+            match register_on_custom_relay(&relay_url, secret.clone()).await {
+                Ok(endpoint) => {
+                    info!("Server registered on custom relay {} after retry", relay_url);
+                    if late_endpoint_tx.send(endpoint).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // Startup already warned once per relay; keep the periodic
+                    // retries quiet to avoid a log line every interval.
+                    log::debug!(
+                        "Custom relay {} still unreachable: {:#} (next attempt in {}s)",
+                        relay_url,
+                        e,
+                        RELAY_REGISTER_RETRY_INTERVAL.as_secs()
+                    );
+                    still_failed.push(relay_url);
+                }
+            }
+        }
+        failed_relays = still_failed;
+    }
+}
+
 /// Create a client endpoint.
 /// If a secret key is provided, the client will use a persistent identity for authentication.
 pub async fn create_client_endpoint(
-    relay_urls: &[String],
-    relay_only: bool,
+    relay_config: &RelayConfig,
     secret_key: Option<&SecretKey>,
 ) -> Result<Endpoint> {
-    let relay_mode = parse_relay_mode(relay_urls)?;
-    let using_custom_relay = !matches!(relay_mode, RelayMode::Default);
-    print_relay_status(relay_urls, relay_only, using_custom_relay);
+    print_relay_status(relay_config);
 
-    let mut builder = create_endpoint_builder(relay_mode, relay_only)?;
+    let mut builder = create_endpoint_builder(relay_config)?;
 
     // Set the secret key for persistent identity (used for authentication)
     if let Some(secret) = secret_key {

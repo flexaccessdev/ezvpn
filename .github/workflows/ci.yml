@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  # The host clippy compiles the Apple-gated modules (src/ffi.rs,
+  # src/tunnel/ios.rs), which Linux CI never type-checks.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  # Verify-only mirror of the release workflow's build-apple job: build the
+  # iOS + macOS xcframework slices (debug profile for speed). Nothing is
+  # published; this exists to catch FFI breakage before a release.
+  verify-apple-xcframework:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Apple xcframework + header (debug)
+        run: ./build-apple.sh debug
+
+  # The host clippy compiles the Windows-gated module (src/ffi_windows.rs).
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Verify-only mirror of the release workflow's build-windows-lib job: build
+  # ezvpn.dll + header (debug profile for speed). Nothing is published.
+  verify-windows-dll:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ezvpn.dll + header (debug)
+        shell: pwsh
+        run: ./build-windows.ps1 -Profile debug

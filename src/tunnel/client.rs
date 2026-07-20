@@ -37,7 +37,7 @@ use crate::tunnel::signaling::{
     MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse,
     parse_ip_packet_v2, read_message, write_message,
 };
-use crate::transport::endpoint::parse_relay_mode;
+use crate::transport::endpoint::RelayConfig;
 use bytes::{Bytes, BytesMut};
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -313,12 +313,12 @@ impl VpnClient {
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for the connection
-    /// * `relay_urls` - Optional relay URLs to use as connection hints. When peer
-    ///   discovery is disabled, relay URLs are required for the connection to succeed.
-    ///   iroh will attempt hole punching for direct P2P connections, falling back
-    ///   to relay transport if needed.
-    pub async fn connect(&self, endpoint: &Endpoint, relay_urls: &[String]) -> VpnResult<()> {
-        let endpoint_addr = self.resolve_server_addr(relay_urls)?;
+    /// * `relay_config` - Custom relays become dial hints (required for the
+    ///   connection to succeed, since custom relays disable peer discovery).
+    ///   iroh will attempt hole punching for direct P2P connections, falling
+    ///   back to relay transport if needed.
+    pub async fn connect(&self, endpoint: &Endpoint, relay_config: &RelayConfig) -> VpnResult<()> {
+        let endpoint_addr = self.resolve_server_addr(relay_config)?;
 
         // Client and server both build the identical fixed transport config
         // (see crate::transport), so nothing is negotiated or upgraded here.
@@ -420,7 +420,7 @@ impl VpnClient {
                 self.add_iroh_bypass_routes(
                     endpoint,
                     tun_device.name(),
-                    relay_urls,
+                    relay_config,
                     &server_info.server_addrs,
                 )
                 .await,
@@ -519,7 +519,7 @@ impl VpnClient {
         // has collected (intended bypasses), when a manager is running.
         let status_conn = connection.clone();
         let status_endpoint = endpoint.clone();
-        let status_relay_urls = relay_urls.to_vec();
+        let status_relay_config = relay_config.clone();
         let bypass_probe: Option<crate::control::BypassRoutesProbe> =
             bypass_collected.map(|collected| {
                 let probe: crate::control::BypassRoutesProbe = Arc::new(move || {
@@ -545,7 +545,7 @@ impl VpnClient {
                 crate::transport::paths::connection_snapshot(
                     &status_conn,
                     &status_endpoint,
-                    &status_relay_urls,
+                    &status_relay_config,
                 )
             }),
             bypass_probe,
@@ -621,12 +621,13 @@ impl VpnClient {
         result
     }
 
-    /// Resolve the server's `EndpointAddr` with relay hints if available.
+    /// Resolve the server's `EndpointAddr`, with the custom relays (if any) as
+    /// dial hints.
     ///
-    /// When peer discovery is disabled, relay URLs are required for the
-    /// connection to succeed. iroh uses the relay for initial connection
-    /// routing while still attempting hole punching for direct P2P.
-    fn resolve_server_addr(&self, relay_urls: &[String]) -> VpnResult<EndpointAddr> {
+    /// When peer discovery is disabled (custom relays), the hints are required
+    /// for the connection to succeed. iroh uses the relay for initial
+    /// connection routing while still attempting hole punching for direct P2P.
+    fn resolve_server_addr(&self, relay_config: &RelayConfig) -> VpnResult<EndpointAddr> {
         // Parse server endpoint ID
         let server_id: EndpointId = self.config.server_node_id.parse().map_err(|e| {
             VpnError::config_with_source(
@@ -637,18 +638,14 @@ impl VpnClient {
 
         log::info!("Connecting to VPN server: {}", server_id);
 
-        if relay_urls.is_empty() {
-            return Ok(EndpointAddr::new(server_id));
-        }
-
         let mut addr = EndpointAddr::new(server_id);
-        for relay_url_str in relay_urls {
-            let relay_url: RelayUrl = relay_url_str.parse().map_err(|e| {
-                VpnError::config_with_source(format!("Invalid relay URL: {}", relay_url_str), e)
-            })?;
-            addr = addr.with_relay_url(relay_url);
+        let relay_urls = relay_config.custom_urls();
+        for relay_url in relay_urls {
+            addr = addr.with_relay_url(relay_url.clone());
         }
-        log::info!("Using {} relay hint(s) for connection", relay_urls.len());
+        if !relay_urls.is_empty() {
+            log::info!("Using {} relay hint(s) for connection", relay_urls.len());
+        }
         Ok(addr)
     }
 
@@ -722,7 +719,7 @@ impl VpnClient {
         &self,
         endpoint: &Endpoint,
         vpn_tun_name: &str,
-        relay_urls: &[String],
+        relay_config: &RelayConfig,
         initial_server_addrs: &[IpAddr],
     ) -> BypassRouteHandles {
         // Bypass routes are only needed for iroh peer IPs that a VPN route would
@@ -766,7 +763,7 @@ impl VpnClient {
         // is pinned at onboarding, instead of waiting for the first periodic
         // data-path publication. `update` filters to addresses actually covered by
         // a VPN route, so publishing extra (e.g. private/LAN) addresses is safe.
-        let mut bootstrap_ips = collect_relay_ips(endpoint, relay_urls).await;
+        let mut bootstrap_ips = collect_relay_ips(endpoint, relay_config).await;
         bootstrap_ips.extend(initial_server_addrs.iter().copied());
         if !bootstrap_ips.is_empty() {
             manager.update(bootstrap_ips).await;
@@ -1344,8 +1341,8 @@ impl VpnClient {
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for connections
-    /// * `relay_urls` - Optional relay URLs to use as connection hints. When peer
-    ///   discovery is disabled, relay URLs are required for the connection to succeed.
+    /// * `relay_config` - Custom relays become dial hints (required for the
+    ///   connection to succeed, since custom relays disable peer discovery).
     /// * `max_attempts` - Maximum total connection attempts (None = unlimited).
     ///   This counts all attempts including the initial one:
     ///   - `Some(1)` = try once, exit on any failure (no retries)
@@ -1362,7 +1359,7 @@ impl VpnClient {
     pub async fn run_with_reconnect(
         &self,
         endpoint: &Endpoint,
-        relay_urls: &[String],
+        relay_config: &RelayConfig,
         max_attempts: Option<NonZeroU32>,
     ) -> VpnResult<()> {
         let mut attempt = 0u32;
@@ -1376,7 +1373,7 @@ impl VpnClient {
                 log::info!("VPN reconnection attempt #{}", attempt);
             }
 
-            match self.connect(endpoint, relay_urls).await {
+            match self.connect(endpoint, relay_config).await {
                 Ok(()) => {
                     // Graceful exit (shouldn't normally happen)
                     log::info!("VPN connection ended gracefully");
@@ -1748,15 +1745,12 @@ async fn run_bypass_route_manager(
 /// would capture. Unresolvable relays are skipped; the connection still rides
 /// whichever relay it selects (its IP is covered when resolvable here, and the
 /// server's published address set covers the direct underlay path).
-pub(crate) async fn collect_relay_ips(endpoint: &Endpoint, relay_urls: &[String]) -> HashSet<IpAddr> {
+pub(crate) async fn collect_relay_ips(
+    endpoint: &Endpoint,
+    relay_config: &RelayConfig,
+) -> HashSet<IpAddr> {
     let mut ips = HashSet::new();
-    let relay_map = match parse_relay_mode(relay_urls) {
-        Ok(mode) => mode.relay_map(),
-        Err(e) => {
-            log::warn!("Could not determine relay set for eager bypass: {}", e);
-            return ips;
-        }
-    };
+    let relay_map = relay_config.relay_mode().relay_map();
     // Resolve relays concurrently so startup isn't serialized across the whole
     // (default) relay map.
     let resolved = futures::future::join_all(relay_map.urls::<Vec<_>>().into_iter().map(|url| async move {

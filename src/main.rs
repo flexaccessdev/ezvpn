@@ -24,9 +24,7 @@ use ezvpn::config::file_config::{
     load_vpn_client_config, load_vpn_server_config,
 };
 use ezvpn::runtime::LockRole;
-use ezvpn::transport::endpoint::{
-    RELAY_CONNECT_TIMEOUT, create_client_endpoint, create_server_endpoint, load_secret,
-};
+use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoints, load_secret};
 // Runtime config types (different from the TOML config types in config::file_config)
 use ezvpn::config::{VpnClientConfig, VpnServerConfig};
 use ezvpn::tunnel::{VpnClient, VpnServer};
@@ -905,74 +903,14 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // setup_tun() after the endpoint is up.
     ezvpn::net::device::ensure_tun_permission()?;
 
-    // Create iroh endpoint(s) for signaling.
-    // relay_only is hardcoded to false: VPN traffic is high-bandwidth and latency-sensitive,
-    // making relay-only impractical. Direct P2P is strongly preferred; relay is only used
-    // as automatic fallback when direct connection fails.
-    // iroh selects one home relay per endpoint. A custom-relay server therefore
-    // needs an endpoint on each relay so the same server identity is reachable
-    // regardless of which configured relay a client can access.
-    //
-    // Each registration attempt is bounded by RELAY_CONNECT_TIMEOUT, so a dead
-    // relay can never stall startup. Startup fails only when every configured
-    // relay is unreachable; relays that fail while at least one succeeds are
-    // retried in the background and folded into the running server once they
-    // come back (late_endpoint_tx -> VpnServer::run).
-    let (late_endpoint_tx, late_endpoint_rx) = tokio::sync::mpsc::channel(1);
-    let endpoints = if resolved.relay_urls.is_empty() {
-        vec![create_server_endpoint(
-            &[],
-            false, // relay_only - direct P2P preferred for VPN performance
-            Some(secret_key),
-        )
-        .await
-        .context("Failed to create iroh endpoint")?]
-    } else {
-        let mut relay_urls = resolved.relay_urls.clone();
-        relay_urls.sort();
-        relay_urls.dedup();
-        let attempts = futures::future::join_all(relay_urls.into_iter().map(|relay_url| {
-            let secret_key = secret_key.clone();
-            async move {
-                let endpoint = register_on_custom_relay(&relay_url, secret_key).await;
-                (relay_url, endpoint)
-            }
-        }))
-        .await;
-        let mut endpoints = Vec::new();
-        let mut failed_relays = Vec::new();
-        for (relay_url, result) in attempts {
-            match result {
-                Ok(endpoint) => {
-                    log::info!("Server registered on custom relay {}", relay_url);
-                    endpoints.push(endpoint);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Could not register server on custom relay {}: {:#} \
-                         (will keep retrying in the background)",
-                        relay_url,
-                        e
-                    );
-                    failed_relays.push(relay_url);
-                }
-            }
-        }
-        if endpoints.is_empty() {
-            anyhow::bail!("Failed to register the VPN server on any configured custom relay");
-        }
-        if !failed_relays.is_empty() {
-            tokio::spawn(retry_failed_relay_registrations(
-                failed_relays,
-                secret_key.clone(),
-                late_endpoint_tx.clone(),
-            ));
-        }
-        endpoints
-    };
-    // The retry task (if any) holds its own sender clone; dropping ours lets
-    // the server see the channel as closed once no late relays remain.
-    drop(late_endpoint_tx);
+    // Create iroh endpoint(s) for signaling. Direct P2P is strongly preferred
+    // for VPN traffic; relays are only the automatic fallback when a direct
+    // connection fails. `create_server_endpoints` owns the default-vs-custom
+    // relay policy: one endpoint on the default relays, or one endpoint per
+    // custom relay with bounded startup attempts and background retry of
+    // relays that were down at startup (delivered via `late_endpoint_rx`).
+    let (endpoints, late_endpoint_rx) =
+        create_server_endpoints(&resolved.relay_config, secret_key).await?;
 
     let server_id = endpoints[0].id();
     log::info!("VPN Server Node ID: {}", server_id);
@@ -990,66 +928,6 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         .run(endpoints, late_endpoint_rx)
         .await
         .map_err(|e| anyhow::anyhow!("VPN server error: {}", e))
-}
-
-/// How long to wait between rounds of re-attempting registration on custom
-/// relays that were unreachable at startup.
-const RELAY_REGISTER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// One time-bounded registration attempt against a single custom relay.
-async fn register_on_custom_relay(
-    relay_url: &str,
-    secret_key: iroh::SecretKey,
-) -> Result<iroh::Endpoint> {
-    match tokio::time::timeout(
-        RELAY_CONNECT_TIMEOUT,
-        create_server_endpoint(&[relay_url.to_owned()], false, Some(secret_key)),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "relay registration timed out after {}s",
-            RELAY_CONNECT_TIMEOUT.as_secs()
-        )),
-    }
-}
-
-/// Keep re-attempting registration on custom relays that were unreachable at
-/// startup, handing each recovered endpoint to the running server through
-/// `late_endpoint_tx`. Exits once every relay has registered (closing the
-/// channel) or the server has shut down (send fails).
-async fn retry_failed_relay_registrations(
-    mut failed_relays: Vec<String>,
-    secret_key: iroh::SecretKey,
-    late_endpoint_tx: tokio::sync::mpsc::Sender<iroh::Endpoint>,
-) {
-    while !failed_relays.is_empty() {
-        tokio::time::sleep(RELAY_REGISTER_RETRY_INTERVAL).await;
-        let mut still_failed = Vec::new();
-        for relay_url in failed_relays {
-            match register_on_custom_relay(&relay_url, secret_key.clone()).await {
-                Ok(endpoint) => {
-                    log::info!("Server registered on custom relay {} after retry", relay_url);
-                    if late_endpoint_tx.send(endpoint).await.is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    // Startup already warned once per relay; keep the periodic
-                    // retries quiet to avoid a log line every interval.
-                    log::debug!(
-                        "Custom relay {} still unreachable: {:#} (next attempt in {}s)",
-                        relay_url,
-                        e,
-                        RELAY_REGISTER_RETRY_INTERVAL.as_secs()
-                    );
-                    still_failed.push(relay_url);
-                }
-            }
-        }
-        failed_relays = still_failed;
-    }
 }
 
 /// Run VPN client.
@@ -1107,17 +985,11 @@ async fn run_vpn_client(
         routes6: parsed_routes6,
     };
 
-    // Create iroh endpoint for signaling (ephemeral identity).
-    // relay_only is hardcoded to false: VPN traffic is high-bandwidth and latency-sensitive,
-    // making relay-only impractical. Direct P2P is strongly preferred; relay is only used
-    // as automatic fallback when direct connection fails.
-    let endpoint = create_client_endpoint(
-        &resolved.relay_urls,
-        false, // relay_only - direct P2P preferred for VPN performance
-        None, // No persistent secret key - ephemeral
-    )
-    .await
-    .context("Failed to create iroh endpoint")?;
+    // Create iroh endpoint for signaling (ephemeral identity - no persistent
+    // secret key).
+    let endpoint = create_client_endpoint(&resolved.relay_config, None)
+        .await
+        .context("Failed to create iroh endpoint")?;
 
     log::info!("VPN Client Node ID: {}", endpoint.id());
 
@@ -1152,7 +1024,7 @@ async fn run_vpn_client(
             client
                 .run_with_reconnect(
                     &endpoint,
-                    &resolved.relay_urls,
+                    &resolved.relay_config,
                     resolved.max_reconnect_attempts,
                 )
                 .await
@@ -1160,7 +1032,7 @@ async fn run_vpn_client(
         } else {
             log::info!("Auto-reconnect disabled, single connection attempt");
             client
-                .connect(&endpoint, &resolved.relay_urls)
+                .connect(&endpoint, &resolved.relay_config)
                 .await
                 .map_err(|e| anyhow::anyhow!("VPN connection error: {}", e))
         }

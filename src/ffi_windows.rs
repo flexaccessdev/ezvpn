@@ -29,16 +29,15 @@
 //!
 //! ## Config JSON (input to `ezvpn_start`)
 //!
-//! `auth_token`/`max_reconnect_attempts` may be null. `relay_urls`,
-//! `relay_only`, `routes`, `routes6`, `instance`, and `auto_reconnect` are all
-//! optional (with the defaults shown).
+//! `auth_token`/`max_reconnect_attempts` may be null. `relay_urls`, `routes`,
+//! `routes6`, `instance`, and `auto_reconnect` are all optional (with the
+//! defaults shown).
 //!
 //! ```json
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
 //!   "auth_token": "<47-char ezvpn token>",
 //!   "relay_urls": ["https://relay.example/"],
-//!   "relay_only": false,
 //!   "routes": ["10.0.0.0/8"],
 //!   "routes6": ["fd00::/8"],
 //!   "instance": "default",
@@ -71,7 +70,7 @@ use tokio::sync::Notify;
 
 use crate::config::VpnClientConfig;
 use crate::control::ClientStatusHandle;
-use crate::transport::endpoint::create_client_endpoint;
+use crate::transport::endpoint::{RelayConfig, create_client_endpoint};
 use crate::tunnel::client::VpnClient;
 
 /// Opaque handle owned by the .NET side. Created by [`ezvpn_start`], freed by
@@ -98,8 +97,6 @@ struct FfiWinConfig {
     auth_token: Option<String>,
     #[serde(default)]
     relay_urls: Vec<String>,
-    #[serde(default)]
-    relay_only: bool,
     #[serde(default)]
     routes: Vec<String>,
     #[serde(default)]
@@ -200,8 +197,7 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
     };
 
-    let relay_urls = cfg.relay_urls;
-    let relay_only = cfg.relay_only;
+    let relay_config = RelayConfig::from_urls(&cfg.relay_urls).map_err(|e| format!("{e:#}"))?;
     let instance = cfg.instance;
     let auto_reconnect = cfg.auto_reconnect;
     let max_attempts = cfg.max_reconnect_attempts.and_then(NonZeroU32::new);
@@ -230,8 +226,7 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
             };
 
             runtime.block_on(async move {
-                let endpoint = match create_client_endpoint(&relay_urls, relay_only, None).await
-                {
+                let endpoint = match create_client_endpoint(&relay_config, None).await {
                     Ok(e) => e,
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create iroh endpoint: {e}")));
@@ -258,7 +253,7 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
                 // RouteGuard / TUN `Drop`s (removing routes, closing wintun)
                 // before this block returns and the runtime is torn down.
                 tokio::select! {
-                    result = run_client(&client, &endpoint, &relay_urls, auto_reconnect, max_attempts) => {
+                    result = run_client(&client, &endpoint, &relay_config, auto_reconnect, max_attempts) => {
                         if let Err(e) = result {
                             log::error!("VPN client exited: {e}");
                         } else {
@@ -299,14 +294,14 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
 async fn run_client(
     client: &VpnClient,
     endpoint: &iroh::Endpoint,
-    relay_urls: &[String],
+    relay_config: &RelayConfig,
     auto_reconnect: bool,
     max_attempts: Option<NonZeroU32>,
 ) -> crate::error::VpnResult<()> {
     if auto_reconnect {
-        client.run_with_reconnect(endpoint, relay_urls, max_attempts).await
+        client.run_with_reconnect(endpoint, relay_config, max_attempts).await
     } else {
-        client.connect(endpoint, relay_urls).await
+        client.connect(endpoint, relay_config).await
     }
 }
 

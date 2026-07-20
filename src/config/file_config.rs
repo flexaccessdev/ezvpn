@@ -1,6 +1,7 @@
 //! TOML config-file support: file-level structs, loading, and resolution
 //! into the runtime configuration ([`crate::config`]).
 
+use crate::transport::endpoint::RelayConfig;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::num::NonZeroU32;
@@ -321,7 +322,7 @@ pub struct ResolvedVpnServerConfig {
     pub server_ip6: Option<String>,
     pub ip6_strategy: Ip6Strategy,
     pub secret_file: Option<PathBuf>,
-    pub relay_urls: Vec<String>,
+    pub relay_config: RelayConfig,
     pub auth_tokens: Vec<String>,
     pub auth_tokens_file: Option<PathBuf>,
 }
@@ -364,7 +365,7 @@ impl ResolvedVpnServerConfig {
             server_ip6: net.server_ip6.clone(),
             ip6_strategy: net.ip6_strategy,
             secret_file: iroh.secret_file.clone(),
-            relay_urls: iroh.relay_urls.clone().unwrap_or_default(),
+            relay_config: RelayConfig::from_urls(iroh.relay_urls.as_deref().unwrap_or_default())?,
             auth_tokens: auth.auth_tokens.clone().unwrap_or_default(),
             auth_tokens_file: auth.auth_tokens_file.clone(),
         })
@@ -378,7 +379,7 @@ pub struct ResolvedVpnClientConfig {
     pub auth_token_file: Option<PathBuf>,
     pub routes: Vec<String>,
     pub routes6: Vec<String>,
-    pub relay_urls: Vec<String>,
+    pub relay_config: RelayConfig,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -508,7 +509,7 @@ impl VpnClientConfigBuilder {
             auth_token_file: self.auth_token_file,
             routes,
             routes6,
-            relay_urls: self.relay_urls.unwrap_or_default(),
+            relay_config: RelayConfig::from_urls(self.relay_urls.as_deref().unwrap_or_default())?,
             auto_reconnect: self.auto_reconnect.unwrap_or(true),
             max_reconnect_attempts: self.max_reconnect_attempts,
         })
@@ -619,7 +620,11 @@ relay_urls = ["https://relay.example.com"]
             .apply_config(Some(&config))
             .build()
             .unwrap();
-        assert_eq!(resolved.relay_urls, ["https://relay.example.com"]);
+        assert_eq!(
+            resolved.relay_config,
+            RelayConfig::from_urls(&["https://relay.example.com".to_string()]).unwrap()
+        );
+        assert_eq!(resolved.relay_config.custom_urls().len(), 1);
     }
 
     /// A typo in a top-level key must be rejected, not silently ignored.

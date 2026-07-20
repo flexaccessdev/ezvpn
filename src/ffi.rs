@@ -21,14 +21,13 @@
 //!
 //! `routes`/`routes6` are the split-tunnel prefixes; they drive the
 //! overlapping-server-address bypass. `auth_token` may be null; `relay_urls`,
-//! `relay_only`, `routes`, and `routes6` are all optional.
+//! `routes`, and `routes6` are all optional.
 //!
 //! ```json
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
 //!   "auth_token": "<optional ezvpn auth token>",
 //!   "relay_urls": ["https://relay.example/"],
-//!   "relay_only": false,
 //!   "routes": ["10.0.0.0/8"],
 //!   "routes6": ["fd00::/8"]
 //! }
@@ -64,6 +63,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 use crate::error::VpnResult;
+use crate::transport::endpoint::RelayConfig;
 use crate::transport::paths::{ConnPathKind, connection_snapshot};
 use crate::tunnel::ios::{IosConfig, IosSession};
 
@@ -80,7 +80,7 @@ pub struct EzvpnHandle {
     connection: iroh::endpoint::Connection,
     /// Endpoint and configured custom relays retained for live health status.
     endpoint: iroh::Endpoint,
-    relay_urls: Vec<String>,
+    relay_config: RelayConfig,
 }
 
 #[derive(Deserialize)]
@@ -90,8 +90,6 @@ struct FfiConfig {
     auth_token: Option<String>,
     #[serde(default)]
     relay_urls: Vec<String>,
-    #[serde(default)]
-    relay_only: bool,
     /// IPv4 routed prefixes (CIDR strings); used for overlap-bypass computation.
     #[serde(default)]
     routes: Vec<String>,
@@ -182,12 +180,12 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
     let cfg: FfiConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
 
-    let relay_urls = cfg.relay_urls;
+    let relay_config =
+        RelayConfig::from_urls(&cfg.relay_urls).map_err(|e| format!("{e:#}"))?;
     let ios_config = IosConfig {
         server_node_id: cfg.server_node_id,
         auth_token: cfg.auth_token,
-        relay_urls: relay_urls.clone(),
-        relay_only: cfg.relay_only,
+        relay_config: relay_config.clone(),
         routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route")?,
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
     };
@@ -229,7 +227,7 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
             task: None,
             connection,
             endpoint,
-            relay_urls,
+            relay_config,
         },
         result_json,
     ))
@@ -273,7 +271,7 @@ pub unsafe extern "C" fn ezvpn_conn_path(
         return -1;
     }
     let handle = unsafe { &*handle };
-    let snapshot = connection_snapshot(&handle.connection, &handle.endpoint, &handle.relay_urls);
+    let snapshot = connection_snapshot(&handle.connection, &handle.endpoint, &handle.relay_config);
     let paths: Vec<_> = snapshot.paths
         .into_iter()
         .map(|p| {
