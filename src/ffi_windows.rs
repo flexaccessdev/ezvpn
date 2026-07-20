@@ -336,7 +336,24 @@ pub unsafe extern "C" fn ezvpn_status(
         return -1;
     }
     let handle = unsafe { &*handle };
-    let snapshot = handle.status.snapshot();
+    // The snapshot is async (custom-relay `/healthz` is checked on demand). The
+    // worker thread's runtime is busy driving the tunnel and can't be reused
+    // from here, so spin up a short-lived runtime to drive this one snapshot.
+    // `ezvpn_status` is called on demand from the .NET side, never on a runtime
+    // worker, so this does not block the tunnel.
+    let snapshot = {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let json = format!("{{\"error\":\"failed to build status runtime: {e}\"}}");
+                return if write_cstr(out_buf, out_len, &json) { 1 } else { 0 };
+            }
+        };
+        rt.block_on(handle.status.snapshot())
+    };
     let json = match serde_json::to_string(&snapshot) {
         Ok(j) => j,
         Err(e) => format!("{{\"error\":\"failed to serialize status: {e}\"}}"),

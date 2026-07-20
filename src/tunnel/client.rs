@@ -313,10 +313,11 @@ impl VpnClient {
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for the connection
-    /// * `relay_config` - Any configured custom relays are attached as dial
-    ///   hints; address lookup is always enabled, so the server's home relay is
-    ///   also resolvable by endpoint ID. iroh will attempt hole punching for
-    ///   direct P2P connections, falling back to relay transport if needed.
+    /// * `relay_config` - With the default relays, internet discovery is on and
+    ///   the server's home relay is resolvable by endpoint ID. With custom
+    ///   relays, discovery is off and the configured relays are attached as dial
+    ///   hints so the server is still reachable. In both modes iroh attempts hole
+    ///   punching for direct P2P, falling back to relay transport if needed.
     pub async fn connect(&self, endpoint: &Endpoint, relay_config: &RelayConfig) -> VpnResult<()> {
         let endpoint_addr = self.resolve_server_addr(relay_config)?;
 
@@ -518,7 +519,6 @@ impl VpnClient {
         // (direct/relay). A second probe reports the bypass addresses the manager
         // has collected (intended bypasses), when a manager is running.
         let status_conn = connection.clone();
-        let status_endpoint = endpoint.clone();
         let status_relay_config = relay_config.clone();
         let bypass_probe: Option<crate::control::BypassRoutesProbe> =
             bypass_collected.map(|collected| {
@@ -542,11 +542,11 @@ impl VpnClient {
                 routes6: active_routes6,
             },
             Arc::new(move || {
-                crate::transport::paths::connection_snapshot(
-                    &status_conn,
-                    &status_endpoint,
-                    &status_relay_config,
-                )
+                let conn = status_conn.clone();
+                let relay_config = status_relay_config.clone();
+                Box::pin(async move {
+                    crate::transport::paths::connection_snapshot(&conn, &relay_config).await
+                })
             }),
             bypass_probe,
         );
@@ -624,11 +624,13 @@ impl VpnClient {
     /// Resolve the server's `EndpointAddr`, with the custom relays (if any) as
     /// dial hints.
     ///
-    /// Address lookup is always enabled, so the server's home relay is
-    /// resolvable from its published record by endpoint ID. The hints are an
-    /// optimization: they let iroh start relay routing immediately instead of
-    /// waiting on the lookup, while it still attempts hole punching for direct
-    /// P2P.
+    /// The hints' role depends on the relay mode. With the **default** relays,
+    /// internet discovery is on and the server's home relay is resolvable from
+    /// its published record by endpoint ID (there are no custom hints to add).
+    /// With **custom** relays, internet discovery is disabled, so these hints are
+    /// how the client reaches the server at all: iroh dials every configured
+    /// relay and the handshake succeeds via whichever one the server is homed on,
+    /// while it still attempts hole punching for direct P2P.
     fn resolve_server_addr(&self, relay_config: &RelayConfig) -> VpnResult<EndpointAddr> {
         // Parse server endpoint ID
         let server_id: EndpointId = self.config.server_node_id.parse().map_err(|e| {
@@ -1343,8 +1345,8 @@ impl VpnClient {
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for connections
-    /// * `relay_config` - Any configured custom relays are attached as dial
-    ///   hints; address lookup is always enabled (see [`Self::connect`]).
+    /// * `relay_config` - Selects the relay map and whether internet discovery
+    ///   is used; custom relays are attached as dial hints (see [`Self::connect`]).
     /// * `max_attempts` - Maximum total connection attempts (None = unlimited).
     ///   This counts all attempts including the initial one:
     ///   - `Some(1)` = try once, exit on any failure (no retries)

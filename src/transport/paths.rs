@@ -5,11 +5,16 @@
 
 use crate::transport::endpoint::RelayConfig;
 use futures::StreamExt;
-use iroh::{Endpoint, TransportAddr};
+use futures::future::join_all;
+use iroh::TransportAddr;
 use iroh::endpoint::{Connection, PathList};
-use n0_watcher::Watcher as _;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::task::JoinHandle;
+
+/// Per-request timeout for the custom-relay `/healthz` check. Kept short so the
+/// on-demand status call stays responsive even when a relay is unreachable.
+const HEALTHZ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Format connection path info for display, showing *all* paths with RTT and
 /// marking which is selected.
@@ -66,12 +71,16 @@ pub struct ConnPath {
     pub selected: bool,
 }
 
-/// Latest health available for one configured custom relay.
+/// Health of one configured custom relay, from an on-demand `/healthz` probe.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomRelayStatus {
     pub url: String,
-    /// `Some(true)` when connected, `Some(false)` after a disconnected
-    /// observation, or `None` before iroh has status for this relay.
+    /// `Some(true)` when the relay's `/healthz` returned a 2xx, `Some(false)`
+    /// when it failed (unreachable, timed out, or a non-2xx response), or `None`
+    /// if the check could not be run at all (e.g. the HTTP client failed to
+    /// build). Note this probes the relay's plain HTTP health endpoint, which is
+    /// unauthenticated — it confirms the relay is up, not that the auth token is
+    /// accepted (the startup per-relay `online()` probe validates the token).
     pub working: Option<bool>,
     pub error: Option<String>,
 }
@@ -117,32 +126,95 @@ fn connection_paths_from(paths: &PathList<'_>) -> Vec<ConnPath> {
         .collect()
 }
 
-/// Snapshot the connection paths and configured custom-relay health together.
-/// `home_relay_status` is iroh's status API; the short-lived watcher is read
-/// once and immediately discarded rather than being stored or polled.
-pub fn connection_snapshot(
+/// Snapshot the connection paths and probe configured custom-relay health.
+///
+/// The path snapshot is synchronous; the relay health is an on-demand `/healthz`
+/// probe (async, all relays in parallel). This is only invoked when a status UI
+/// asks for it (the iOS/Windows connection-path sheet, `ezvpn client status`),
+/// so the HTTP checks never run on the tunnel's hot path.
+pub async fn connection_snapshot(
     conn: &Connection,
-    endpoint: &Endpoint,
     relay_config: &RelayConfig,
 ) -> ConnectionSnapshot {
     let paths = conn.paths();
-    let observed = endpoint.home_relay_status().get();
-    let custom_relays = relay_config
-        .custom_urls()
-        .iter()
-        .map(|configured| {
-            let status = observed.iter().find(|status| status.url() == configured);
-            CustomRelayStatus {
-                url: configured.to_string(),
-                working: status.map(|status| status.is_connected()),
-                error: status.and_then(|status| status.last_error().map(ToString::to_string)),
-            }
-        })
-        .collect();
+    let description = format_connection_paths(&paths);
+    let path_list = connection_paths_from(&paths);
+    let custom_relays = probe_custom_relay_health(relay_config).await;
     ConnectionSnapshot {
-        description: format_connection_paths(&paths),
-        paths: connection_paths_from(&paths),
+        description,
+        paths: path_list,
         custom_relays,
+    }
+}
+
+/// Install a process-wide ring crypto provider for `reqwest` (built with
+/// `rustls-no-provider`, which resolves the provider via
+/// [`rustls::crypto::CryptoProvider::get_default`]). Idempotent and safe to call
+/// from any thread; a competing install by another component is fine.
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Probe the `/healthz` endpoint of every configured custom relay in parallel.
+/// Empty for the default relays (nothing custom to check).
+pub async fn probe_custom_relay_health(relay_config: &RelayConfig) -> Vec<CustomRelayStatus> {
+    let urls = relay_config.custom_urls();
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    ensure_crypto_provider();
+    let client = match reqwest::Client::builder().timeout(HEALTHZ_TIMEOUT).build() {
+        Ok(client) => client,
+        Err(e) => {
+            let err = format!("failed to build health-check client: {e}");
+            return urls
+                .iter()
+                .map(|url| CustomRelayStatus {
+                    url: url.to_string(),
+                    working: None,
+                    error: Some(err.clone()),
+                })
+                .collect();
+        }
+    };
+    join_all(urls.iter().map(|url| probe_relay_healthz(&client, url))).await
+}
+
+/// Probe one relay's `/healthz`. `working` is `Some(true)` on a 2xx response,
+/// `Some(false)` otherwise (unreachable, timeout, or non-2xx).
+async fn probe_relay_healthz(client: &reqwest::Client, url: &iroh::RelayUrl) -> CustomRelayStatus {
+    // `RelayUrl` derefs to `url::Url`; join an absolute path so a missing/extra
+    // trailing slash on the configured URL does not matter.
+    let healthz = match url.join("/healthz") {
+        Ok(healthz) => healthz,
+        Err(e) => {
+            return CustomRelayStatus {
+                url: url.to_string(),
+                working: Some(false),
+                error: Some(format!("invalid relay URL: {e}")),
+            };
+        }
+    };
+    match client.get(healthz).send().await {
+        Ok(resp) if resp.status().is_success() => CustomRelayStatus {
+            url: url.to_string(),
+            working: Some(true),
+            error: None,
+        },
+        Ok(resp) => CustomRelayStatus {
+            url: url.to_string(),
+            working: Some(false),
+            error: Some(format!("/healthz returned HTTP {}", resp.status())),
+        },
+        Err(e) => CustomRelayStatus {
+            url: url.to_string(),
+            working: Some(false),
+            error: Some(e.to_string()),
+        },
     }
 }
 

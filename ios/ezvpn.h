@@ -84,8 +84,15 @@ int ezvpn_run(EzvpnHandle *handle, int tun_fd);
  * A point-in-time snapshot of how the client currently reaches the server,
  * showing ALL discovered paths (not just the selected one). kind is "direct",
  * "relay", or "other" (forward-compatible catch-all); selected marks the path
- * iroh routes over right now. The array is EMPTY while the connection is down,
- * so only offer this while the tunnel is up.
+ * iroh routes over right now. The paths array is EMPTY while the connection is
+ * down, so only offer this while the tunnel is up.
+ *
+ * custom_relays reports each configured custom relay's health from an on-demand
+ * GET of its /healthz endpoint (checked in parallel, only when this snapshot is
+ * requested). working is true on a 2xx, false when unreachable/timed-out/non-2xx,
+ * and null if the check could not run; error carries the failure detail. The
+ * array is empty when the default relays are used. /healthz is unauthenticated:
+ * it confirms the relay is up, not that a relay_auth_token is accepted.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the
  * JSON is truncated; retry larger), and -1 for a NULL handle. out_buf is always

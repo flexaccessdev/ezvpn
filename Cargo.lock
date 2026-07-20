@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "ezvpn"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "anyhow",
  "base64",
@@ -986,6 +986,7 @@ dependencies = [
  "noq-proto",
  "rand 0.9.4",
  "rand_chacha",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

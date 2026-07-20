@@ -4,6 +4,7 @@ use crate::transport::build_quic_transport_config;
 use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use futures::future::join_all;
 use iroh::{
     Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
@@ -18,11 +19,14 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Relay configuration, resolved once from the raw config strings.
 ///
-/// This is the single source of the default-vs-custom distinction. Both modes
-/// enable iroh address lookup (pkarr publishing + DNS resolution of the peer's
-/// home relay — see <https://docs.iroh.computer/concepts/address-lookup>); the
-/// only difference between them is which relay map iroh uses. See "Relays and
-/// Address Lookup" in `docs/Architecture.md`.
+/// This is the single source of the default-vs-custom distinction. It selects
+/// both which relay map iroh uses **and** whether iroh internet discovery is
+/// enabled: [`Default`](Self::Default) uses the n0 relays with the full lookup
+/// stack (pkarr publishing + DNS resolution of the peer's home relay — see
+/// <https://docs.iroh.computer/concepts/address-lookup>), while
+/// [`Custom`](Self::Custom) uses the configured relays with internet discovery
+/// disabled (clients reach the server through relay hints instead). See "Relays
+/// and Address Lookup" in `docs/Architecture.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RelayConfig {
     /// iroh's default relay map, with n0 address lookup.
@@ -208,41 +212,141 @@ fn warn_if_socket_buffer_capped() {
 
 /// Create a base endpoint builder with common configuration.
 ///
-/// iroh address lookup (pkarr publishing + DNS-based lookup of
+/// iroh internet discovery (pkarr publishing + DNS-based lookup of
 /// `_iroh.<endpoint-id>.dns.iroh.link`, see
-/// <https://docs.iroh.computer/concepts/address-lookup>) is enabled uniformly,
-/// for both the default relays and custom relay sets. The relay map differs
-/// between the two, but in both cases the server publishes its current home
-/// relay and a client resolves it by endpoint ID.
+/// <https://docs.iroh.computer/concepts/address-lookup>) is **not** configurable;
+/// it follows the relay mode:
+///
+/// - [`RelayConfig::Default`]: the full n0 lookup stack is enabled — the server
+///   publishes its current home relay and a client resolves it by endpoint ID.
+/// - [`RelayConfig::Custom`]: internet discovery is always disabled — nothing is
+///   published to or resolved from n0's public infrastructure. The client reaches
+///   the server through the configured relay hints it attaches to the server's
+///   `EndpointAddr` (see `VpnClient::resolve_server_addr`): iroh sends QUIC
+///   Initials to every configured relay, so the handshake succeeds via whichever
+///   relay the server is homed on.
 pub fn create_endpoint_builder(relay_config: &RelayConfig) -> Result<EndpointBuilder> {
     warn_if_socket_buffer_capped();
     let transport_config = build_quic_transport_config()?;
     // iroh 1.0 requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
-    let builder = Endpoint::builder(presets::Empty)
+    let mut builder = Endpoint::builder(presets::Empty)
         .relay_mode(relay_config.relay_mode())
         .transport_config(transport_config)
-        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        // n0 address lookup (pkarr publishing + DNS-based lookup), always on.
-        .address_lookup(PkarrPublisher::n0_dns())
-        .address_lookup(DnsAddressLookup::n0_dns());
+        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
+
+    if relay_config.is_custom() {
+        info!("Internet discovery disabled (custom relays configured)");
+    } else {
+        // Default n0 relays: enable the full lookup stack (pkarr publishing +
+        // DNS-based lookup).
+        builder = builder
+            .address_lookup(PkarrPublisher::n0_dns())
+            .address_lookup(DnsAddressLookup::n0_dns());
+    }
 
     Ok(builder)
+}
+
+/// Build a minimal, relay-only endpoint for probing a single relay.
+///
+/// It uses an ephemeral identity (no persistent secret, no address publishing)
+/// and clears IP transports so [`Endpoint::online`] reflects *pure relay*
+/// connectivity — a holepunched direct path can never mask a dead or
+/// auth-rejecting relay. This is the "relay only" builder reintroduced for
+/// internal probe use. The auth token, when set, rides the WebSocket upgrade
+/// exactly as it does for the real endpoint, so the probe validates the token too.
+fn probe_endpoint_builder(
+    relay_url: &RelayUrl,
+    auth_token: Option<&str>,
+) -> Result<EndpointBuilder> {
+    let transport_config = build_quic_transport_config()?;
+    let map = RelayMap::from_iter([relay_url.clone()]);
+    let map = match auth_token {
+        Some(token) => map.with_auth_token(token.to_string()),
+        None => map,
+    };
+    let builder = Endpoint::builder(presets::Empty)
+        .relay_mode(RelayMode::Custom(map))
+        .transport_config(transport_config)
+        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        // Relay-only: drop direct IP transports so `online()` is a pure relay
+        // reachability signal, independent of holepunching.
+        .clear_ip_transports();
+    Ok(builder)
+}
+
+/// Probe a single custom relay by binding a relay-only endpoint and waiting for
+/// it to come online, bounded by [`RELAY_CONNECT_TIMEOUT`]. `Ok(())` means the
+/// relay connected (and accepted the auth token, if any); otherwise the error
+/// describes the failure. The probe endpoint is always closed before returning.
+async fn probe_relay(relay_url: &RelayUrl, auth_token: Option<&str>) -> Result<()> {
+    let endpoint = probe_endpoint_builder(relay_url, auth_token)?
+        .bind()
+        .await
+        .with_context(|| format!("Failed to bind probe endpoint for relay {relay_url}"))?;
+    let outcome = tokio::time::timeout(RELAY_CONNECT_TIMEOUT, endpoint.online()).await;
+    endpoint.close().await;
+    outcome.map_err(|_| {
+        anyhow::anyhow!(
+            "did not come online within {}s (unreachable or rejected the auth token)",
+            RELAY_CONNECT_TIMEOUT.as_secs()
+        )
+    })
+}
+
+/// Probe every configured custom relay individually (in parallel) and fail if
+/// **any** relay is unreachable.
+///
+/// This is stricter than a single endpoint-wide `online()` wait, which only
+/// proved that *one* relay in the set (the home relay) connected and so reported
+/// a misleading all-clear when a backup relay was down. Default relays are not
+/// probed (returns `Ok(())` immediately).
+async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
+    let RelayConfig::Custom { urls, auth_token } = relay_config else {
+        return Ok(());
+    };
+    let token = auth_token.as_deref();
+    info!("Probing {} custom relay(s) for reachability...", urls.len());
+    let results = join_all(
+        urls.iter()
+            .map(|url| async move { (url, probe_relay(url, token).await) }),
+    )
+    .await;
+    let failures: Vec<String> = results
+        .into_iter()
+        .filter_map(|(url, res)| res.err().map(|e| format!("{url}: {e}")))
+        .collect();
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} of {} custom relay(s) failed to come online:\n  {}",
+            failures.len(),
+            urls.len(),
+            failures.join("\n  ")
+        );
+    }
+    Ok(())
 }
 
 /// Create the VPN server's iroh endpoint with an optional persistent identity,
 /// waiting for it to come online (bounded by [`RELAY_CONNECT_TIMEOUT`]).
 ///
-/// A single endpoint serves both the default and custom relay modes: address
-/// lookup is always enabled, so the server publishes its current home relay and
-/// clients resolve it by endpoint ID (iroh's relay failover re-homes and
-/// republishes on its own).
+/// A single endpoint serves both relay modes. With the default relays internet
+/// discovery is on, so the server publishes its current home relay and clients
+/// resolve it by endpoint ID (iroh's relay failover re-homes and republishes on
+/// its own). With custom relays discovery is off, so clients reach the server
+/// through the relay hints they attach to its `EndpointAddr` (see
+/// [`create_endpoint_builder`]).
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
     secret: Option<SecretKey>,
 ) -> Result<Endpoint> {
     print_relay_status(relay_config);
+
+    // Validate each custom relay individually (fail if any is unreachable); a
+    // no-op for the default relays.
+    probe_custom_relays(relay_config).await?;
 
     let mut builder = create_endpoint_builder(relay_config)?.alpns(vec![VPN_ALPN.to_vec()]);
 
@@ -278,6 +382,10 @@ pub async fn create_client_endpoint(
     secret_key: Option<&SecretKey>,
 ) -> Result<Endpoint> {
     print_relay_status(relay_config);
+
+    // Validate each custom relay individually (fail if any is unreachable); a
+    // no-op for the default relays.
+    probe_custom_relays(relay_config).await?;
 
     let mut builder = create_endpoint_builder(relay_config)?;
 

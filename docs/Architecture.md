@@ -198,11 +198,13 @@ The 64-bit ID space provides a ~2^32 birthday bound for collisions, which is suf
 
 ### Relays and Address Lookup (Default vs Custom)
 
-How a client finds the server is uniform across relay modes. The default-vs-
-custom distinction is resolved once, at config time, into the `RelayConfig`
-enum (`src/transport/endpoint.rs`) — `Default` vs `Custom` — but the *only*
-thing it changes is which relay map iroh uses. Address lookup is always on, so
-a single endpoint per side serves both modes.
+How a client finds the server depends on the relay mode. The default-vs-custom
+distinction is resolved once, at config time, into the `RelayConfig` enum
+(`src/transport/endpoint.rs`) — `Default` vs `Custom` — and it selects **both**
+which relay map iroh uses **and** whether iroh internet discovery (n0 pkarr
+publish + DNS lookup) is enabled. Discovery is not independently configurable; it
+strictly follows the relay mode: on for the default relays, off for custom
+relays.
 
 **Background: iroh address lookup.** Dialing an iroh endpoint by `EndpointId`
 alone works because of [address
@@ -218,27 +220,30 @@ addresses) and publishes it to n0's `iroh-dns-server`; a dialer resolves
    connected where and do not forward to each other. Traffic sent to a relay
    the peer is not connected to goes nowhere.
 
-ezvpn enables the full lookup stack (`PkarrPublisher` + `DnsAddressLookup`, see
-`create_endpoint_builder`) **regardless of relay mode**: the server publishes
-its current home relay, the client resolves it, and iroh's relay failover works
-— if the server's home relay dies, it re-homes to another relay from the
-configured map and republishes; dialers find the new record. One endpoint per
-side, no extra machinery. This is true whether the map is n0's default set or a
-custom set: with custom relays the home relay is simply one of the configured
-URLs, but the pkarr record is still published to and resolved from n0's
-`dns.iroh.link`.
+**Default relays.** ezvpn enables the full lookup stack (`PkarrPublisher` +
+`DnsAddressLookup`, see `create_endpoint_builder`): the server publishes its
+current home relay, the client resolves it by endpoint ID, and iroh's relay
+failover works — if the server's home relay dies, it re-homes to another relay
+from the default map and republishes; dialers find the new record. The client
+has no relay hints to add, so findability relies entirely on n0's public lookup
+(`dns.iroh.link`).
 
-The client additionally attaches every configured custom relay URL to the
-server's `EndpointAddr` as transport-address hints (see
-`VpnClient::resolve_server_addr`). This is only an optimization — the same
-information an iroh *ticket* would carry — letting iroh begin relay routing
-immediately instead of waiting on the DNS lookup. Connectivity does not depend
-on the hints; address lookup alone is sufficient.
+**Custom relays.** Internet discovery is **disabled** — nothing is published to
+or resolved from n0's `dns.iroh.link`. Instead the client attaches every
+configured relay URL to the server's `EndpointAddr` as transport-address hints
+(see `VpnClient::resolve_server_addr` and the iOS `connect` path). iroh sends
+QUIC Initials to every configured relay, so the handshake succeeds via whichever
+relay the server is currently homed on, and hole punching is still attempted for
+a direct P2P path. Here the hints are **required** for connectivity, not just an
+optimization: with discovery off there is no published record to fall back on.
+Relay failover still works as long as the client lists the relay the server
+re-homes onto — which is why a client configured with only a subset of the
+server's relays can reach it only while the server's home relay is in that
+subset. Configure both sides with the full relay list.
 
-The trade-off: custom relays let a deployment run its own relay infrastructure
-for the transport path, but findability still relies on n0's public lookup
-(`dns.iroh.link`). Both modes therefore share the same single-endpoint,
-lookup-based rendezvous.
+This is the same behavior as tunnel-rs (`Disable internet discovery
+automatically when custom relays are configured`): a deployment that runs custom
+relays contacts no public iroh infrastructure at all.
 
 **Optional shared relay token.** A private relay deployment can require a shared
 bearer token (iroh-relay's `IROH_RELAY_ACCESS_TOKEN` / `access.shared_token`).
@@ -248,11 +253,31 @@ variant and applied to every entry in the custom relay map
 <token>` header on each relay WebSocket upgrade. It is **strictly gated to custom
 relays**: `RelayConfig::from_urls_with_token` rejects a token supplied without
 `relay_urls`, so the default n0 relays never receive one and the feature is inert
-in default mode. The token is not separately validated — custom relay URLs are
-always parse-validated, and the existing `endpoint.online()` wait
-(`RELAY_CONNECT_TIMEOUT`) fails startup if the relay rejects the token or is
-unreachable. Server and clients that share a private relay must configure the
+in default mode. Server and clients that share a private relay must configure the
 same token.
+
+**Custom relay validation.** Custom relays are checked in two independent places:
+
+1. *Per-relay startup probe (`endpoint::probe_custom_relays`).* Before binding
+   the real endpoint, each configured relay is probed **individually** by binding
+   a throwaway, relay-only endpoint (`clear_ip_transports`, ephemeral identity)
+   for just that one URL and waiting on `endpoint.online()`, bounded by
+   `RELAY_CONNECT_TIMEOUT`. Startup **fails if any** relay does not come online.
+   This is stricter than — and replaces — the previous single endpoint-wide
+   `online()` wait, which only proved that *one* relay (the eventual home relay)
+   connected and so gave a misleading all-clear when a backup relay was down.
+   Because the auth token rides the relay WebSocket upgrade, this probe also
+   validates the token: a relay that rejects it never comes online and startup
+   fails.
+2. *On-demand `/healthz` status (`paths::probe_custom_relay_health`).* The
+   connection-status surface (`ezvpn client status`, the iOS/Windows
+   connection-path sheet via `ezvpn_conn_path`/`ezvpn_status`) reports each
+   relay's health by GETting its unauthenticated `/healthz` endpoint (all relays
+   in parallel, short timeout). This runs only when a status snapshot is
+   requested, never on the tunnel's hot path, and reflects a live per-relay
+   up/down rather than iroh's single home-relay view. Note `/healthz` is
+   unauthenticated, so it confirms the relay is *up*, not that the token is
+   accepted — token validation is the startup probe's job.
 
 ### Segmentation Offload (GSO/GRO)
 

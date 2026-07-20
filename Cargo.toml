@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.29"
+version = "0.0.30"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -31,6 +31,10 @@ n0-watcher = "1.0.0"
 log = "0.4"
 libc = "0.2"
 rand = "0.9"
+# Custom-relay `/healthz` checks (see `transport::paths`). `rustls-no-provider`
+# matches the exact reqwest feature iroh already enables, so this adds no new TLS
+# backend (no openssl / aws-lc); the process installs a ring crypto provider.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

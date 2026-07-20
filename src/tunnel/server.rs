@@ -876,16 +876,24 @@ impl VpnServer {
         let status_overlay_v6 = server.config.network6;
         let _status_listener =
             crate::control::spawn_status_listener(LockRole::Server, "default", move || {
-                let bypass_addrs =
-                    server_candidate_addrs(&status_endpoint, status_overlay_v4, status_overlay_v6)
-                        .iter()
-                        .map(|ip| ip.to_string())
-                        .collect();
-                status_server.status_snapshot(
-                    node_id.clone(),
-                    started_at.elapsed().as_secs(),
-                    bypass_addrs,
-                )
+                let status_endpoint = status_endpoint.clone();
+                let status_server = status_server.clone();
+                let node_id = node_id.clone();
+                async move {
+                    let bypass_addrs = server_candidate_addrs(
+                        &status_endpoint,
+                        status_overlay_v4,
+                        status_overlay_v6,
+                    )
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect();
+                    status_server.status_snapshot(
+                        node_id,
+                        started_at.elapsed().as_secs(),
+                        bypass_addrs,
+                    )
+                }
             });
         match &_status_listener {
             Ok(_) => log::info!("Status control socket ready (ezvpn server status)"),
