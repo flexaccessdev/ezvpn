@@ -75,7 +75,9 @@ EzvpnHandle *ezvpn_start(const char *config_json, char *out_buf, size_t out_len)
  *    "gateway":"10.0.0.1","assigned_ip6":"fd00::2","network6":"fd00::1/128",
  *    "gateway6":"fd00::1","mtu":1280,"gso_negotiated":false,
  *    "routes":["10.0.0.1/32"],"routes6":["fd00::1/128"],
- *    "connection":"Direct 1.2.3.4:52186 (rtt 1ms)","bypass_addrs":[]}
+ *    "connection":"Direct 1.2.3.4:52186 (rtt 1ms)",
+ *    "custom_relays":[{"url":"https://relay.example/","working":true,
+ *                      "error":null}],"bypass_addrs":[]}
  * `state` is "disconnected" while connecting/reconnecting and "connected" once
  * the handshake succeeds. Per-family fields are null when unassigned.
  *

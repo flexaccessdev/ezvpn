@@ -982,6 +982,7 @@ dependencies = [
  "libc",
  "log",
  "mock_instant",
+ "n0-watcher",
  "noq-proto",
  "rand 0.9.4",
  "rand_chacha",

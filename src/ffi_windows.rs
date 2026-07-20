@@ -52,7 +52,9 @@
 //! The serialized [`StatusSnapshot::Client`](crate::control::StatusSnapshot),
 //! e.g. `{"role":"client","instance":"default","state":"connected",
 //! "assigned_ip":"10.0.0.2","gateway":"10.0.0.1","routes":["10.0.0.1/32"],
-//! "connection":"Direct 1.2.3.4:52186 (rtt 1ms)", ...}`. `state` is
+//! "connection":"Direct 1.2.3.4:52186 (rtt 1ms)",
+//! "custom_relays":[{"url":"https://relay.example/","working":true,"error":null}],
+//! ...}`. `state` is
 //! `"disconnected"` while connecting/reconnecting and `"connected"` once the
 //! handshake succeeds.
 
@@ -244,6 +246,14 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
                         return;
                     }
                 };
+
+                if !relay_urls.is_empty() {
+                    let relay_endpoint = endpoint.clone();
+                    let status_relay_urls = relay_urls.clone();
+                    client.status_handle().set_custom_relays(Some(Arc::new(move || {
+                        crate::control::custom_relay_status(&relay_endpoint, &status_relay_urls)
+                    })));
+                }
 
                 // Hand the status handle back; setup is done from here on.
                 if setup_tx.send(Ok(client.status_handle())).is_err() {

@@ -30,6 +30,8 @@
 
 use crate::error::{VpnError, VpnResult};
 use crate::runtime::{LockRole, runtime_base_name, validate_instance_name};
+use iroh::Endpoint;
+use n0_watcher::Watcher as _;
 // `runtime_dir` only feeds the Unix-domain-socket path; the Windows control path
 // uses named pipes (`pipe_name`), so the import is Unix-only.
 #[cfg(unix)]
@@ -169,6 +171,9 @@ pub struct ClientStatus {
     pub routes6: Vec<String>,
     /// iroh connection path(s) to the server (direct/relay, addresses).
     pub connection: Option<String>,
+    /// Configured custom relay URLs and their latest endpoint health. Empty
+    /// when the default iroh relay map is in use.
+    pub custom_relays: Vec<CustomRelayStatus>,
     /// Underlay bypass addresses the client has *collected* this session (relays
     /// resolved at startup + the server's published candidates), filtered to
     /// those a VPN route would capture. Debugging aid: collected ≠ applied — an
@@ -179,6 +184,38 @@ pub struct ClientStatus {
     /// Daemon log-file path (set only when started with `--daemon`).
     #[serde(default)]
     pub log_file: Option<String>,
+}
+
+/// Latest health available for one configured custom relay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomRelayStatus {
+    /// Configured relay URL.
+    pub url: String,
+    /// `Some(true)` when connected, `Some(false)` after a failed/disconnected
+    /// observation, or `None` before iroh has status for this relay.
+    pub working: Option<bool>,
+    /// Most recent connection error for a non-working relay, when available.
+    pub error: Option<String>,
+}
+
+/// Combine the configured custom relay list with iroh's latest live health.
+/// Relays for which iroh has not published a status remain `working: null`.
+pub fn custom_relay_status(endpoint: &Endpoint, relay_urls: &[String]) -> Vec<CustomRelayStatus> {
+    let observed = endpoint.home_relay_status().get();
+    relay_urls
+        .iter()
+        .map(|configured| {
+            let parsed = configured.parse::<iroh::RelayUrl>().ok();
+            let status = parsed.as_ref().and_then(|url| {
+                observed.iter().find(|status| status.url() == url)
+            });
+            CustomRelayStatus {
+                url: configured.clone(),
+                working: status.map(|status| status.is_connected()),
+                error: status.and_then(|status| status.last_error().map(ToString::to_string)),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +263,7 @@ struct ClientStateInner {
     info: ClientConnectedInfo,
     connection_probe: Option<ConnectionProbe>,
     bypass_routes_probe: Option<BypassRoutesProbe>,
+    custom_relays_probe: Option<CustomRelaysProbe>,
     /// Daemon log-file path (set only when started with `--daemon`).
     log_file: Option<String>,
 }
@@ -236,6 +274,9 @@ struct ClientStateInner {
 pub struct ClientStatusHandle {
     inner: Arc<std::sync::RwLock<ClientStateInner>>,
 }
+
+/// Probe returning configured custom relays with their latest live health.
+pub type CustomRelaysProbe = Arc<dyn Fn() -> Vec<CustomRelayStatus> + Send + Sync>;
 
 impl ClientStatusHandle {
     /// Create a handle for a client with the given configured server node id
@@ -251,9 +292,18 @@ impl ClientStatusHandle {
                 info: ClientConnectedInfo::default(),
                 connection_probe: None,
                 bypass_routes_probe: None,
+                custom_relays_probe: None,
                 log_file: None,
             })),
         }
+    }
+
+
+    /// Publish configured custom relays and a probe for their live endpoint
+    /// health. The probe remains active across VPN reconnects.
+    pub fn set_custom_relays(&self, probe: Option<CustomRelaysProbe>) {
+        let mut guard = self.inner.write().expect("client status lock poisoned");
+        guard.custom_relays_probe = probe;
     }
 
     /// Record the daemon log-file path so it appears in `status` output.
@@ -309,6 +359,7 @@ impl ClientStatusHandle {
             info,
             probe,
             bypass_probe,
+            custom_relays_probe,
             log_file,
         ) = {
             let guard = self.inner.read().expect("client status lock poisoned");
@@ -321,6 +372,7 @@ impl ClientStatusHandle {
                 guard.info.clone(),
                 guard.connection_probe.clone(),
                 guard.bypass_routes_probe.clone(),
+                guard.custom_relays_probe.clone(),
                 guard.log_file.clone(),
             )
         };
@@ -356,6 +408,7 @@ impl ClientStatusHandle {
             routes: info.routes,
             routes6: info.routes6,
             connection: probe.map(|probe| probe()),
+            custom_relays: custom_relays_probe.map(|p| p()).unwrap_or_default(),
             bypass_addrs: bypass_probe.map(|p| p()).unwrap_or_default(),
             log_file,
         }
@@ -780,6 +833,17 @@ fn print_client_text(c: &ClientStatus) {
     if let Some(secs) = c.connected_since_secs {
         println!("Connected for:  {}", fmt_uptime(secs));
     }
+    for relay in &c.custom_relays {
+        let state = match relay.working {
+            Some(true) => "working",
+            Some(false) => "not working",
+            None => "status unavailable",
+        };
+        println!("Custom relay:   {} ({state})", relay.url);
+        if let Some(error) = &relay.error {
+            println!("                {error}");
+        }
+    }
     if c.state == "connected" {
         println!("Mode:           {}", c.mode);
         println!("VPN IPv4:       {}", fmt_opt(&c.assigned_ip));
@@ -890,6 +954,15 @@ mod tests {
         assert_eq!(snap.device_id, "00000000deadbeef");
         assert_eq!(snap.mode, "none");
         assert!(snap.mtu.is_none());
+        assert!(snap.custom_relays.is_empty());
+
+        handle.set_custom_relays(Some(Arc::new(|| {
+            vec![CustomRelayStatus {
+                url: "https://relay.example/".into(),
+                working: Some(true),
+                error: None,
+            }]
+        })));
 
         handle.set_connected(
             ClientConnectedInfo {
@@ -912,12 +985,14 @@ mod tests {
         assert_eq!(snap.gso_negotiated, Some(true));
         assert_eq!(snap.routes, vec!["0.0.0.0/0".to_string()]);
         assert_eq!(snap.connection.as_deref(), Some("relay https://relay.example"));
+        assert_eq!(snap.custom_relays[0].working, Some(true));
         assert_eq!(snap.bypass_addrs, vec!["198.51.100.7".to_string()]);
 
         handle.set_disconnected();
         let snap = handle.client_status();
         assert_eq!(snap.state, "disconnected");
         assert!(snap.connection.is_none());
+        assert_eq!(snap.custom_relays[0].url, "https://relay.example/");
         assert!(snap.bypass_addrs.is_empty());
     }
 

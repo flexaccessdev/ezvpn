@@ -27,6 +27,7 @@ futures = "0.3"
 ipnet = { version = "2", features = ["serde"] }
 iroh = "1.0.2"
 noq-proto = "1.0.1"
+n0-watcher = "1.0.0"
 log = "0.4"
 libc = "0.2"
 rand = "0.9"

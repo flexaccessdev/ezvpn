@@ -79,7 +79,8 @@ int ezvpn_run(EzvpnHandle *handle, int tun_fd);
  * `ezvpn client status`:
  *   {"paths":[
  *     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
- *     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}]}
+ *     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}],
+ *   "custom_relays":[{"url":"https://relay.example/","working":true,"error":null}]}
  * A point-in-time snapshot of how the client currently reaches the server,
  * showing ALL discovered paths (not just the selected one). kind is "direct",
  * "relay", or "other" (forward-compatible catch-all); selected marks the path
