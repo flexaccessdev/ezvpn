@@ -64,7 +64,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 use crate::error::VpnResult;
-use crate::transport::paths::{ConnPathKind, connection_paths};
+use crate::transport::paths::{ConnPathKind, connection_snapshot};
 use crate::tunnel::ios::{IosConfig, IosSession};
 
 /// Opaque handle owned by the Swift side. Created by [`ezvpn_connect`], freed by
@@ -78,6 +78,9 @@ pub struct EzvpnHandle {
     /// Clone of the live iroh connection, kept so [`ezvpn_conn_path`] can
     /// snapshot its paths on demand after `ezvpn_run` consumed the session.
     connection: iroh::endpoint::Connection,
+    /// Endpoint and configured custom relays retained for live health status.
+    endpoint: iroh::Endpoint,
+    relay_urls: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -179,10 +182,11 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
     let cfg: FfiConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
 
+    let relay_urls = cfg.relay_urls;
     let ios_config = IosConfig {
         server_node_id: cfg.server_node_id,
         auth_token: cfg.auth_token,
-        relay_urls: cfg.relay_urls,
+        relay_urls: relay_urls.clone(),
         relay_only: cfg.relay_only,
         routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route")?,
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
@@ -217,12 +221,15 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
     .to_string();
 
     let connection = session.connection();
+    let endpoint = session.endpoint();
     Ok((
         EzvpnHandle {
             runtime,
             session: Some(session),
             task: None,
             connection,
+            endpoint,
+            relay_urls,
         },
         result_json,
     ))
@@ -235,6 +242,8 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
 /// { "paths": [
 ///     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
 ///     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}
+/// ], "custom_relays": [
+///     {"url":"https://relay.example/","working":true,"error":null}
 /// ] }
 /// ```
 ///
@@ -264,7 +273,8 @@ pub unsafe extern "C" fn ezvpn_conn_path(
         return -1;
     }
     let handle = unsafe { &*handle };
-    let paths: Vec<_> = connection_paths(&handle.connection)
+    let snapshot = connection_snapshot(&handle.connection, &handle.endpoint, &handle.relay_urls);
+    let paths: Vec<_> = snapshot.paths
         .into_iter()
         .map(|p| {
             let kind = match p.kind {
@@ -275,7 +285,7 @@ pub unsafe extern "C" fn ezvpn_conn_path(
             serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
         })
         .collect();
-    let json = serde_json::json!({ "paths": paths }).to_string();
+    let json = serde_json::json!({ "paths": paths, "custom_relays": snapshot.custom_relays }).to_string();
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 

@@ -339,7 +339,8 @@ sudo ezvpn client stop --instance work
 or `signal_sent` (signaled, but still shutting down after 5 s).
 
 `ezvpn client status` prints connection state, assigned VPN IP/gateway, MTU,
-negotiated GSO, live iroh path (direct or relay), and the daemon log path when
+negotiated GSO, live iroh path (direct or relay), configured custom relay URLs
+with live health when available, and the daemon log path when
 applicable. Add `--json` for machine-readable output, or `--instance <NAME>` to
 query a specific instance.
 

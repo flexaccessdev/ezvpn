@@ -31,7 +31,7 @@ use crate::error::{VpnError, VpnResult};
 #[cfg(not(target_os = "ios"))]
 use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::{TcpGroTable, VirtioNetHdr, materialize_offload_into};
-use crate::transport::paths::{format_connection_paths, watch_connection_paths};
+use crate::transport::paths::watch_connection_paths;
 use crate::config::VPN_MTU;
 use crate::tunnel::signaling::{
     MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse,
@@ -518,6 +518,8 @@ impl VpnClient {
         // (direct/relay). A second probe reports the bypass addresses the manager
         // has collected (intended bypasses), when a manager is running.
         let status_conn = connection.clone();
+        let status_endpoint = endpoint.clone();
+        let status_relay_urls = relay_urls.to_vec();
         let bypass_probe: Option<crate::control::BypassRoutesProbe> =
             bypass_collected.map(|collected| {
                 let probe: crate::control::BypassRoutesProbe = Arc::new(move || {
@@ -539,7 +541,13 @@ impl VpnClient {
                 routes: active_routes,
                 routes6: active_routes6,
             },
-            Arc::new(move || format_connection_paths(&status_conn.paths())),
+            Arc::new(move || {
+                crate::transport::paths::connection_snapshot(
+                    &status_conn,
+                    &status_endpoint,
+                    &status_relay_urls,
+                )
+            }),
             bypass_probe,
         );
 

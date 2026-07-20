@@ -52,7 +52,9 @@
 //! The serialized [`StatusSnapshot::Client`](crate::control::StatusSnapshot),
 //! e.g. `{"role":"client","instance":"default","state":"connected",
 //! "assigned_ip":"10.0.0.2","gateway":"10.0.0.1","routes":["10.0.0.1/32"],
-//! "connection":"Direct 1.2.3.4:52186 (rtt 1ms)", ...}`. `state` is
+//! "connection":"Direct 1.2.3.4:52186 (rtt 1ms)",
+//! "custom_relays":[{"url":"https://relay.example/","working":true,"error":null}],
+//! ...}`. `state` is
 //! `"disconnected"` while connecting/reconnecting and `"connected"` once the
 //! handshake succeeds.
 

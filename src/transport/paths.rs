@@ -4,8 +4,10 @@
 //! again whenever the selected path changes (e.g., relay -> direct).
 
 use futures::StreamExt;
-use iroh::TransportAddr;
+use iroh::{Endpoint, TransportAddr};
 use iroh::endpoint::{Connection, PathList};
+use n0_watcher::Watcher as _;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
 /// Format connection path info for display, showing *all* paths with RTT and
@@ -63,13 +65,35 @@ pub struct ConnPath {
     pub selected: bool,
 }
 
+/// Latest health available for one configured custom relay.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomRelayStatus {
+    pub url: String,
+    /// `Some(true)` when connected, `Some(false)` after a disconnected
+    /// observation, or `None` before iroh has status for this relay.
+    pub working: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// One on-demand snapshot for connection-status UIs. Both path discovery and
+/// relay health are sampled only when this is requested; no watcher is retained.
+pub struct ConnectionSnapshot {
+    pub description: String,
+    pub paths: Vec<ConnPath>,
+    pub custom_relays: Vec<CustomRelayStatus>,
+}
+
 /// Snapshot the current path(s) of a live connection for a status UI, showing
 /// *all* paths (not just the selected one) so a direct path iroh has discovered
 /// but not selected is still visible. [`Connection::paths`] is itself a
 /// point-in-time snapshot, so this needs no background watcher. Empty while the
 /// connection is down.
 pub fn connection_paths(conn: &Connection) -> Vec<ConnPath> {
-    conn.paths()
+    connection_paths_from(&conn.paths())
+}
+
+fn connection_paths_from(paths: &PathList<'_>) -> Vec<ConnPath> {
+    paths
         .iter()
         .map(|path| {
             let rtt = path.rtt();
@@ -90,6 +114,37 @@ pub fn connection_paths(conn: &Connection) -> Vec<ConnPath> {
             }
         })
         .collect()
+}
+
+/// Snapshot the connection paths and configured custom-relay health together.
+/// `home_relay_status` is iroh's status API; the short-lived watcher is read
+/// once and immediately discarded rather than being stored or polled.
+pub fn connection_snapshot(
+    conn: &Connection,
+    endpoint: &Endpoint,
+    relay_urls: &[String],
+) -> ConnectionSnapshot {
+    let paths = conn.paths();
+    let observed = endpoint.home_relay_status().get();
+    let custom_relays = relay_urls
+        .iter()
+        .map(|configured| {
+            let parsed = configured.parse::<iroh::RelayUrl>().ok();
+            let status = parsed
+                .as_ref()
+                .and_then(|url| observed.iter().find(|status| status.url() == url));
+            CustomRelayStatus {
+                url: configured.clone(),
+                working: status.map(|status| status.is_connected()),
+                error: status.and_then(|status| status.last_error().map(ToString::to_string)),
+            }
+        })
+        .collect();
+    ConnectionSnapshot {
+        description: format_connection_paths(&paths),
+        paths: connection_paths_from(&paths),
+        custom_relays,
+    }
 }
 
 /// Key identifying the full path topology (all paths plus which is selected),

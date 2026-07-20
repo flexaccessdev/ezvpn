@@ -220,6 +220,11 @@ impl IosSession {
         self.connection.clone()
     }
 
+    /// A clone of the endpoint, used for live custom-relay health snapshots.
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
     /// The network parameters for the extension's tunnel settings, for whichever
     /// families the server assigned (IPv4, IPv6, or both).
     pub fn network_config(&self) -> VpnResult<IosNetworkConfig> {

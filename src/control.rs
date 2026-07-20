@@ -30,6 +30,7 @@
 
 use crate::error::{VpnError, VpnResult};
 use crate::runtime::{LockRole, runtime_base_name, validate_instance_name};
+use crate::transport::paths::{ConnectionSnapshot, CustomRelayStatus};
 // `runtime_dir` only feeds the Unix-domain-socket path; the Windows control path
 // uses named pipes (`pipe_name`), so the import is Unix-only.
 #[cfg(unix)]
@@ -169,6 +170,9 @@ pub struct ClientStatus {
     pub routes6: Vec<String>,
     /// iroh connection path(s) to the server (direct/relay, addresses).
     pub connection: Option<String>,
+    /// Configured custom relay URLs and their latest endpoint health. Empty
+    /// when the default iroh relay map is in use.
+    pub custom_relays: Vec<CustomRelayStatus>,
     /// Underlay bypass addresses the client has *collected* this session (relays
     /// resolved at startup + the server's published candidates), filtered to
     /// those a VPN route would capture. Debugging aid: collected ≠ applied — an
@@ -206,7 +210,7 @@ pub struct ClientConnectedInfo {
 ///
 /// Provided by the client (capturing its iroh `Connection`) so this module
 /// stays transport-agnostic. Called on demand when a snapshot is built.
-pub type ConnectionProbe = Arc<dyn Fn() -> String + Send + Sync>;
+pub type ConnectionProbe = Arc<dyn Fn() -> ConnectionSnapshot + Send + Sync>;
 
 /// Probe returning the bypass addresses the client has collected this session.
 ///
@@ -263,8 +267,8 @@ impl ClientStatusHandle {
     }
 
     /// Mark the client connected with the given session details. `connection`
-    /// is a probe that yields a live description of the iroh path(s); `bypass`
-    /// (when present) yields the bypass addresses collected this session.
+    /// is an on-demand probe for the live path and custom-relay health;
+    /// `bypass` yields the bypass addresses collected this session.
     pub fn set_connected(
         &self,
         info: ClientConnectedInfo,
@@ -334,6 +338,7 @@ impl ClientStatusHandle {
         } else {
             "ipv4"
         };
+        let connection = probe.map(|probe| probe());
         ClientStatus {
             instance,
             state: if connected {
@@ -355,7 +360,8 @@ impl ClientStatusHandle {
             gso_negotiated: connected.then_some(info.gso_negotiated),
             routes: info.routes,
             routes6: info.routes6,
-            connection: probe.map(|probe| probe()),
+            connection: connection.as_ref().map(|snapshot| snapshot.description.clone()),
+            custom_relays: connection.map(|snapshot| snapshot.custom_relays).unwrap_or_default(),
             bypass_addrs: bypass_probe.map(|p| p()).unwrap_or_default(),
             log_file,
         }
@@ -780,6 +786,17 @@ fn print_client_text(c: &ClientStatus) {
     if let Some(secs) = c.connected_since_secs {
         println!("Connected for:  {}", fmt_uptime(secs));
     }
+    for relay in &c.custom_relays {
+        let state = match relay.working {
+            Some(true) => "working",
+            Some(false) => "not working",
+            None => "status unavailable",
+        };
+        println!("Custom relay:   {} ({state})", relay.url);
+        if let Some(error) = &relay.error {
+            println!("                {error}");
+        }
+    }
     if c.state == "connected" {
         println!("Mode:           {}", c.mode);
         println!("VPN IPv4:       {}", fmt_opt(&c.assigned_ip));
@@ -890,6 +907,7 @@ mod tests {
         assert_eq!(snap.device_id, "00000000deadbeef");
         assert_eq!(snap.mode, "none");
         assert!(snap.mtu.is_none());
+        assert!(snap.custom_relays.is_empty());
 
         handle.set_connected(
             ClientConnectedInfo {
@@ -901,7 +919,15 @@ mod tests {
                 routes: vec!["0.0.0.0/0".into()],
                 ..Default::default()
             },
-            Arc::new(|| "relay https://relay.example".to_string()),
+            Arc::new(|| ConnectionSnapshot {
+                description: "relay https://relay.example".into(),
+                paths: Vec::new(),
+                custom_relays: vec![CustomRelayStatus {
+                    url: "https://relay.example/".into(),
+                    working: Some(true),
+                    error: None,
+                }],
+            }),
             Some(Arc::new(|| vec!["198.51.100.7".to_string()])),
         );
         let snap = handle.client_status();
@@ -912,12 +938,14 @@ mod tests {
         assert_eq!(snap.gso_negotiated, Some(true));
         assert_eq!(snap.routes, vec!["0.0.0.0/0".to_string()]);
         assert_eq!(snap.connection.as_deref(), Some("relay https://relay.example"));
+        assert_eq!(snap.custom_relays[0].working, Some(true));
         assert_eq!(snap.bypass_addrs, vec!["198.51.100.7".to_string()]);
 
         handle.set_disconnected();
         let snap = handle.client_status();
         assert_eq!(snap.state, "disconnected");
         assert!(snap.connection.is_none());
+        assert!(snap.custom_relays.is_empty());
         assert!(snap.bypass_addrs.is_empty());
     }
 
