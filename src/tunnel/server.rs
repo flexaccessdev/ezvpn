@@ -50,6 +50,12 @@ const CLIENT_CHANNEL_SIZE: usize = 1024;
 /// it bounds memory (~750 KB worst case) while absorbing bursts.
 const TUN_WRITER_CHANNEL_SIZE: usize = 512;
 
+/// UDP ports bound by the server's own iroh endpoints. Tunneled packets
+/// to/from these ports are dropped (self-encapsulation guard). Behind a lock
+/// because late relay registration adds endpoints (and thus ports) at runtime;
+/// reads are per-packet but writes are so rare the lock is uncontended.
+type LocalIrohUdpPorts = Arc<std::sync::RwLock<HashSet<u16>>>;
+
 /// Performance statistics for the VPN server.
 ///
 /// These atomic counters replace per-packet trace logging to eliminate
@@ -759,19 +765,45 @@ impl VpnServer {
         })
     }
 
-    /// Run the VPN server, accepting connections via iroh.
-    pub async fn run(mut self, endpoint: Endpoint) -> VpnResult<()> {
+    /// Run the VPN server, accepting connections through every iroh endpoint.
+    ///
+    /// Custom relays use one endpoint per relay, all sharing the server's
+    /// identity. This keeps the server registered on every configured relay
+    /// instead of relying on iroh's single selected home relay.
+    ///
+    /// `late_endpoints` delivers endpoints for custom relays that were
+    /// unreachable at startup and registered later by the background retry
+    /// task; each is folded into the running server (accept loop, self-
+    /// encapsulation port filter, status). Pass a closed channel when no late
+    /// registrations can occur.
+    pub async fn run(
+        mut self,
+        endpoints: Vec<Endpoint>,
+        mut late_endpoints: mpsc::Receiver<Endpoint>,
+    ) -> VpnResult<()> {
+        let Some(first_endpoint) = endpoints.first() else {
+            return Err(VpnError::config("VPN server requires at least one iroh endpoint"));
+        };
+        let endpoint_id = first_endpoint.id();
+        if endpoints.iter().any(|endpoint| endpoint.id() != endpoint_id) {
+            return Err(VpnError::config(
+                "all VPN server iroh endpoints must use the same identity",
+            ));
+        }
+
         // Setup TUN device
         self.setup_tun().await?;
 
         // Drop self-encapsulated iroh UDP packets from the VPN tunnel path.
-        let local_iroh_udp_ports = Arc::new(collect_local_iroh_udp_ports(&endpoint));
-        if !local_iroh_udp_ports.is_empty() {
+        let initial_iroh_udp_ports = collect_local_iroh_udp_ports(&endpoints);
+        if !initial_iroh_udp_ports.is_empty() {
             log::info!(
                 "Filtering tunneled traffic for {} local iroh UDP port(s)",
-                local_iroh_udp_ports.len()
+                initial_iroh_udp_ports.len()
             );
         }
+        let local_iroh_udp_ports: LocalIrohUdpPorts =
+            Arc::new(std::sync::RwLock::new(initial_iroh_udp_ports));
 
         log::info!("VPN Server started:");
         // Log IPv4 info if configured
@@ -802,7 +834,8 @@ impl VpnServer {
                 "disabled"
             }
         );
-        log::info!("  Node ID: {}", endpoint.id());
+        log::info!("  Node ID: {}", endpoint_id);
+        log::info!("  Relay endpoints: {}", endpoints.len());
 
         // Take TUN device and split it
         let tun_device = self.tun_device.take().expect("TUN device not set up");
@@ -869,18 +902,25 @@ impl VpnServer {
         // Spawn the status control-socket listener. The guard removes the
         // socket file and aborts the listener when `run` returns.
         let started_at = Instant::now();
-        let node_id = endpoint.id().to_string();
+        let node_id = endpoint_id.to_string();
         let status_server = server.clone();
-        let status_endpoint = endpoint.clone();
+        // Shared with the endpoint loop below so relays registered after
+        // startup show up in status bypass addresses too.
+        let shared_endpoints = Arc::new(std::sync::RwLock::new(endpoints.clone()));
+        let status_endpoints = shared_endpoints.clone();
         let status_overlay_v4 = server.config.network;
         let status_overlay_v6 = server.config.network6;
         let _status_listener =
             crate::control::spawn_status_listener(LockRole::Server, "default", move || {
-                let bypass_addrs =
-                    server_candidate_addrs(&status_endpoint, status_overlay_v4, status_overlay_v6)
-                        .iter()
-                        .map(|ip| ip.to_string())
-                        .collect();
+                let endpoints = status_endpoints.read().unwrap_or_else(|e| e.into_inner());
+                let bypass_addrs = server_candidate_addrs_for_endpoints(
+                    &endpoints,
+                    status_overlay_v4,
+                    status_overlay_v6,
+                )
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect();
                 status_server.status_snapshot(
                     node_id.clone(),
                     started_at.elapsed().as_secs(),
@@ -906,34 +946,77 @@ impl VpnServer {
             }
         });
 
-        // Accept incoming connections
+        // Fan all relay-specific endpoint accept loops into one connection
+        // stream. JoinSet aborts the accept tasks if server.run() is cancelled.
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(endpoints.len());
+        let mut accept_tasks = tokio::task::JoinSet::new();
+        for endpoint in endpoints {
+            spawn_endpoint_accept(&mut accept_tasks, endpoint, incoming_tx.clone());
+        }
+        // Held (as Some) only while late relay registrations may still arrive,
+        // so the recv loop below still ends once every accept task has exited —
+        // the same "all endpoints closed" shutdown as before late registration.
+        let mut late_incoming_tx = Some(incoming_tx);
+
         loop {
-            match endpoint.accept().await {
-                Some(incoming) => {
+            tokio::select! {
+                maybe_incoming = incoming_rx.recv() => {
+                    let Some((incoming, endpoint)) = maybe_incoming else {
+                        break;
+                    };
                     let server = server.clone();
                     let tun_write_tx = tun_write_tx.clone();
                     let local_iroh_udp_ports = local_iroh_udp_ports.clone();
-                    let endpoint = endpoint.clone();
                     tokio::spawn(async move {
                         if let Err(e) = server
-                            .handle_connection(
-                                incoming,
-                                tun_write_tx,
-                                local_iroh_udp_ports,
-                                endpoint,
-                            )
+                            .handle_connection(incoming, tun_write_tx, local_iroh_udp_ports, endpoint)
                             .await
                         {
                             log::error!("Connection error: {}", e);
                         }
                     });
                 }
-                None => {
-                    log::info!("Endpoint closed, shutting down");
-                    break;
+                maybe_endpoint = late_endpoints.recv(), if late_incoming_tx.is_some() => {
+                    let Some(endpoint) = maybe_endpoint else {
+                        // No more late registrations can arrive; drop our
+                        // sender so the recv loop ends with the accept tasks.
+                        late_incoming_tx = None;
+                        continue;
+                    };
+                    if endpoint.id() != endpoint_id {
+                        log::warn!("Ignoring late relay endpoint with mismatched identity");
+                        endpoint.close().await;
+                        continue;
+                    }
+                    let new_ports =
+                        collect_local_iroh_udp_ports(std::slice::from_ref(&endpoint));
+                    local_iroh_udp_ports
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend(new_ports);
+                    let total = {
+                        let mut shared = shared_endpoints
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        shared.push(endpoint.clone());
+                        shared.len()
+                    };
+                    let incoming_tx = late_incoming_tx
+                        .clone()
+                        .expect("guarded by select precondition");
+                    spawn_endpoint_accept(&mut accept_tasks, endpoint, incoming_tx);
+                    log::info!("Relay endpoint registered after startup (total: {})", total);
                 }
             }
         }
+        while let Some(result) = accept_tasks.join_next().await {
+            if let Err(e) = result
+                && !e.is_cancelled()
+            {
+                log::warn!("Relay endpoint accept task failed: {}", e);
+            }
+        }
+        log::info!("All relay endpoints closed, shutting down");
 
         // Graceful shutdown: drop channel sender to signal TUN writer to exit,
         // then await both tasks to ensure clean termination.
@@ -959,7 +1042,7 @@ impl VpnServer {
         &self,
         incoming: iroh::endpoint::Incoming,
         tun_write_tx: mpsc::Sender<TunWriteRequest>,
-        local_iroh_udp_ports: Arc<HashSet<u16>>,
+        local_iroh_udp_ports: LocalIrohUdpPorts,
         endpoint: Endpoint,
     ) -> VpnResult<()> {
         let connection = incoming
@@ -1076,7 +1159,7 @@ impl VpnServer {
         remote_id: EndpointId,
         connection: iroh::endpoint::Connection,
         tun_write_tx: mpsc::Sender<TunWriteRequest>,
-        local_iroh_udp_ports: Arc<HashSet<u16>>,
+        local_iroh_udp_ports: LocalIrohUdpPorts,
         handshake: VpnHandshake,
         endpoint: Endpoint,
     ) -> VpnResult<()> {
@@ -1528,7 +1611,7 @@ impl VpnServer {
         mut recv: RecvStream,
         ctx: ClientContext,
         tun_write_tx: mpsc::Sender<TunWriteRequest>,
-        local_iroh_udp_ports: Arc<HashSet<u16>>,
+        local_iroh_udp_ports: LocalIrohUdpPorts,
         writer_error_rx: oneshot::Receiver<String>,
         stats: Arc<VpnServerStats>,
     ) -> VpnResult<()> {
@@ -1771,7 +1854,7 @@ impl VpnServer {
     async fn run_tun_reader(
         &self,
         mut tun_reader: crate::net::device::TunReader,
-        local_iroh_udp_ports: Arc<HashSet<u16>>,
+        local_iroh_udp_ports: LocalIrohUdpPorts,
     ) -> VpnResult<()> {
         log::info!("TUN reader started");
 
@@ -2100,9 +2183,53 @@ fn read_ipv6_addr(packet: &[u8], offset: usize) -> Ipv6Addr {
     Ipv6Addr::from(bytes)
 }
 
-/// Collect local UDP ports bound by the iroh endpoint.
-fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
-    endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
+/// Spawn the accept loop for one relay endpoint, fanning its incoming
+/// connections into the shared connection channel.
+fn spawn_endpoint_accept(
+    accept_tasks: &mut tokio::task::JoinSet<()>,
+    endpoint: Endpoint,
+    incoming_tx: mpsc::Sender<(iroh::endpoint::Incoming, Endpoint)>,
+) {
+    accept_tasks.spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            if incoming_tx
+                .send((incoming, endpoint.clone()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        log::info!("Relay endpoint closed");
+    });
+}
+
+/// Collect local UDP ports bound by all iroh endpoints.
+fn collect_local_iroh_udp_ports(endpoints: &[Endpoint]) -> HashSet<u16> {
+    endpoints
+        .iter()
+        .flat_map(|endpoint| {
+            endpoint
+                .addr()
+                .ip_addrs()
+                .map(|addr| addr.port())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn server_candidate_addrs_for_endpoints(
+    endpoints: &[Endpoint],
+    overlay_v4: Option<Ipv4Net>,
+    overlay_v6: Option<Ipv6Net>,
+) -> Vec<IpAddr> {
+    let mut addrs: Vec<IpAddr> = endpoints
+        .iter()
+        .flat_map(|endpoint| server_candidate_addrs(endpoint, overlay_v4, overlay_v6))
+        .collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
 }
 
 /// The server's candidate iroh underlay addresses (deduped, sorted): the set it
@@ -2247,13 +2374,15 @@ async fn run_server_addr_publisher(
 
 /// Return true if packet is UDP and either source/destination port matches a blocked port.
 #[inline]
-fn packet_has_local_iroh_udp_port(packet: &[u8], blocked_ports: &HashSet<u16>) -> bool {
-    if blocked_ports.is_empty() {
-        return false;
-    }
+fn packet_has_local_iroh_udp_port(
+    packet: &[u8],
+    blocked_ports: &std::sync::RwLock<HashSet<u16>>,
+) -> bool {
+    // Parse before locking so non-UDP packets never touch the lock.
     let Some((src_port, dst_port)) = extract_udp_ports(packet) else {
         return false;
     };
+    let blocked_ports = blocked_ports.read().unwrap_or_else(|e| e.into_inner());
     blocked_ports.contains(&src_port) || blocked_ports.contains(&dst_port)
 }
 

@@ -3,6 +3,7 @@
 //! Logs the currently selected iroh connection path(s) with RTT and logs
 //! again whenever the selected path changes (e.g., relay -> direct).
 
+use crate::transport::endpoint::RelayConfig;
 use futures::StreamExt;
 use iroh::{Endpoint, TransportAddr};
 use iroh::endpoint::{Connection, PathList};
@@ -122,19 +123,17 @@ fn connection_paths_from(paths: &PathList<'_>) -> Vec<ConnPath> {
 pub fn connection_snapshot(
     conn: &Connection,
     endpoint: &Endpoint,
-    relay_urls: &[String],
+    relay_config: &RelayConfig,
 ) -> ConnectionSnapshot {
     let paths = conn.paths();
     let observed = endpoint.home_relay_status().get();
-    let custom_relays = relay_urls
+    let custom_relays = relay_config
+        .custom_urls()
         .iter()
         .map(|configured| {
-            let parsed = configured.parse::<iroh::RelayUrl>().ok();
-            let status = parsed
-                .as_ref()
-                .and_then(|url| observed.iter().find(|status| status.url() == url));
+            let status = observed.iter().find(|status| status.url() == configured);
             CustomRelayStatus {
-                url: configured.clone(),
+                url: configured.to_string(),
                 working: status.map(|status| status.is_connected()),
                 error: status.and_then(|status| status.last_error().map(ToString::to_string)),
             }

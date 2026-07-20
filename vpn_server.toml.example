@@ -13,7 +13,7 @@
 # Config is grouped by purpose:
 #   [network] - VPN tunnel addressing (the VPN itself)
 #   [auth]    - client authentication tokens
-#   [iroh]    - iroh transport: identity, relays, discovery
+#   [iroh]    - iroh transport: identity, relays, address lookup
 #
 # There are deliberately no performance/tuning knobs (WireGuard/Tailscale
 # style): the tunnel MTU is fixed at 1280, QUIC transport settings (congestion
@@ -143,17 +143,22 @@ secret_file = "./vpn-server.key"
 # Relay and Discovery (Optional)
 # ============================================================================
 
-# Custom relay server URL(s) for failover
-# Must match client's relay configuration for discovery
+# Custom relay server URL(s). The server registers its identity on every URL,
+# allowing clients to connect through any relay they can reach.
+# A client's relay list must include at least one of these URLs.
+# Relays unreachable at startup are retried in the background and registered
+# once available; startup fails only if every relay is unreachable.
 # relay_urls = [
 #     "https://relay1.example.com",
 #     "https://relay2.example.com",
 # ]
 #
-# iroh peer discovery (the n0 discovery service) is used automatically when the
-# default relays are in use. It is NOT configurable and is NOT real/VPN DNS.
+# iroh address lookup (pkarr publishing + DNS lookup via n0's dns.iroh.link,
+# https://docs.iroh.computer/concepts/address-lookup) is used automatically when
+# the default relays are in use. It is NOT configurable and is NOT real/VPN DNS.
 # When a custom relay is configured (relay_urls above), the relay doubles as the
-# rendezvous point and the discovery service is disabled automatically.
+# rendezvous point and address lookup is disabled automatically; see "Relays and
+# Address Lookup" in docs/Architecture.md for why registration/hints replace it.
 
 # NOTE: There is no [iroh.transport] section. QUIC transport settings are
 # fixed constants on both ends: CUBIC congestion control, 8 MB receive/send

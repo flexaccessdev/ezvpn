@@ -685,24 +685,35 @@ The client uses a stable per-process `device_id`, so the server normally assigns
 the same IP during reconnects. Reassignment is expected mainly after server
 restart or allocation state changes.
 
-## Relay and Discovery
+## Relay and Address Lookup
 
-`ezvpn` can use custom iroh relay and discovery infrastructure:
+`ezvpn` can use custom iroh relay infrastructure:
 
-- `relay_urls` / `--relay-url` configure custom relay servers for failover and
-  connection hints.
-- iroh peer discovery (the n0 discovery service — pkarr + DNS-based lookup) is
-  used automatically when the default relays are in use. It is not configurable.
-  This is iroh peer discovery, not real/VPN DNS: it does not affect client DNS
-  resolution, and the client does not push DNS or match domains over the tunnel.
-  To resolve an internal zone through a resolver reachable over the tunnel, set
-  OS-level conditional forwarding — see
+- `relay_urls` / `--relay-url` configure custom relay servers. The server
+  registers the same identity independently on every configured relay, and
+  clients can connect through any of those relays that they can reach.
+  Relays that are unreachable at server startup are retried in the background
+  and re-registered when they come back; startup fails only if every
+  configured relay is unreachable.
+- [iroh address lookup](https://docs.iroh.computer/concepts/address-lookup)
+  (pkarr publishing + DNS-based lookup via n0's `dns.iroh.link`) is used
+  automatically when the default relays are in use. It is not configurable.
+  This is iroh's endpoint-ID resolution, not real/VPN DNS: it does not affect
+  client DNS resolution, and the client does not push DNS or match domains
+  over the tunnel. To resolve an internal zone through a resolver reachable
+  over the tunnel, set OS-level conditional forwarding — see
   [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
-- When a custom relay is configured, it doubles as the rendezvous point and the
-  discovery service is disabled automatically; clients and server then connect
-  through their common relay. Server and client relay settings must match.
+- When custom relays are configured, they double as rendezvous points and
+  address lookup is disabled automatically — nothing about the deployment is
+  published to n0's public DNS. Because a relay only reaches peers connected
+  to it (relays do not forward to each other) and no lookup record advertises
+  which relay the server chose, the server maintains an endpoint on each
+  relay and the client dials with its relay list as hints. A client's relay
+  list must overlap the server's list, but it does not need to contain every
+  server relay. See "Relays and Address Lookup" in
+  [docs/Architecture.md](docs/Architecture.md) for the full design rationale.
 
-See the relay and discovery comments in `vpn_server.toml.example` and
+See the relay comments in `vpn_server.toml.example` and
 `vpn_client.toml.example` for exact TOML syntax.
 
 ## Running as a Service

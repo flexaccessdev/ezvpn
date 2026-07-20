@@ -13,7 +13,7 @@
 #   [network] - VPN routes to install once connected
 #   [auth]    - the auth token presented to the server
 #   top-level - client runtime behavior (reconnection)
-#   [iroh]    - iroh transport: server identity, ALPN, relays, discovery
+#   [iroh]    - iroh transport: server identity, ALPN, relays, address lookup
 
 # Required: validates config matches CLI command
 role = "vpnclient"
@@ -111,14 +111,17 @@ server_node_id = "changeme"
 # Relay and Discovery (Optional)
 # ============================================================================
 
-# Custom relay server URL(s) for failover
-# Must match server's relay configuration for discovery
+# Custom relay server URL(s). The client can connect through any configured
+# relay on which the server is registered.
+# Must include at least one URL configured on the server.
 # relay_urls = [
 #     "https://relay1.example.com",
 #     "https://relay2.example.com",
 # ]
 #
-# iroh peer discovery (the n0 discovery service) is used automatically when the
-# default relays are in use. It is NOT configurable and is NOT real/VPN DNS.
+# iroh address lookup (pkarr publishing + DNS lookup via n0's dns.iroh.link,
+# https://docs.iroh.computer/concepts/address-lookup) is used automatically when
+# the default relays are in use. It is NOT configurable and is NOT real/VPN DNS.
 # When a custom relay is configured (relay_urls above), the relay doubles as the
-# rendezvous point and the discovery service is disabled automatically.
+# rendezvous point and address lookup is disabled automatically; see "Relays and
+# Address Lookup" in docs/Architecture.md for why registration/hints replace it.
