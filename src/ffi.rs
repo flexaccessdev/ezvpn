@@ -64,7 +64,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 use crate::error::VpnResult;
-use crate::transport::paths::{ConnPathKind, connection_paths};
+use crate::transport::paths::{ConnPathKind, connection_snapshot};
 use crate::tunnel::ios::{IosConfig, IosSession};
 
 /// Opaque handle owned by the Swift side. Created by [`ezvpn_connect`], freed by
@@ -273,7 +273,8 @@ pub unsafe extern "C" fn ezvpn_conn_path(
         return -1;
     }
     let handle = unsafe { &*handle };
-    let paths: Vec<_> = connection_paths(&handle.connection)
+    let snapshot = connection_snapshot(&handle.connection, &handle.endpoint, &handle.relay_urls);
+    let paths: Vec<_> = snapshot.paths
         .into_iter()
         .map(|p| {
             let kind = match p.kind {
@@ -284,8 +285,7 @@ pub unsafe extern "C" fn ezvpn_conn_path(
             serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
         })
         .collect();
-    let custom_relays = crate::control::custom_relay_status(&handle.endpoint, &handle.relay_urls);
-    let json = serde_json::json!({ "paths": paths, "custom_relays": custom_relays }).to_string();
+    let json = serde_json::json!({ "paths": paths, "custom_relays": snapshot.custom_relays }).to_string();
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 

@@ -1005,14 +1005,6 @@ async fn run_vpn_client(
     let client = VpnClient::new(config, instance)
         .map_err(|e| anyhow::anyhow!("Failed to create VPN client: {}", e))?;
 
-    if !resolved.relay_urls.is_empty() {
-        let relay_endpoint = endpoint.clone();
-        let relay_urls = resolved.relay_urls.clone();
-        client.status_handle().set_custom_relays(Some(std::sync::Arc::new(move || {
-            control::custom_relay_status(&relay_endpoint, &relay_urls)
-        })));
-    }
-
     // Surface the daemon log-file path through the status socket (None when
     // running in the foreground).
     client.status_handle().set_log_file(daemon_log);

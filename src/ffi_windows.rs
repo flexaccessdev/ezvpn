@@ -247,14 +247,6 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
                     }
                 };
 
-                if !relay_urls.is_empty() {
-                    let relay_endpoint = endpoint.clone();
-                    let status_relay_urls = relay_urls.clone();
-                    client.status_handle().set_custom_relays(Some(Arc::new(move || {
-                        crate::control::custom_relay_status(&relay_endpoint, &status_relay_urls)
-                    })));
-                }
-
                 // Hand the status handle back; setup is done from here on.
                 if setup_tx.send(Ok(client.status_handle())).is_err() {
                     // The starter gave up (dropped the receiver); nothing to run.
