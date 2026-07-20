@@ -158,6 +158,11 @@ enum ClientAction {
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
 
+        /// Shared bearer token for the custom relays (sent as
+        /// `Authorization: Bearer <token>`). Requires --relay-url.
+        #[arg(long = "relay-token")]
+        relay_auth_token: Option<String>,
+
         /// Authentication token to send to server
         #[arg(long)]
         auth_token: Option<String>,
@@ -314,6 +319,7 @@ fn main() -> Result<()> {
                     default_config,
                     server_node_id,
                     relay_urls,
+                    relay_auth_token,
                     auth_token,
                     auth_token_file,
                     routes,
@@ -331,6 +337,7 @@ fn main() -> Result<()> {
                 default_config,
                 server_node_id,
                 relay_urls,
+                relay_auth_token,
                 auth_token,
                 auth_token_file,
                 routes,
@@ -462,6 +469,7 @@ fn prepare_client_start(
     default_config: bool,
     server_node_id: Option<String>,
     relay_urls: Vec<String>,
+    relay_auth_token: Option<String>,
     auth_token: Option<String>,
     auth_token_file: Option<PathBuf>,
     routes: Vec<String>,
@@ -506,6 +514,7 @@ fn prepare_client_start(
             routes,
             routes6,
             relay_urls,
+            relay_auth_token,
             auto_reconnect_opt,
             max_reconnect_attempts,
         )

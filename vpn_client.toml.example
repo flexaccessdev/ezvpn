@@ -119,6 +119,12 @@ server_node_id = "changeme"
 #     "https://relay2.example.com",
 # ]
 #
+# Optional shared bearer token for a private relay deployment. When set, it is
+# sent to every custom relay as an "Authorization: Bearer <token>" header. It is
+# only valid together with relay_urls (above) — setting it with the default
+# relays is rejected at startup. Must match the token the server (and relay) use.
+# relay_auth_token = "your-shared-relay-token"
+#
 # iroh address lookup (pkarr publishing + DNS lookup via n0's dns.iroh.link,
 # https://docs.iroh.computer/concepts/address-lookup) is always used — for both
 # the default relays and custom relays — so the client resolves the server's

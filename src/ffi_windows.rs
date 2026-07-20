@@ -29,15 +29,19 @@
 //!
 //! ## Config JSON (input to `ezvpn_start`)
 //!
-//! `auth_token`/`max_reconnect_attempts` may be null. `relay_urls`, `routes`,
-//! `routes6`, `instance`, and `auto_reconnect` are all optional (with the
-//! defaults shown).
+//! `auth_token`/`max_reconnect_attempts` may be null. `relay_urls`,
+//! `relay_auth_token`, `routes`, `routes6`, `instance`, and `auto_reconnect` are
+//! all optional (with the defaults shown). `relay_auth_token` is the shared
+//! bearer token for the custom relays (sent as `Authorization: Bearer <token>`);
+//! it is only valid together with `relay_urls` and is rejected with the default
+//! relays.
 //!
 //! ```json
 //! {
 //!   "server_node_id": "<iroh endpoint id>",
 //!   "auth_token": "<47-char ezvpn token>",
 //!   "relay_urls": ["https://relay.example/"],
+//!   "relay_auth_token": "<optional shared relay bearer token>",
 //!   "routes": ["10.0.0.0/8"],
 //!   "routes6": ["fd00::/8"],
 //!   "instance": "default",
@@ -97,6 +101,10 @@ struct FfiWinConfig {
     auth_token: Option<String>,
     #[serde(default)]
     relay_urls: Vec<String>,
+    /// Optional shared bearer token for the custom relays. Only valid with
+    /// `relay_urls`; rejected with the default relays.
+    #[serde(default)]
+    relay_auth_token: Option<String>,
     #[serde(default)]
     routes: Vec<String>,
     #[serde(default)]
@@ -197,7 +205,8 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
     };
 
-    let relay_config = RelayConfig::from_urls(&cfg.relay_urls).map_err(|e| format!("{e:#}"))?;
+    let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
+        .map_err(|e| format!("{e:#}"))?;
     let instance = cfg.instance;
     let auto_reconnect = cfg.auto_reconnect;
     let max_attempts = cfg.max_reconnect_attempts.and_then(NonZeroU32::new);

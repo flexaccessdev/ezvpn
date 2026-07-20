@@ -240,6 +240,20 @@ for the transport path, but findability still relies on n0's public lookup
 (`dns.iroh.link`). Both modes therefore share the same single-endpoint,
 lookup-based rendezvous.
 
+**Optional shared relay token.** A private relay deployment can require a shared
+bearer token (iroh-relay's `IROH_RELAY_ACCESS_TOKEN` / `access.shared_token`).
+When `relay_auth_token` is configured, it is carried on the `RelayConfig::Custom`
+variant and applied to every entry in the custom relay map
+(`RelayMap::with_auth_token`), which iroh sends as an `Authorization: Bearer
+<token>` header on each relay WebSocket upgrade. It is **strictly gated to custom
+relays**: `RelayConfig::from_urls_with_token` rejects a token supplied without
+`relay_urls`, so the default n0 relays never receive one and the feature is inert
+in default mode. The token is not separately validated — custom relay URLs are
+always parse-validated, and the existing `endpoint.online()` wait
+(`RELAY_CONNECT_TIMEOUT`) fails startup if the relay rejects the token or is
+unreachable. Server and clients that share a private relay must configure the
+same token.
+
 ### Segmentation Offload (GSO/GRO)
 
 Per-packet cost dominates tunnel throughput: every ~MTU-sized TCP segment otherwise pays its own framing, channel send and QUIC write. `ezvpn` moves whole TCP "super-packets" (up to 64 KB) through the tunnel whenever possible and segments them as late as possible — ideally in the receiving kernel.

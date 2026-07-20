@@ -29,15 +29,43 @@ pub enum RelayConfig {
     #[default]
     Default,
     /// Custom relay set (parsed, sorted, deduped). Never empty.
-    Custom(Vec<RelayUrl>),
+    ///
+    /// `auth_token`, when set, is sent to every custom relay as an
+    /// `Authorization: Bearer <token>` header on the WebSocket upgrade (see
+    /// [`Self::relay_mode`]). It is only ever carried by custom relays — the
+    /// default relays never receive a token (see [`Self::from_urls_with_token`]).
+    Custom {
+        urls: Vec<RelayUrl>,
+        auth_token: Option<String>,
+    },
 }
 
 impl RelayConfig {
-    /// Parse raw config strings; empty input selects the default relays.
-    /// Fails on the first malformed URL, so config typos surface at resolve
-    /// time instead of at each use site.
+    /// Parse raw config strings with no relay auth token.
+    ///
+    /// Thin wrapper over [`Self::from_urls_with_token`]; see there for behavior.
     pub fn from_urls(urls: &[String]) -> Result<Self> {
+        Self::from_urls_with_token(urls, None)
+    }
+
+    /// Parse raw config strings and attach an optional shared relay auth token.
+    ///
+    /// Empty input selects the default relays. Parsing fails on the first
+    /// malformed URL, so config typos surface at resolve time instead of at each
+    /// use site.
+    ///
+    /// The token is normalized (blank/whitespace-only becomes `None`) and is
+    /// **strictly gated to custom relays**: a non-empty token with no custom
+    /// relay URLs is a hard error, since the default iroh relays never take a
+    /// token. This surfaces the misconfiguration before the endpoint starts.
+    pub fn from_urls_with_token(urls: &[String], auth_token: Option<String>) -> Result<Self> {
+        let auth_token = auth_token.filter(|t| !t.trim().is_empty());
         if urls.is_empty() {
+            if auth_token.is_some() {
+                anyhow::bail!(
+                    "relay_auth_token requires custom relay_urls; it is not used with the default iroh relays"
+                );
+            }
             return Ok(Self::Default);
         }
         let mut parsed = urls
@@ -49,26 +77,48 @@ impl RelayConfig {
             .collect::<Result<Vec<_>>>()?;
         parsed.sort();
         parsed.dedup();
-        Ok(Self::Custom(parsed))
+        Ok(Self::Custom {
+            urls: parsed,
+            auth_token,
+        })
     }
 
     /// The custom relay URLs; empty for [`RelayConfig::Default`].
     pub fn custom_urls(&self) -> &[RelayUrl] {
         match self {
             Self::Default => &[],
-            Self::Custom(urls) => urls,
+            Self::Custom { urls, .. } => urls,
+        }
+    }
+
+    /// The shared relay auth token, if configured (custom relays only).
+    pub fn relay_auth_token(&self) -> Option<&str> {
+        match self {
+            Self::Default => None,
+            Self::Custom { auth_token, .. } => auth_token.as_deref(),
         }
     }
 
     pub fn is_custom(&self) -> bool {
-        matches!(self, Self::Custom(_))
+        matches!(self, Self::Custom { .. })
     }
 
     /// The corresponding iroh [`RelayMode`].
+    ///
+    /// For custom relays, an `auth_token` (when set) is applied to every relay in
+    /// the map via [`RelayMap::with_auth_token`], which iroh sends as an
+    /// `Authorization: Bearer <token>` header on the relay WebSocket upgrade.
     pub fn relay_mode(&self) -> RelayMode {
         match self {
             Self::Default => RelayMode::Default,
-            Self::Custom(urls) => RelayMode::Custom(RelayMap::from_iter(urls.iter().cloned())),
+            Self::Custom { urls, auth_token } => {
+                let map = RelayMap::from_iter(urls.iter().cloned());
+                let map = match auth_token {
+                    Some(token) => map.with_auth_token(token.clone()),
+                    None => map,
+                };
+                RelayMode::Custom(map)
+            }
         }
     }
 }
@@ -252,4 +302,82 @@ pub async fn create_client_endpoint(
     }
 
     Ok(endpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RELAY: &str = "https://relay.example.com./";
+
+    #[test]
+    fn empty_urls_no_token_is_default() {
+        let cfg = RelayConfig::from_urls_with_token(&[], None).unwrap();
+        assert_eq!(cfg, RelayConfig::Default);
+        assert!(!cfg.is_custom());
+        assert_eq!(cfg.relay_auth_token(), None);
+    }
+
+    #[test]
+    fn blank_token_without_urls_is_default() {
+        // A whitespace-only token normalizes to None, so it is not an error.
+        let cfg = RelayConfig::from_urls_with_token(&[], Some("   ".to_string())).unwrap();
+        assert_eq!(cfg, RelayConfig::Default);
+    }
+
+    #[test]
+    fn token_without_custom_urls_is_error() {
+        let err = RelayConfig::from_urls_with_token(&[], Some("secret".to_string()))
+            .expect_err("token without custom relays must be rejected");
+        assert!(
+            err.to_string()
+                .contains("relay_auth_token requires custom relay_urls"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_custom_url_is_rejected_without_token() {
+        // Custom relays are always parse-validated, independent of any token.
+        let err = RelayConfig::from_urls_with_token(&["not a url".to_string()], None)
+            .expect_err("malformed relay URL must be rejected");
+        assert!(
+            err.to_string().contains("Invalid relay URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn custom_urls_without_token() {
+        let cfg = RelayConfig::from_urls_with_token(&[RELAY.to_string()], None).unwrap();
+        assert!(cfg.is_custom());
+        assert_eq!(cfg.custom_urls().len(), 1);
+        assert_eq!(cfg.relay_auth_token(), None);
+        assert!(matches!(cfg.relay_mode(), RelayMode::Custom(_)));
+    }
+
+    #[test]
+    fn custom_urls_with_token_retained() {
+        let cfg =
+            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("secret".to_string()))
+                .unwrap();
+        assert!(cfg.is_custom());
+        assert_eq!(cfg.relay_auth_token(), Some("secret"));
+        assert!(matches!(cfg.relay_mode(), RelayMode::Custom(_)));
+    }
+
+    #[test]
+    fn token_is_trimmed_to_none_with_custom_urls() {
+        // A blank token alongside custom relays is simply no token, not an error.
+        let cfg =
+            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("  ".to_string())).unwrap();
+        assert!(cfg.is_custom());
+        assert_eq!(cfg.relay_auth_token(), None);
+    }
+
+    #[test]
+    fn from_urls_carries_no_token() {
+        let cfg = RelayConfig::from_urls(&[RELAY.to_string()]).unwrap();
+        assert_eq!(cfg.relay_auth_token(), None);
+    }
 }
