@@ -24,7 +24,9 @@ use ezvpn::config::file_config::{
     load_vpn_client_config, load_vpn_server_config,
 };
 use ezvpn::runtime::LockRole;
-use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
+use ezvpn::transport::endpoint::{
+    RELAY_CONNECT_TIMEOUT, create_client_endpoint, create_server_endpoint, load_secret,
+};
 // Runtime config types (different from the TOML config types in config::file_config)
 use ezvpn::config::{VpnClientConfig, VpnServerConfig};
 use ezvpn::tunnel::{VpnClient, VpnServer};
@@ -925,12 +927,22 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         let attempts = futures::future::join_all(relay_urls.into_iter().map(|relay_url| {
             let secret_key = secret_key.clone();
             async move {
-                let endpoint = create_server_endpoint(
-                    std::slice::from_ref(&relay_url),
-                    false,
-                    Some(secret_key),
+                let endpoint = match tokio::time::timeout(
+                    RELAY_CONNECT_TIMEOUT,
+                    create_server_endpoint(
+                        std::slice::from_ref(&relay_url),
+                        false,
+                        Some(secret_key),
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "relay registration timed out after {}s",
+                        RELAY_CONNECT_TIMEOUT.as_secs()
+                    )),
+                };
                 (relay_url, endpoint)
             }
         }))
