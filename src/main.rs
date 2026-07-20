@@ -915,8 +915,8 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
 
     // Create the iroh endpoint for signaling. Direct P2P is strongly preferred
     // for VPN traffic; relays are only the automatic fallback when a direct
-    // connection fails. Address lookup is always on, so a single endpoint
-    // serves both the default and custom relay modes.
+    // connection fails. A single endpoint serves both relay modes; internet
+    // discovery follows the mode (on for default relays, off for custom).
     let endpoint = create_server_endpoint(&resolved.relay_config, Some(secret_key))
         .await
         .context("Failed to create iroh endpoint")?;

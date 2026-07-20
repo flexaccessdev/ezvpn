@@ -19,11 +19,14 @@ pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Relay configuration, resolved once from the raw config strings.
 ///
-/// This is the single source of the default-vs-custom distinction. Both modes
-/// enable iroh address lookup (pkarr publishing + DNS resolution of the peer's
-/// home relay — see <https://docs.iroh.computer/concepts/address-lookup>); the
-/// only difference between them is which relay map iroh uses. See "Relays and
-/// Address Lookup" in `docs/Architecture.md`.
+/// This is the single source of the default-vs-custom distinction. It selects
+/// both which relay map iroh uses **and** whether iroh internet discovery is
+/// enabled: [`Default`](Self::Default) uses the n0 relays with the full lookup
+/// stack (pkarr publishing + DNS resolution of the peer's home relay — see
+/// <https://docs.iroh.computer/concepts/address-lookup>), while
+/// [`Custom`](Self::Custom) uses the configured relays with internet discovery
+/// disabled (clients reach the server through relay hints instead). See "Relays
+/// and Address Lookup" in `docs/Architecture.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RelayConfig {
     /// iroh's default relay map, with n0 address lookup.
@@ -209,25 +212,39 @@ fn warn_if_socket_buffer_capped() {
 
 /// Create a base endpoint builder with common configuration.
 ///
-/// iroh address lookup (pkarr publishing + DNS-based lookup of
+/// iroh internet discovery (pkarr publishing + DNS-based lookup of
 /// `_iroh.<endpoint-id>.dns.iroh.link`, see
-/// <https://docs.iroh.computer/concepts/address-lookup>) is enabled uniformly,
-/// for both the default relays and custom relay sets. The relay map differs
-/// between the two, but in both cases the server publishes its current home
-/// relay and a client resolves it by endpoint ID.
+/// <https://docs.iroh.computer/concepts/address-lookup>) is **not** configurable;
+/// it follows the relay mode:
+///
+/// - [`RelayConfig::Default`]: the full n0 lookup stack is enabled — the server
+///   publishes its current home relay and a client resolves it by endpoint ID.
+/// - [`RelayConfig::Custom`]: internet discovery is always disabled — nothing is
+///   published to or resolved from n0's public infrastructure. The client reaches
+///   the server through the configured relay hints it attaches to the server's
+///   `EndpointAddr` (see `VpnClient::resolve_server_addr`): iroh sends QUIC
+///   Initials to every configured relay, so the handshake succeeds via whichever
+///   relay the server is homed on.
 pub fn create_endpoint_builder(relay_config: &RelayConfig) -> Result<EndpointBuilder> {
     warn_if_socket_buffer_capped();
     let transport_config = build_quic_transport_config()?;
     // iroh 1.0 requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
     // only makes the ring backend available, it does not wire it in.
-    let builder = Endpoint::builder(presets::Empty)
+    let mut builder = Endpoint::builder(presets::Empty)
         .relay_mode(relay_config.relay_mode())
         .transport_config(transport_config)
-        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        // n0 address lookup (pkarr publishing + DNS-based lookup), always on.
-        .address_lookup(PkarrPublisher::n0_dns())
-        .address_lookup(DnsAddressLookup::n0_dns());
+        .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
+
+    if relay_config.is_custom() {
+        info!("Internet discovery disabled (custom relays configured)");
+    } else {
+        // Default n0 relays: enable the full lookup stack (pkarr publishing +
+        // DNS-based lookup).
+        builder = builder
+            .address_lookup(PkarrPublisher::n0_dns())
+            .address_lookup(DnsAddressLookup::n0_dns());
+    }
 
     Ok(builder)
 }
@@ -315,10 +332,12 @@ async fn probe_custom_relays(relay_config: &RelayConfig) -> Result<()> {
 /// Create the VPN server's iroh endpoint with an optional persistent identity,
 /// waiting for it to come online (bounded by [`RELAY_CONNECT_TIMEOUT`]).
 ///
-/// A single endpoint serves both the default and custom relay modes: address
-/// lookup is always enabled, so the server publishes its current home relay and
-/// clients resolve it by endpoint ID (iroh's relay failover re-homes and
-/// republishes on its own).
+/// A single endpoint serves both relay modes. With the default relays internet
+/// discovery is on, so the server publishes its current home relay and clients
+/// resolve it by endpoint ID (iroh's relay failover re-homes and republishes on
+/// its own). With custom relays discovery is off, so clients reach the server
+/// through the relay hints they attach to its `EndpointAddr` (see
+/// [`create_endpoint_builder`]).
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
     secret: Option<SecretKey>,
