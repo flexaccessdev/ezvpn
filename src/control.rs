@@ -206,11 +206,16 @@ pub struct ClientConnectedInfo {
     pub routes6: Vec<String>,
 }
 
-/// Probe that returns a live description of the current connection path(s).
+/// Async probe that returns a live description of the current connection path(s)
+/// and custom-relay `/healthz` status.
 ///
-/// Provided by the client (capturing its iroh `Connection`) so this module
-/// stays transport-agnostic. Called on demand when a snapshot is built.
-pub type ConnectionProbe = Arc<dyn Fn() -> ConnectionSnapshot + Send + Sync>;
+/// Provided by the client (capturing its iroh `Connection`) so this module stays
+/// transport-agnostic. It is async because the relay health check performs
+/// on-demand HTTP; awaited when a snapshot is built so it never blocks the
+/// runtime. Returns a boxed future for object safety.
+pub type ConnectionSnapshotFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ConnectionSnapshot> + Send>>;
+pub type ConnectionProbe = Arc<dyn Fn() -> ConnectionSnapshotFuture + Send + Sync>;
 
 /// Probe returning the bypass addresses the client has collected this session.
 ///
@@ -294,16 +299,17 @@ impl ClientStatusHandle {
     }
 
     /// Build the current snapshot wrapped for the control protocol.
-    pub fn snapshot(&self) -> StatusSnapshot {
-        StatusSnapshot::Client(self.client_status())
+    pub async fn snapshot(&self) -> StatusSnapshot {
+        StatusSnapshot::Client(self.client_status().await)
     }
 
     /// Build the current serializable client status.
-    fn client_status(&self) -> ClientStatus {
+    async fn client_status(&self) -> ClientStatus {
         // Copy out everything needed under the lock and clone the probe, then
-        // drop the guard before invoking the probe. The probe may call into
-        // iroh and block, so it must not run while holding the lock (which
-        // would stall `set_connected`/`set_disconnected`).
+        // drop the guard before awaiting the probe. The (std, non-async) lock
+        // must not be held across the probe's `.await` — the probe performs
+        // on-demand HTTP and would otherwise stall
+        // `set_connected`/`set_disconnected`.
         let (
             instance,
             connected,
@@ -338,7 +344,10 @@ impl ClientStatusHandle {
         } else {
             "ipv4"
         };
-        let connection = probe.map(|probe| probe());
+        let connection = match probe {
+            Some(probe) => Some(probe().await),
+            None => None,
+        };
         ClientStatus {
             instance,
             state: if connected {
@@ -393,13 +402,14 @@ impl Drop for StatusListenerGuard {
 /// Spawn a status listener for `role`/`instance` that serves snapshots produced
 /// by `provider` on demand. The returned guard keeps the listener alive; drop it
 /// to stop serving.
-pub fn spawn_status_listener<F>(
+pub fn spawn_status_listener<F, Fut>(
     role: LockRole,
     instance: &str,
     provider: F,
 ) -> VpnResult<StatusListenerGuard>
 where
-    F: Fn() -> StatusSnapshot + Send + Sync + 'static,
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = StatusSnapshot> + Send + 'static,
 {
     // Guard against unchecked input reaching socket/pipe path construction.
     validate_instance_name(instance)?;
@@ -499,12 +509,13 @@ where
 }
 
 /// Write one JSON snapshot line to a connected stream, then close it.
-async fn serve_one<S, F>(stream: &mut S, provider: &F)
+async fn serve_one<S, F, Fut>(stream: &mut S, provider: &F)
 where
     S: AsyncWriteExt + Unpin,
-    F: Fn() -> StatusSnapshot + ?Sized,
+    F: Fn() -> Fut + ?Sized,
+    Fut: std::future::Future<Output = StatusSnapshot>,
 {
-    let snapshot = provider();
+    let snapshot = provider().await;
     match serde_json::to_vec(&snapshot) {
         Ok(mut bytes) => {
             bytes.push(b'\n');
@@ -898,10 +909,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn client_handle_tracks_connection_state() {
+    #[tokio::test]
+    async fn client_handle_tracks_connection_state() {
         let handle = ClientStatusHandle::new("default".into(), "server-node".into(), 0xdead_beef);
-        let snap = handle.client_status();
+        let snap = handle.client_status().await;
         assert_eq!(snap.instance, "default");
         assert_eq!(snap.state, "disconnected");
         assert_eq!(snap.device_id, "00000000deadbeef");
@@ -919,18 +930,22 @@ mod tests {
                 routes: vec!["0.0.0.0/0".into()],
                 ..Default::default()
             },
-            Arc::new(|| ConnectionSnapshot {
-                description: "relay https://relay.example".into(),
-                paths: Vec::new(),
-                custom_relays: vec![CustomRelayStatus {
-                    url: "https://relay.example/".into(),
-                    working: Some(true),
-                    error: None,
-                }],
+            Arc::new(|| {
+                Box::pin(async {
+                    ConnectionSnapshot {
+                        description: "relay https://relay.example".into(),
+                        paths: Vec::new(),
+                        custom_relays: vec![CustomRelayStatus {
+                            url: "https://relay.example/".into(),
+                            working: Some(true),
+                            error: None,
+                        }],
+                    }
+                })
             }),
             Some(Arc::new(|| vec!["198.51.100.7".to_string()])),
         );
-        let snap = handle.client_status();
+        let snap = handle.client_status().await;
         assert_eq!(snap.state, "connected");
         assert_eq!(snap.mode, "ipv4");
         assert_eq!(snap.assigned_ip.as_deref(), Some("10.0.0.2"));
@@ -942,7 +957,7 @@ mod tests {
         assert_eq!(snap.bypass_addrs, vec!["198.51.100.7".to_string()]);
 
         handle.set_disconnected();
-        let snap = handle.client_status();
+        let snap = handle.client_status().await;
         assert_eq!(snap.state, "disconnected");
         assert!(snap.connection.is_none());
         assert!(snap.custom_relays.is_empty());
@@ -1003,7 +1018,7 @@ mod tests {
                 .is_none()
         );
 
-        let provider = || {
+        let provider = || async {
             StatusSnapshot::Server(ServerStatus {
                 node_id: "test-node".into(),
                 uptime_secs: 5,
@@ -1075,8 +1090,11 @@ mod tests {
         let _lock = VpnLock::acquire(LockRole::Client, &instance).expect("acquire lock");
         let handle = ClientStatusHandle::new(instance.clone(), "server-node".into(), 0x1234);
         let probe = handle.clone();
-        let guard = spawn_status_listener(LockRole::Client, &instance, move || probe.snapshot())
-            .expect("listener spawns");
+        let guard = spawn_status_listener(LockRole::Client, &instance, move || {
+            let probe = probe.clone();
+            async move { probe.snapshot().await }
+        })
+        .expect("listener spawns");
 
         let instances = list_instances(LockRole::Client).await.expect("list ok");
         let found = instances

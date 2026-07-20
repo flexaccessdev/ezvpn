@@ -82,8 +82,8 @@ pub struct EzvpnHandle {
     /// Clone of the live iroh connection, kept so [`ezvpn_conn_path`] can
     /// snapshot its paths on demand after `ezvpn_run` consumed the session.
     connection: iroh::endpoint::Connection,
-    /// Endpoint and configured custom relays retained for live health status.
-    endpoint: iroh::Endpoint,
+    /// Configured custom relays, retained so [`ezvpn_conn_path`] can probe their
+    /// `/healthz` on demand.
     relay_config: RelayConfig,
 }
 
@@ -227,14 +227,12 @@ fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
     .to_string();
 
     let connection = session.connection();
-    let endpoint = session.endpoint();
     Ok((
         EzvpnHandle {
             runtime,
             session: Some(session),
             task: None,
             connection,
-            endpoint,
             relay_config,
         },
         result_json,
@@ -279,7 +277,13 @@ pub unsafe extern "C" fn ezvpn_conn_path(
         return -1;
     }
     let handle = unsafe { &*handle };
-    let snapshot = connection_snapshot(&handle.connection, &handle.endpoint, &handle.relay_config);
+    // The relay health check performs on-demand HTTP, so drive the async
+    // snapshot on the embedded runtime. Called from the extension's own thread
+    // (never a runtime worker), so `block_on` is safe and does not stall the
+    // running tunnel task.
+    let snapshot = handle
+        .runtime
+        .block_on(connection_snapshot(&handle.connection, &handle.relay_config));
     let paths: Vec<_> = snapshot.paths
         .into_iter()
         .map(|p| {

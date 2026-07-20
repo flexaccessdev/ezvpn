@@ -1014,7 +1014,8 @@ async fn run_vpn_client(
     let status_handle = client.status_handle();
     let _status_listener =
         control::spawn_status_listener(LockRole::Client, instance, move || {
-            status_handle.snapshot()
+            let status_handle = status_handle.clone();
+            async move { status_handle.snapshot().await }
         });
     match &_status_listener {
         Ok(_) => log::info!(

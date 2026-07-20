@@ -518,7 +518,6 @@ impl VpnClient {
         // (direct/relay). A second probe reports the bypass addresses the manager
         // has collected (intended bypasses), when a manager is running.
         let status_conn = connection.clone();
-        let status_endpoint = endpoint.clone();
         let status_relay_config = relay_config.clone();
         let bypass_probe: Option<crate::control::BypassRoutesProbe> =
             bypass_collected.map(|collected| {
@@ -542,11 +541,11 @@ impl VpnClient {
                 routes6: active_routes6,
             },
             Arc::new(move || {
-                crate::transport::paths::connection_snapshot(
-                    &status_conn,
-                    &status_endpoint,
-                    &status_relay_config,
-                )
+                let conn = status_conn.clone();
+                let relay_config = status_relay_config.clone();
+                Box::pin(async move {
+                    crate::transport::paths::connection_snapshot(&conn, &relay_config).await
+                })
             }),
             bypass_probe,
         );

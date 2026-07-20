@@ -248,11 +248,31 @@ variant and applied to every entry in the custom relay map
 <token>` header on each relay WebSocket upgrade. It is **strictly gated to custom
 relays**: `RelayConfig::from_urls_with_token` rejects a token supplied without
 `relay_urls`, so the default n0 relays never receive one and the feature is inert
-in default mode. The token is not separately validated — custom relay URLs are
-always parse-validated, and the existing `endpoint.online()` wait
-(`RELAY_CONNECT_TIMEOUT`) fails startup if the relay rejects the token or is
-unreachable. Server and clients that share a private relay must configure the
+in default mode. Server and clients that share a private relay must configure the
 same token.
+
+**Custom relay validation.** Custom relays are checked in two independent places:
+
+1. *Per-relay startup probe (`endpoint::probe_custom_relays`).* Before binding
+   the real endpoint, each configured relay is probed **individually** by binding
+   a throwaway, relay-only endpoint (`clear_ip_transports`, ephemeral identity)
+   for just that one URL and waiting on `endpoint.online()`, bounded by
+   `RELAY_CONNECT_TIMEOUT`. Startup **fails if any** relay does not come online.
+   This is stricter than — and replaces — the previous single endpoint-wide
+   `online()` wait, which only proved that *one* relay (the eventual home relay)
+   connected and so gave a misleading all-clear when a backup relay was down.
+   Because the auth token rides the relay WebSocket upgrade, this probe also
+   validates the token: a relay that rejects it never comes online and startup
+   fails.
+2. *On-demand `/healthz` status (`paths::probe_custom_relay_health`).* The
+   connection-status surface (`ezvpn client status`, the iOS/Windows
+   connection-path sheet via `ezvpn_conn_path`/`ezvpn_status`) reports each
+   relay's health by GETting its unauthenticated `/healthz` endpoint (all relays
+   in parallel, short timeout). This runs only when a status snapshot is
+   requested, never on the tunnel's hot path, and reflects a live per-relay
+   up/down rather than iroh's single home-relay view. Note `/healthz` is
+   unauthenticated, so it confirms the relay is *up*, not that the token is
+   accepted — token validation is the startup probe's job.
 
 ### Segmentation Offload (GSO/GRO)
 
