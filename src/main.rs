@@ -159,7 +159,8 @@ enum ClientAction {
         relay_urls: Vec<String>,
 
         /// Shared bearer token for the custom relays (sent as
-        /// `Authorization: Bearer <token>`). Requires --relay-url.
+        /// `Authorization: Bearer <token>`). Requires custom relay URLs from
+        /// --relay-url or the configured [iroh].relay_urls setting.
         #[arg(long = "relay-token")]
         relay_auth_token: Option<String>,
 

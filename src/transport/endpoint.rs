@@ -59,7 +59,10 @@ impl RelayConfig {
     /// relay URLs is a hard error, since the default iroh relays never take a
     /// token. This surfaces the misconfiguration before the endpoint starts.
     pub fn from_urls_with_token(urls: &[String], auth_token: Option<String>) -> Result<Self> {
-        let auth_token = auth_token.filter(|t| !t.trim().is_empty());
+        let auth_token = auth_token.and_then(|token| {
+            let token = token.trim();
+            (!token.is_empty()).then(|| token.to_string())
+        });
         if urls.is_empty() {
             if auth_token.is_some() {
                 anyhow::bail!(
@@ -357,10 +360,12 @@ mod tests {
     }
 
     #[test]
-    fn custom_urls_with_token_retained() {
-        let cfg =
-            RelayConfig::from_urls_with_token(&[RELAY.to_string()], Some("secret".to_string()))
-                .unwrap();
+    fn custom_urls_with_token_trimmed() {
+        let cfg = RelayConfig::from_urls_with_token(
+            &[RELAY.to_string()],
+            Some("  secret\n".to_string()),
+        )
+        .unwrap();
         assert!(cfg.is_custom());
         assert_eq!(cfg.relay_auth_token(), Some("secret"));
         assert!(matches!(cfg.relay_mode(), RelayMode::Custom(_)));
