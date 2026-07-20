@@ -24,7 +24,7 @@ use ezvpn::config::file_config::{
     load_vpn_client_config, load_vpn_server_config,
 };
 use ezvpn::runtime::LockRole;
-use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoints, load_secret};
+use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
 // Runtime config types (different from the TOML config types in config::file_config)
 use ezvpn::config::{VpnClientConfig, VpnServerConfig};
 use ezvpn::tunnel::{VpnClient, VpnServer};
@@ -903,29 +903,27 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // setup_tun() after the endpoint is up.
     ezvpn::net::device::ensure_tun_permission()?;
 
-    // Create iroh endpoint(s) for signaling. Direct P2P is strongly preferred
+    // Create the iroh endpoint for signaling. Direct P2P is strongly preferred
     // for VPN traffic; relays are only the automatic fallback when a direct
-    // connection fails. `create_server_endpoints` owns the default-vs-custom
-    // relay policy: one endpoint on the default relays, or one endpoint per
-    // custom relay with bounded startup attempts and background retry of
-    // relays that were down at startup (delivered via `late_endpoint_rx`).
-    let (endpoints, late_endpoint_rx) =
-        create_server_endpoints(&resolved.relay_config, secret_key).await?;
+    // connection fails. Address lookup is always on, so a single endpoint
+    // serves both the default and custom relay modes.
+    let endpoint = create_server_endpoint(&resolved.relay_config, Some(secret_key))
+        .await
+        .context("Failed to create iroh endpoint")?;
 
-    let server_id = endpoints[0].id();
-    log::info!("VPN Server Node ID: {}", server_id);
+    log::info!("VPN Server Node ID: {}", endpoint.id());
     log::info!(
         "Clients connect with: ezvpn client start --server-node-id {} --auth-token <TOKEN>",
-        server_id
+        endpoint.id()
     );
 
     // Create and run VPN server
-    let server = VpnServer::new(config, server_id)
+    let server = VpnServer::new(config, endpoint.id())
         .await
         .context("Failed to create VPN server")?;
 
     server
-        .run(endpoints, late_endpoint_rx)
+        .run(endpoint)
         .await
         .map_err(|e| anyhow::anyhow!("VPN server error: {}", e))
 }
