@@ -47,6 +47,9 @@ pub struct ServerAuthConfig {
 pub struct VpnServerIrohConfig {
     pub secret_file: Option<PathBuf>,
     pub relay_urls: Option<Vec<String>>,
+    /// Optional shared bearer token sent to the custom relays as
+    /// `Authorization: Bearer <token>`. Only valid together with `relay_urls`.
+    pub relay_auth_token: Option<String>,
 }
 
 /// VPN routes the client installs once connected. `[network]` section.
@@ -71,6 +74,9 @@ pub struct ClientAuthConfig {
 pub struct VpnClientIrohConfig {
     pub server_node_id: Option<String>,
     pub relay_urls: Option<Vec<String>>,
+    /// Optional shared bearer token sent to the custom relays as
+    /// `Authorization: Bearer <token>`. Only valid together with `relay_urls`.
+    pub relay_auth_token: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -365,7 +371,10 @@ impl ResolvedVpnServerConfig {
             server_ip6: net.server_ip6.clone(),
             ip6_strategy: net.ip6_strategy,
             secret_file: iroh.secret_file.clone(),
-            relay_config: RelayConfig::from_urls(iroh.relay_urls.as_deref().unwrap_or_default())?,
+            relay_config: RelayConfig::from_urls_with_token(
+                iroh.relay_urls.as_deref().unwrap_or_default(),
+                iroh.relay_auth_token.clone(),
+            )?,
             auth_tokens: auth.auth_tokens.clone().unwrap_or_default(),
             auth_tokens_file: auth.auth_tokens_file.clone(),
         })
@@ -392,6 +401,7 @@ pub struct VpnClientConfigBuilder {
     routes: Option<Vec<String>>,
     routes6: Option<Vec<String>>,
     relay_urls: Option<Vec<String>>,
+    relay_auth_token: Option<String>,
     auto_reconnect: Option<bool>,
     max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -416,6 +426,9 @@ impl VpnClientConfigBuilder {
                 }
                 if iroh.relay_urls.is_some() {
                     self.relay_urls = iroh.relay_urls.clone();
+                }
+                if iroh.relay_auth_token.is_some() {
+                    self.relay_auth_token = iroh.relay_auth_token.clone();
                 }
             }
             if cfg.auth.auth_token.is_some() {
@@ -449,6 +462,7 @@ impl VpnClientConfigBuilder {
         routes: Vec<String>,
         routes6: Vec<String>,
         relay_urls: Vec<String>,
+        relay_auth_token: Option<String>,
         auto_reconnect: Option<bool>,
         max_reconnect_attempts: Option<NonZeroU32>,
     ) -> Self {
@@ -469,6 +483,9 @@ impl VpnClientConfigBuilder {
         }
         if !relay_urls.is_empty() {
             self.relay_urls = Some(relay_urls);
+        }
+        if relay_auth_token.is_some() {
+            self.relay_auth_token = relay_auth_token;
         }
         if auto_reconnect.is_some() {
             self.auto_reconnect = auto_reconnect;
@@ -509,7 +526,10 @@ impl VpnClientConfigBuilder {
             auth_token_file: self.auth_token_file,
             routes,
             routes6,
-            relay_config: RelayConfig::from_urls(self.relay_urls.as_deref().unwrap_or_default())?,
+            relay_config: RelayConfig::from_urls_with_token(
+                self.relay_urls.as_deref().unwrap_or_default(),
+                self.relay_auth_token,
+            )?,
             auto_reconnect: self.auto_reconnect.unwrap_or(true),
             max_reconnect_attempts: self.max_reconnect_attempts,
         })
@@ -625,6 +645,83 @@ relay_urls = ["https://relay.example.com"]
             RelayConfig::from_urls(&["https://relay.example.com".to_string()]).unwrap()
         );
         assert_eq!(resolved.relay_config.custom_urls().len(), 1);
+    }
+
+    #[test]
+    fn test_client_relay_auth_token_parses_and_resolves() {
+        let config: VpnClientConfig = toml::from_str(
+            r#"
+role = "vpnclient"
+
+[iroh]
+server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+relay_urls = ["https://relay.example.com"]
+relay_auth_token = "shared-secret"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.iroh.as_ref().unwrap().relay_auth_token.as_deref(),
+            Some("shared-secret")
+        );
+
+        let resolved = VpnClientConfigBuilder::new()
+            .apply_defaults()
+            .apply_config(Some(&config))
+            .build()
+            .unwrap();
+        assert_eq!(
+            resolved.relay_config.relay_auth_token(),
+            Some("shared-secret")
+        );
+    }
+
+    /// A relay token with no custom relays is rejected at build time (before the
+    /// endpoint starts) — the default iroh relays never take a token.
+    #[test]
+    fn test_client_relay_auth_token_without_relays_rejected() {
+        let config: VpnClientConfig = toml::from_str(
+            r#"
+role = "vpnclient"
+
+[iroh]
+server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+relay_auth_token = "shared-secret"
+"#,
+        )
+        .unwrap();
+        let err = VpnClientConfigBuilder::new()
+            .apply_defaults()
+            .apply_config(Some(&config))
+            .build()
+            .expect_err("relay_auth_token without relay_urls must be rejected");
+        assert!(
+            err.to_string().contains("relay_auth_token requires"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_server_relay_auth_token_without_relays_rejected() {
+        let config: VpnServerConfig = toml::from_str(
+            r#"
+role = "vpnserver"
+
+[network]
+network6 = "fd00::/64"
+
+[iroh]
+secret_file = "./vpn-server.key"
+relay_auth_token = "shared-secret"
+"#,
+        )
+        .unwrap();
+        let err = ResolvedVpnServerConfig::from_config(&config)
+            .expect_err("relay_auth_token without relay_urls must be rejected");
+        assert!(
+            err.to_string().contains("relay_auth_token requires"),
+            "unexpected error: {err}"
+        );
     }
 
     /// A typo in a top-level key must be rejected, not silently ignored.
