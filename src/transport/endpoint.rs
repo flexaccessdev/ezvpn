@@ -24,13 +24,18 @@ pub const RELAY_REGISTER_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// Relay configuration, resolved once from the raw config strings.
 ///
 /// This is the single source of the default-vs-custom distinction. iroh's
-/// default relay map comes with n0 peer discovery; a custom relay set doubles
-/// as the rendezvous point instead (discovery is disabled), so the server must
-/// hold a registration on every custom relay ([`create_server_endpoints`]) and
-/// the client must dial with the relay URLs as hints.
+/// default relay map comes with address lookup (pkarr publishing + DNS
+/// resolution of the peer's home relay — see
+/// <https://docs.iroh.computer/concepts/address-lookup>); a custom relay set
+/// doubles as the rendezvous point instead, with address lookup disabled for
+/// self-containment. Without lookup, nothing tells a dialer which single home
+/// relay an endpoint chose, so the server must hold a registration on every
+/// custom relay ([`create_server_endpoints`]) and the client must dial with
+/// the relay URLs as `EndpointAddr` hints. See "Relays and Address Lookup" in
+/// `docs/Architecture.md` for the full rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RelayConfig {
-    /// iroh's default relay map, with n0 peer discovery.
+    /// iroh's default relay map, with n0 address lookup.
     #[default]
     Default,
     /// Custom relay set (parsed, sorted, deduped). Never empty.
@@ -160,10 +165,13 @@ fn warn_if_socket_buffer_capped() {
 
 /// Create a base endpoint builder with common configuration.
 ///
-/// iroh peer discovery (the n0 discovery service — pkarr publishing + DNS-based
-/// lookup) is enabled only when using the default relays. A custom relay doubles
-/// as the rendezvous point, so discovery is disabled automatically whenever one
-/// is configured. (This is iroh peer discovery, not real DNS resolution.)
+/// iroh address lookup (pkarr publishing + DNS-based lookup of
+/// `_iroh.<endpoint-id>.dns.iroh.link`, see
+/// <https://docs.iroh.computer/concepts/address-lookup>) is enabled only when
+/// using the default relays. A custom relay doubles as the rendezvous point,
+/// so lookup is disabled automatically whenever one is configured — nothing
+/// about the deployment is published to n0's public DNS infrastructure, and
+/// the workarounds described on [`RelayConfig`] take over.
 pub fn create_endpoint_builder(relay_config: &RelayConfig) -> Result<EndpointBuilder> {
     warn_if_socket_buffer_capped();
     let transport_config = build_quic_transport_config()?;
@@ -176,11 +184,11 @@ pub fn create_endpoint_builder(relay_config: &RelayConfig) -> Result<EndpointBui
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()));
 
     if relay_config.is_custom() {
-        // Custom relay doubles as the rendezvous point, so the n0 discovery
-        // service is unnecessary and is disabled automatically.
-        info!("Peer discovery disabled (custom relay in use)");
+        // Custom relay doubles as the rendezvous point, so n0 address lookup
+        // is unnecessary and is disabled automatically.
+        info!("Address lookup disabled (custom relay in use)");
     } else {
-        // Default n0 discovery (DNS-based lookup + pkarr publishing)
+        // Default n0 address lookup (pkarr publishing + DNS-based lookup)
         builder = builder
             .address_lookup(PkarrPublisher::n0_dns())
             .address_lookup(DnsAddressLookup::n0_dns());
@@ -232,8 +240,11 @@ pub async fn create_server_endpoint(
 ///   receiver is already closed.
 /// - **Custom relays**: one endpoint per relay, all sharing the server
 ///   identity, so the server is reachable regardless of which configured relay
-///   a client can access (iroh gives each endpoint a single home relay, and
-///   relays do not forward to each other). Registrations run concurrently and
+///   a client can access. iroh gives each endpoint a single home relay, relays
+///   are stateless and do not forward to each other, and with address lookup
+///   disabled no published record tells a dialer which relay the server chose
+///   (see `docs/Architecture.md`, "Relays and Address Lookup"). Registrations
+///   run concurrently and
 ///   each is bounded by [`RELAY_CONNECT_TIMEOUT`], so an unreachable relay can
 ///   never stall startup. This fails only when *every* relay is unreachable;
 ///   relays that failed while at least one succeeded are retried in a
