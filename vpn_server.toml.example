@@ -143,8 +143,9 @@ secret_file = "./vpn-server.key"
 # Relay and Discovery (Optional)
 # ============================================================================
 
-# Custom relay server URL(s) for failover
-# Must match client's relay configuration for discovery
+# Custom relay server URL(s). The server registers its identity on every URL,
+# allowing clients to connect through any relay they can reach.
+# A client's relay list must include at least one of these URLs.
 # relay_urls = [
 #     "https://relay1.example.com",
 #     "https://relay2.example.com",

@@ -111,8 +111,9 @@ server_node_id = "changeme"
 # Relay and Discovery (Optional)
 # ============================================================================
 
-# Custom relay server URL(s) for failover
-# Must match server's relay configuration for discovery
+# Custom relay server URL(s). The client can connect through any configured
+# relay on which the server is registered.
+# Must include at least one URL configured on the server.
 # relay_urls = [
 #     "https://relay1.example.com",
 #     "https://relay2.example.com",

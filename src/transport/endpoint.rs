@@ -64,10 +64,7 @@ pub fn print_relay_status(relay_urls: &[String], relay_only: bool, using_custom_
         if relay_urls.len() == 1 {
             info!("Using custom relay server");
         } else {
-            info!(
-                "Using {} custom relay servers (with failover)",
-                relay_urls.len()
-            );
+            info!("Using {} custom relay servers", relay_urls.len());
         }
     }
     if relay_only {

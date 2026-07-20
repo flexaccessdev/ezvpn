@@ -154,7 +154,7 @@ enum ClientAction {
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
 
-        /// Custom relay server URL(s) for failover
+        /// Custom relay server URL(s)
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
 
@@ -903,31 +903,72 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // setup_tun() after the endpoint is up.
     ezvpn::net::device::ensure_tun_permission()?;
 
-    // Create iroh endpoint for signaling.
+    // Create iroh endpoint(s) for signaling.
     // relay_only is hardcoded to false: VPN traffic is high-bandwidth and latency-sensitive,
     // making relay-only impractical. Direct P2P is strongly preferred; relay is only used
     // as automatic fallback when direct connection fails.
-    let endpoint = create_server_endpoint(
-        &resolved.relay_urls,
-        false, // relay_only - direct P2P preferred for VPN performance
-        Some(secret_key),
-    )
-    .await
-    .context("Failed to create iroh endpoint")?;
+    // iroh selects one home relay per endpoint. A custom-relay server therefore
+    // needs an endpoint on each relay so the same server identity is reachable
+    // regardless of which configured relay a client can access.
+    let endpoints = if resolved.relay_urls.is_empty() {
+        vec![create_server_endpoint(
+            &[],
+            false, // relay_only - direct P2P preferred for VPN performance
+            Some(secret_key),
+        )
+        .await
+        .context("Failed to create iroh endpoint")?]
+    } else {
+        let mut relay_urls = resolved.relay_urls.clone();
+        relay_urls.sort();
+        relay_urls.dedup();
+        let attempts = futures::future::join_all(relay_urls.into_iter().map(|relay_url| {
+            let secret_key = secret_key.clone();
+            async move {
+                let endpoint = create_server_endpoint(
+                    std::slice::from_ref(&relay_url),
+                    false,
+                    Some(secret_key),
+                )
+                .await;
+                (relay_url, endpoint)
+            }
+        }))
+        .await;
+        let mut endpoints = Vec::new();
+        for (relay_url, result) in attempts {
+            match result {
+                Ok(endpoint) => {
+                    log::info!("Server registered on custom relay {}", relay_url);
+                    endpoints.push(endpoint);
+                }
+                Err(e) => log::warn!(
+                    "Could not register server on custom relay {}: {:#}",
+                    relay_url,
+                    e
+                ),
+            }
+        }
+        if endpoints.is_empty() {
+            anyhow::bail!("Failed to register the VPN server on any configured custom relay");
+        }
+        endpoints
+    };
 
-    log::info!("VPN Server Node ID: {}", endpoint.id());
+    let server_id = endpoints[0].id();
+    log::info!("VPN Server Node ID: {}", server_id);
     log::info!(
         "Clients connect with: ezvpn client start --server-node-id {} --auth-token <TOKEN>",
-        endpoint.id()
+        server_id
     );
 
     // Create and run VPN server
-    let server = VpnServer::new(config, endpoint.id())
+    let server = VpnServer::new(config, server_id)
         .await
         .context("Failed to create VPN server")?;
 
     server
-        .run(endpoint)
+        .run(endpoints)
         .await
         .map_err(|e| anyhow::anyhow!("VPN server error: {}", e))
 }

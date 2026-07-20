@@ -689,8 +689,9 @@ restart or allocation state changes.
 
 `ezvpn` can use custom iroh relay and discovery infrastructure:
 
-- `relay_urls` / `--relay-url` configure custom relay servers for failover and
-  connection hints.
+- `relay_urls` / `--relay-url` configure custom relay servers. The server
+  registers the same identity independently on every configured relay, and
+  clients can connect through any of those relays that they can reach.
 - iroh peer discovery (the n0 discovery service — pkarr + DNS-based lookup) is
   used automatically when the default relays are in use. It is not configurable.
   This is iroh peer discovery, not real/VPN DNS: it does not affect client DNS
@@ -698,9 +699,10 @@ restart or allocation state changes.
   To resolve an internal zone through a resolver reachable over the tunnel, set
   OS-level conditional forwarding — see
   [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
-- When a custom relay is configured, it doubles as the rendezvous point and the
-  discovery service is disabled automatically; clients and server then connect
-  through their common relay. Server and client relay settings must match.
+- When custom relays are configured, they double as rendezvous points and the
+  discovery service is disabled automatically. The server maintains an endpoint
+  on each relay; a client's relay list must overlap the server's list, but it
+  does not need to contain every server relay.
 
 See the relay and discovery comments in `vpn_server.toml.example` and
 `vpn_client.toml.example` for exact TOML syntax.
