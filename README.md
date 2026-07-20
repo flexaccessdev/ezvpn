@@ -689,28 +689,22 @@ restart or allocation state changes.
 
 `ezvpn` can use custom iroh relay infrastructure:
 
-- `relay_urls` / `--relay-url` configure custom relay servers. The server
-  registers the same identity independently on every configured relay, and
-  clients can connect through any of those relays that they can reach.
-  Relays that are unreachable at server startup are retried in the background
-  and re-registered when they come back; startup fails only if every
-  configured relay is unreachable.
+- `relay_urls` / `--relay-url` configure custom relay servers. This only
+  changes which relay map iroh uses for the transport path; the server still
+  uses a single endpoint and its usual relay failover.
 - [iroh address lookup](https://docs.iroh.computer/concepts/address-lookup)
-  (pkarr publishing + DNS-based lookup via n0's `dns.iroh.link`) is used
-  automatically when the default relays are in use. It is not configurable.
+  (pkarr publishing + DNS-based lookup via n0's `dns.iroh.link`) is always
+  used — for both the default relays and custom relays — so a client resolves
+  the server's current home relay by endpoint ID. It is not configurable.
   This is iroh's endpoint-ID resolution, not real/VPN DNS: it does not affect
   client DNS resolution, and the client does not push DNS or match domains
   over the tunnel. To resolve an internal zone through a resolver reachable
   over the tunnel, set OS-level conditional forwarding — see
   [docs/Client-Split-DNS.md](docs/Client-Split-DNS.md).
-- When custom relays are configured, they double as rendezvous points and
-  address lookup is disabled automatically — nothing about the deployment is
-  published to n0's public DNS. Because a relay only reaches peers connected
-  to it (relays do not forward to each other) and no lookup record advertises
-  which relay the server chose, the server maintains an endpoint on each
-  relay and the client dials with its relay list as hints. A client's relay
-  list must overlap the server's list, but it does not need to contain every
-  server relay. See "Relays and Address Lookup" in
+- With custom relays, the client also attaches its configured relay URLs to
+  the connection as dial hints. That is only an optimization on top of address
+  lookup (it lets iroh start relay routing before the lookup completes); the
+  connection does not depend on it. See "Relays and Address Lookup" in
   [docs/Architecture.md](docs/Architecture.md) for the full design rationale.
 
 See the relay comments in `vpn_server.toml.example` and

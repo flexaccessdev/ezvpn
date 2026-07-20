@@ -198,10 +198,11 @@ The 64-bit ID space provides a ~2^32 birthday bound for collisions, which is suf
 
 ### Relays and Address Lookup (Default vs Custom)
 
-How a client finds the server depends entirely on whether custom relays are
-configured. The distinction is resolved once, at config time, into the
-`RelayConfig` enum (`src/transport/endpoint.rs`) — `Default` vs `Custom` — and
-everything below follows from it.
+How a client finds the server is uniform across relay modes. The default-vs-
+custom distinction is resolved once, at config time, into the `RelayConfig`
+enum (`src/transport/endpoint.rs`) — `Default` vs `Custom` — but the *only*
+thing it changes is which relay map iroh uses. Address lookup is always on, so
+a single endpoint per side serves both modes.
 
 **Background: iroh address lookup.** Dialing an iroh endpoint by `EndpointId`
 alone works because of [address
@@ -209,8 +210,7 @@ lookup](https://docs.iroh.computer/concepts/address-lookup): each endpoint
 signs a pkarr record containing its **home relay** URL (and optionally direct
 addresses) and publishes it to n0's `iroh-dns-server`; a dialer resolves
 `_iroh.<z32-endpoint-id>.dns.iroh.link TXT` to learn `relay=<url>` /
-`addr=<addr>` and knows where to reach the peer. Two facts matter for
-everything below:
+`addr=<addr>` and knows where to reach the peer. Two facts matter:
 
 1. An endpoint has **one home relay** at a time. It is reachable for inbound
    connections only through that relay.
@@ -218,49 +218,27 @@ everything below:
    connected where and do not forward to each other. Traffic sent to a relay
    the peer is not connected to goes nowhere.
 
-With the **default relays**, ezvpn enables the full lookup stack
-(`PkarrPublisher` + `DnsAddressLookup`, see `create_endpoint_builder`): the
-server publishes its current home relay, the client resolves it, and iroh's
-relay failover works — if the server's home relay dies, it re-homes to another
-relay from the default map and republishes; dialers find the new record. One
-endpoint per side, no extra machinery.
+ezvpn enables the full lookup stack (`PkarrPublisher` + `DnsAddressLookup`, see
+`create_endpoint_builder`) **regardless of relay mode**: the server publishes
+its current home relay, the client resolves it, and iroh's relay failover works
+— if the server's home relay dies, it re-homes to another relay from the
+configured map and republishes; dialers find the new record. One endpoint per
+side, no extra machinery. This is true whether the map is n0's default set or a
+custom set: with custom relays the home relay is simply one of the configured
+URLs, but the pkarr record is still published to and resolved from n0's
+`dns.iroh.link`.
 
-With **custom relays**, ezvpn deliberately disables address lookup (no pkarr
-publishing, no DNS lookup). A custom relay deployment is meant to be
-self-contained: the server's identity, relay choice, and addresses are not
-published to n0's public DNS infrastructure, and connectivity does not depend
-on `dns.iroh.link` being reachable. The custom relay itself doubles as the
-rendezvous point. But disabling lookup removes the machinery that fact 1 and
-fact 2 rely on, which is exactly why the following workarounds exist:
+The client additionally attaches every configured custom relay URL to the
+server's `EndpointAddr` as transport-address hints (see
+`VpnClient::resolve_server_addr`). This is only an optimization — the same
+information an iroh *ticket* would carry — letting iroh begin relay routing
+immediately instead of waiting on the DNS lookup. Connectivity does not depend
+on the hints; address lookup alone is sufficient.
 
-- **Dial hints instead of DNS resolution (client).** There is no record to
-  resolve `relay=` from, so the client attaches every configured relay URL to
-  the server's `EndpointAddr` as transport-address hints (the same information
-  an iroh *ticket* would carry). See `VpnClient::resolve_server_addr`.
-- **One server endpoint per relay (server).** Lookup would normally tell the
-  dialer *which* relay is the server's home. Without it, a client only knows
-  the configured list — and per facts 1 and 2, a server homed on relay B is
-  simply unreachable via relay A, even though iroh "supports multiple relays":
-  iroh's automatic failover moves an endpoint's *own* home-relay connection,
-  it does not make relays route to each other. So the server binds one iroh
-  endpoint per configured relay, all sharing the same secret key/identity,
-  keeping a live registration on every relay. Whichever single relay a client
-  can reach, the server is there. See `create_server_endpoints`
-  (`src/transport/endpoint.rs`). The client stays a single endpoint — it only
-  dials out and never needs to be found.
-- **Bounded startup, background re-registration (server).** Every per-relay
-  registration attempt is bounded by `RELAY_CONNECT_TIMEOUT` (10 s), so an
-  unreachable relay cannot stall startup; startup fails only if *every* relay
-  is unreachable. Relays that were down at startup are retried every
-  `RELAY_REGISTER_RETRY_INTERVAL` (30 s) and folded into the running server
-  when they come back (`VpnServer::run` accepts late endpoints: new accept
-  loop, self-encapsulation port filter, status). Without published records, a
-  missed registration would otherwise silently remove that rendezvous until
-  the next server restart.
-
-The trade-off is explicit: default relays outsource findability to n0's
-lookup infrastructure and get single-endpoint simplicity; custom relays trade
-that for self-containment and pay with per-relay registrations and dial hints.
+The trade-off: custom relays let a deployment run its own relay infrastructure
+for the transport path, but findability still relies on n0's public lookup
+(`dns.iroh.link`). Both modes therefore share the same single-endpoint,
+lookup-based rendezvous.
 
 ### Segmentation Offload (GSO/GRO)
 

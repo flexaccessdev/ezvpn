@@ -313,10 +313,10 @@ impl VpnClient {
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for the connection
-    /// * `relay_config` - Custom relays become dial hints (required for the
-    ///   connection to succeed, since custom relays disable address lookup).
-    ///   iroh will attempt hole punching for direct P2P connections, falling
-    ///   back to relay transport if needed.
+    /// * `relay_config` - Any configured custom relays are attached as dial
+    ///   hints; address lookup is always enabled, so the server's home relay is
+    ///   also resolvable by endpoint ID. iroh will attempt hole punching for
+    ///   direct P2P connections, falling back to relay transport if needed.
     pub async fn connect(&self, endpoint: &Endpoint, relay_config: &RelayConfig) -> VpnResult<()> {
         let endpoint_addr = self.resolve_server_addr(relay_config)?;
 
@@ -624,11 +624,11 @@ impl VpnClient {
     /// Resolve the server's `EndpointAddr`, with the custom relays (if any) as
     /// dial hints.
     ///
-    /// Custom relays disable iroh address lookup, so there is no published
-    /// record to resolve the server's home relay from; the hints stand in for
-    /// that record (like an iroh ticket) and are required for the connection
-    /// to succeed. iroh uses the relay for initial connection routing while
-    /// still attempting hole punching for direct P2P.
+    /// Address lookup is always enabled, so the server's home relay is
+    /// resolvable from its published record by endpoint ID. The hints are an
+    /// optimization: they let iroh start relay routing immediately instead of
+    /// waiting on the lookup, while it still attempts hole punching for direct
+    /// P2P.
     fn resolve_server_addr(&self, relay_config: &RelayConfig) -> VpnResult<EndpointAddr> {
         // Parse server endpoint ID
         let server_id: EndpointId = self.config.server_node_id.parse().map_err(|e| {
@@ -1343,8 +1343,8 @@ impl VpnClient {
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for connections
-    /// * `relay_config` - Custom relays become dial hints (required for the
-    ///   connection to succeed, since custom relays disable address lookup).
+    /// * `relay_config` - Any configured custom relays are attached as dial
+    ///   hints; address lookup is always enabled (see [`Self::connect`]).
     /// * `max_attempts` - Maximum total connection attempts (None = unlimited).
     ///   This counts all attempts including the initial one:
     ///   - `Some(1)` = try once, exit on any failure (no retries)
