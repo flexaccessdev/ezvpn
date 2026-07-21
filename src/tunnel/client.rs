@@ -42,7 +42,7 @@ use bytes::{Bytes, BytesMut};
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
