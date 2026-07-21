@@ -8,6 +8,7 @@
 //! `write_frames` for `ServerAddrs` control frames on the stream.
 
 use bytes::BytesMut;
+use ezvpn::config::VPN_MTU;
 use ezvpn::transport::build_quic_transport_config;
 use ezvpn::tunnel::signaling::ServerAddrsMsg;
 use ezvpn::tunnel::stream::{
@@ -59,6 +60,28 @@ async fn ip_packets_roundtrip_as_datagrams() {
     let mut arena = BytesMut::new();
     let mut seg_scratch: Vec<u8> = Vec::new();
     let mut pending = Vec::new();
+
+    assert!(
+        conn.max_datagram_size().expect("datagrams enabled") >= VPN_MTU as usize,
+        "a full VPN packet must fit immediately after the handshake"
+    );
+
+    // A full-MTU packet must not be dropped while path discovery warms up.
+    let mut full_mtu = vec![0u8; VPN_MTU as usize];
+    full_mtu[0] = 0x45;
+    let outcome = send_ip_datagrams(
+        &conn,
+        &mut arena,
+        &mut seg_scratch,
+        &mut pending,
+        None,
+        &full_mtu,
+    )
+    .await;
+    assert_eq!(outcome.sent, 1, "full-MTU packet is sent immediately");
+    assert_eq!(outcome.dropped_too_large, 0);
+    let echoed = conn.read_datagram().await.expect("read full-MTU echo");
+    assert_eq!(&echoed[..], &full_mtu[..]);
 
     // A minimal IP packet fits in one datagram and round-trips intact.
     let small = {

@@ -57,20 +57,19 @@ pub const SERVER_ADDR_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Initial QUIC path MTU (UDP payload bytes) before MTU discovery completes.
 ///
-/// 1200 is the QUIC protocol minimum (and quinn's `min_mtu` default), so the
-/// very first packets survive *any* path — cellular, tunnel-in-tunnel, PPPoE —
-/// with no early black-holing. DPLPMTUD's first run happens right after the
-/// handshake and binary-searches upward to its default `upper_bound` (1452), so
-/// LAN/broadband paths reach full size within a few RTTs.
+/// noq conservatively reserves at most 50 bytes for the QUIC short header,
+/// connection ID, packet number, AEAD tag, and DATAGRAM frame encoding. Adding
+/// that bound to the fixed inner MTU guarantees a complete VPN packet fits
+/// immediately after the handshake without assuming a 1500-byte underlay.
+/// Starting at QUIC's 1200-byte protocol minimum made the live datagram limit
+/// smaller than the TUN MTU, dropping full-sized inner TCP packets for several
+/// seconds while DPLPMTUD ramped upward.
 ///
-/// The primary deployment target is mobile / high-latency internet access, where
-/// an optimistic initial MTU (e.g. 1452) causes persistent packet loss on paths
-/// with a smaller real MTU until black-hole detection recovers. Reliability from
-/// packet one is worth the brief ramp-up. The path MTU only affects QUIC's own
-/// packetization of the data stream — application framing is size-independent —
-/// so discovery raising (or lowering) it is invisible above the transport.
-/// `min_mtu` and MTU discovery keep their defaults.
-pub const QUIC_INITIAL_MTU: u16 = 1200;
+/// DPLPMTUD and its 1200-byte minimum remain enabled, so a genuinely smaller
+/// underlay is detected and corrected downward. Such a path cannot carry the
+/// fixed 1280-byte inner MTU without fragmentation in any case.
+pub const QUIC_DATAGRAM_OVERHEAD_BUDGET: u16 = 50;
+pub const QUIC_INITIAL_MTU: u16 = crate::config::VPN_MTU + QUIC_DATAGRAM_OVERHEAD_BUDGET;
 
 /// QUIC connection/stream receive window and send window (bytes).
 ///
@@ -124,9 +123,9 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.stream_receive_window(QUIC_WINDOW_SIZE.into());
     transport_config = transport_config.send_window(QUIC_WINDOW_SIZE.into());
 
-    // Start at the protocol-minimum path MTU so the first packets survive any
-    // path (see QUIC_INITIAL_MTU); MTU discovery probes upward right after the
-    // handshake. Discovery config and min_mtu keep their defaults.
+    // Start large enough for the fixed inner MTU (see QUIC_INITIAL_MTU).
+    // Discovery config and min_mtu keep their defaults, including downward
+    // black-hole recovery for smaller paths.
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
 
     // The data path maps each IP packet to one unreliable QUIC datagram, so

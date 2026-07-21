@@ -599,27 +599,24 @@ where the app applies DNS conditional forwarding in-tunnel itself (see
 
 ## Protocol, MTU, and GSO
 
-- Wire protocol v6 is required on both peers. Mixed-version pairs do not
+- Wire protocol v7 is required on both peers. Mixed-version pairs do not
   connect.
-- The data path sends raw IP packets over a single reliable QUIC
-  bidirectional stream (the handshake stream, kept open) protected by
-  QUIC/TLS 1.3.
-- IP packet frames are `[len: u32 BE][type][offload_len][offload?][ip_packet]`.
-  The stream is a byte pipe, so an explicit length prefix delimits messages.
-  Server address publications use their own frame type (`0x01`) with a JSON
-  body.
-- The initial QUIC path MTU is 1200, the QUIC protocol minimum, so the first
-  packets survive any path (cellular, tunnel-in-tunnel, PPPoE). QUIC path-MTU
-  discovery probes upward to 1452 right after the handshake. The path MTU only
-  affects QUIC's own packetization — application framing is size-independent.
+- Each raw IP packet is one unreliable, unordered QUIC DATAGRAM protected by
+  QUIC/TLS 1.3. The handshake stream stays open only for reliable server-address
+  control publications (`[len: u32 BE][0x01][json]`).
+- The initial QUIC UDP payload MTU is 1330: the fixed 1280-byte inner MTU plus
+  noq's conservative 50-byte QUIC DATAGRAM overhead bound. A full inner packet
+  therefore fits immediately without assuming a 1500-byte underlay. DPLPMTUD
+  remains enabled with a 1200-byte minimum and probes toward the real PMTU.
 - The inner TUN MTU is fixed at 1280 on both ends (the IPv6 minimum link MTU
   and the same fixed value Tailscale uses, mobile-safe on essentially any real
   path). It is a protocol constant, not a config knob, and is not carried in
   the handshake.
-- GSO super-frames ride the stream whole when both sides negotiated GSO and
-  are re-coalesced into kernel-TSO super-frames on receive where supported;
-  otherwise they are software-segmented into per-MSS packets. Path MTU never
-  forces segmentation or drops — QUIC retransmits and packetizes the stream.
+- GSO super-frames are segmented into plain per-MSS datagrams before transport
+  and consecutive received TCP packets are re-coalesced into kernel-TSO
+  super-frames where supported; otherwise packets are written individually.
+  GSO is purely local and is not negotiated. A packet larger than the live QUIC
+  datagram limit is dropped rather than fragmented.
 
 Linux GSO is automatic:
 

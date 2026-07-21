@@ -957,7 +957,7 @@ pub(crate) async fn run_tunnel(
                             warned_too_large = true;
                             log::warn!(
                                 "Dropping packet(s) exceeding the current QUIC datagram size \
-                                 (path MTU still ramping up, or too small); the inner flow \
+                                 (the discovered path MTU is too small); the inner flow \
                                  adapts. Further such drops are counted silently."
                             );
                         }

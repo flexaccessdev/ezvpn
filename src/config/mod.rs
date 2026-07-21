@@ -15,9 +15,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// 1280 is the IPv6 minimum link MTU (RFC 8200) and the same fixed value
 /// Tailscale uses: mobile-safe on essentially any real path. It is deliberately
 /// *not* negotiated or derived from live path measurements — a fixed MTU is
-/// deterministic across reconnects. The data path is a reliable QUIC stream,
-/// so the wire path MTU never constrains framing (QUIC packetizes the stream);
-/// the tunnel MTU only bounds per-packet overhead and inner-flow behavior.
+/// deterministic across reconnects. Each packet maps to one QUIC DATAGRAM;
+/// the fixed initial outer MTU includes the transport's conservative overhead
+/// bound, and DPLPMTUD corrects the path estimate thereafter.
 pub const VPN_MTU: u16 = 1280;
 
 /// IPv6 address-assignment strategy for VPN clients.
