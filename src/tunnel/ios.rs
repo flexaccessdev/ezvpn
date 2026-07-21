@@ -45,7 +45,7 @@ use std::sync::Arc;
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use rand::Rng;
+use rand::RngExt;
 
 use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};

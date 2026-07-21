@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
+use rand::Rng;
 use std::collections::HashSet;
 use std::path::Path;
 
