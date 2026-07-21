@@ -216,16 +216,19 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
 
     // The worker thread owns a dedicated multi-thread runtime and drives the
     // whole tunnel lifetime. Separate workers keep UDP receive/QUIC pacing from
-    // being starved by TUN and route-management work. Setup success/failure is
-    // reported back over a one-shot channel so `ezvpn_start` can surface a
-    // lock-held / offline error synchronously before returning; after that the
-    // loop runs until shutdown.
+    // being starved by TUN and route-management work; the workload is a handful
+    // of hot tasks (TUN reader, QUIC driver, datagram writer), so a small fixed
+    // pool suffices and avoids one-thread-per-core on the GUI client. Setup
+    // success/failure is reported back over a one-shot channel so `ezvpn_start`
+    // can surface a lock-held / offline error synchronously before returning;
+    // after that the loop runs until shutdown.
     let (setup_tx, setup_rx) = mpsc::channel::<Result<ClientStatusHandle, String>>();
 
     let worker = thread::Builder::new()
         .name("ezvpn-tunnel".to_string())
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
                 .enable_all()
                 .build()
             {
