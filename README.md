@@ -282,7 +282,7 @@ Server-side settings are authoritative for VPN network parameters:
 The tunnel MTU and QUIC transport settings are fixed protocol constants
 (WireGuard/Tailscale-style — no tuning knobs): the MTU is always 1280
 (Tailscale's fixed value, the IPv6 minimum link MTU) and the transport always
-uses CUBIC with fixed windows. Nothing is negotiated; both sides derive the
+uses paced BBRv3 with fixed windows. Nothing is negotiated; both sides derive the
 same values from constants.
 
 Clients configure their server identity, auth token, routes, relay and
@@ -632,7 +632,7 @@ Linux GSO is automatic:
 ## Throughput Notes
 
 There are no transport tuning knobs (WireGuard/Tailscale style). QUIC transport
-settings are fixed constants on both ends: CUBIC congestion control and 8 MB
+settings are fixed constants on both ends: paced BBRv3 congestion control and 8 MB
 receive/send windows, which cover most links.
 
 The datagram sender uses a small bounded queue and waits for QUIC's pacer during

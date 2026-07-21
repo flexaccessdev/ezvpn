@@ -9,7 +9,7 @@ pub mod paths;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::QuicTransportConfig;
-use noq_proto::congestion::CubicConfig;
+use noq_proto::congestion::Bbr3Config;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,7 +99,7 @@ pub const QUIC_DATAGRAM_SEND_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Build the fixed QUIC transport config used by both client and server.
 ///
-/// Every setting is a constant: CUBIC congestion control, 8 MB windows, the
+/// Every setting is a constant: BBRv3 congestion control, 8 MB windows, the
 /// keep-alive/idle timers above, and the protocol-minimum initial MTU. Both
 /// sides applying the identical config means nothing has to be negotiated.
 pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
@@ -112,9 +112,12 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL);
 
-    // CUBIC: the widely deployed loss-based default, fixed (no knob).
+    // BBRv3 uses a bandwidth/RTT model and explicitly paces transmissions. That
+    // is important for a VPN carrying TCP inside QUIC DATAGRAMs: CUBIC reacts
+    // to the same loss as the inner TCP connection, multiplying congestion-window
+    // reductions, while bursty sends overflow small platform UDP socket queues.
     transport_config =
-        transport_config.congestion_controller_factory(Arc::new(CubicConfig::default()));
+        transport_config.congestion_controller_factory(Arc::new(Bbr3Config::default()));
 
     // Fixed flow-control windows for connection + streams.
     transport_config = transport_config.receive_window(QUIC_WINDOW_SIZE.into());
