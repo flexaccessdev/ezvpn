@@ -639,8 +639,12 @@ receive/send windows, which cover most links.
 
 Both peers run iroh. Its socket layer requests 7 MiB UDP
 `SO_RCVBUF`/`SO_SNDBUF` buffers so the kernel can absorb bursty multi-Gbit
-traffic instead of silently dropping datagrams. Dropped datagrams show up as
-inner-TCP retransmits in tools such as `iperf3`.
+traffic instead of silently dropping datagrams. Because the VPN data path is now
+unreliable QUIC datagrams (one IP packet per datagram), a dropped datagram is
+**not** recovered by the transport — only the inner flow recovers it, so drops
+show up directly as inner-TCP retransmits in tools such as `iperf3`. Getting
+these buffers right is therefore materially more important than it was under the
+old reliable-stream data path.
 
 Linux silently caps that request at `net.core.rmem_max` / `net.core.wmem_max`,
 which default to about 208 KiB on many systems. The receive buffer is the one
@@ -652,9 +656,19 @@ sudo sysctl -w net.core.rmem_max=7340032
 sudo sysctl -w net.core.wmem_max=7340032
 ```
 
+Two things to watch:
+
+- **Raise them on both ends.** The clamp bites whichever side is receiving the
+  burst; for a one-way transfer that is the receiver, but a real workload sends
+  both ways, so raise client and server.
+- **Restart `ezvpn` after raising.** The socket buffer size is fixed when the
+  UDP socket is created, so a process that was already running keeps the old,
+  clamped size until it is restarted.
+
 To persist across reboots, add them to `/etc/sysctl.d/99-ezvpn.conf`. `ezvpn`
 logs a startup warning with the exact command when either sysctl is below 7
-MiB. This is Linux-only; macOS uses `kern.ipc.maxsockbuf`.
+MiB — its absence on startup confirms the new ceiling took effect. This is
+Linux-only; macOS uses `kern.ipc.maxsockbuf`.
 
 ## Reconnect Behavior
 
