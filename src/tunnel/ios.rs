@@ -256,7 +256,6 @@ impl IosSession {
             self.connection,
             self.data_send,
             self.data_recv,
-            self.server_info.server_gso_enabled,
             None,
             None,
             local_iroh_udp_ports,

@@ -16,8 +16,7 @@ use crate::net::buffer::uninitialized_vec;
 #[cfg(not(target_os = "ios"))]
 use crate::config::VpnClientConfig;
 use crate::tunnel::stream::{
-    FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, build_frames, build_gro_frames, classify,
-    copy_packet_to_arena, read_frame, write_frames,
+    FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify, read_frame, send_ip_datagrams,
 };
 use crate::net::device::{
     BypassRouteGuard, Route6Guard, RouteGuard, TunConfig, TunDevice, UnderlayGateway,
@@ -30,12 +29,12 @@ use crate::net::local_networks::{has_refusable_routes, local_networks, overlap_e
 use crate::error::{VpnError, VpnResult};
 #[cfg(not(target_os = "ios"))]
 use crate::runtime::{LockRole, VpnLock};
-use crate::tunnel::offload::{TcpGroTable, VirtioNetHdr, materialize_offload_into};
+use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::watch_connection_paths;
 use crate::config::VPN_MTU;
 use crate::tunnel::signaling::{
-    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse,
-    parse_ip_packet_v2, read_message, write_message,
+    MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VPN_ALPN, VpnHandshake, VpnHandshakeResponse, read_message,
+    write_message,
 };
 use crate::transport::endpoint::RelayConfig;
 use bytes::{Bytes, BytesMut};
@@ -68,12 +67,6 @@ const INBOUND_TUN_CHANNEL_SIZE: usize = 512;
 /// infrequent (every [`crate::transport::SERVER_ADDR_PUBLISH_INTERVAL`]) and a
 /// dropped one is recovered by the next periodic publish.
 const SERVER_ADDR_CHANNEL_SIZE: usize = 8;
-
-/// Client GSO capability advertised to the server in the handshake.
-///
-/// Always `true`: data-channel GSO metadata is supported even when the local
-/// TUN has no offload, because inbound metadata is materialized in software.
-const ADVERTISED_GSO: bool = true;
 
 /// Timeout for resolving relay URLs via DNS.
 const RESOLVE_RELAY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -141,8 +134,6 @@ pub struct ServerInfo {
     pub network6: Option<Ipv6Net>,
     /// Server's IPv6 VPN address (gateway). None for IPv4-only mode.
     pub server_ip6: Option<Ipv6Addr>,
-    /// Whether server-side Linux TUN GSO is enabled.
-    pub server_gso_enabled: bool,
     /// Server's candidate iroh underlay addresses, delivered in the handshake so
     /// the client can bypass-route any a VPN route would capture at onboarding
     /// (rather than waiting for the first periodic data-path publication). Empty
@@ -366,7 +357,6 @@ impl VpnClient {
         } else {
             log::info!("  Mode: IPv4-only");
         }
-        log::info!("  Server GSO enabled: {}", server_info.server_gso_enabled);
         log::info!("  MTU (fixed): {}", VPN_MTU);
 
         // If this is a reconnect and the server's network parameters changed,
@@ -488,21 +478,13 @@ impl VpnClient {
 
         let offload_status = tun_device.offload_status();
         let local_gso_enabled = offload_status.enabled;
-        let negotiated_gso = local_gso_enabled && server_info.server_gso_enabled;
-        log::info!(
-            "GSO status (client): local={}, server={}, negotiated={}, advertised={}",
-            local_gso_enabled,
-            server_info.server_gso_enabled,
-            negotiated_gso,
-            ADVERTISED_GSO
-        );
-        if !local_gso_enabled {
+        // GSO is a purely local TUN concern now (the datagram wire never carries
+        // offload super-frames). It only affects local read GRO / write batching.
+        if local_gso_enabled {
+            log::info!("Local TUN GSO/offload enabled");
+        } else {
             let reason = offload_status.reason.as_deref().unwrap_or("unknown reason");
-            if server_info.server_gso_enabled {
-                log::warn!("Local TUN GSO disabled: {}", reason);
-            } else {
-                log::info!("Local TUN GSO disabled: {}", reason);
-            }
+            log::info!("Local TUN GSO/offload disabled: {}", reason);
         }
 
         log::info!("VPN tunnel established!");
@@ -537,7 +519,6 @@ impl VpnClient {
                 network6: server_info.network6.map(|n| n.to_string()),
                 gateway6: server_info.server_ip6.map(|ip| ip.to_string()),
                 mtu: VPN_MTU,
-                gso_negotiated: negotiated_gso,
                 routes: active_routes,
                 routes6: active_routes6,
             },
@@ -596,7 +577,6 @@ impl VpnClient {
             connection,
             data_send,
             data_recv,
-            server_info.server_gso_enabled,
             bypass_route_guard,
             server_addr_tx,
             local_iroh_udp_ports,
@@ -696,7 +676,10 @@ impl VpnClient {
                 ));
             }
         };
-        tun_config = tun_config.with_gso(server_info.server_gso_enabled);
+        // GSO is a local TUN concern (never negotiated on the datagram wire);
+        // request it and let the device layer enable it where the platform
+        // supports it.
+        tun_config = tun_config.with_gso(true);
 
         TunDevice::create(tun_config)
     }
@@ -816,10 +799,9 @@ pub(crate) async fn perform_handshake(
         .await
         .map_err(|e| VpnError::Signaling(format!("Failed to open stream: {}", e)))?;
 
-    // Send handshake. The client advertises its data-channel GSO capability
-    // here (the handshake leads the data frames on the same reliable stream,
-    // so there is no separate, racy capabilities message).
-    let mut handshake = VpnHandshake::new(device_id).with_gso(ADVERTISED_GSO);
+    // Send handshake. GSO is not negotiated (IP packets ride datagrams, which
+    // never carry offload super-frames); each side's TUN offload is local.
+    let mut handshake = VpnHandshake::new(device_id);
     if let Some(token) = auth_token {
         handshake = handshake.with_auth_token(token);
     }
@@ -874,7 +856,7 @@ pub(crate) async fn perform_handshake(
         ));
     }
 
-    // Keep the stream open: it now carries the data frames.
+    // Keep the stream open: it stays as the control channel (ServerAddrs).
     Ok((
         ServerInfo {
             assigned_ip,
@@ -883,7 +865,6 @@ pub(crate) async fn perform_handshake(
             assigned_ip6,
             network6,
             server_ip6,
-            server_gso_enabled: response.server_gso_enabled,
             server_addrs: response.server_addrs,
         },
         send,
@@ -893,22 +874,17 @@ pub(crate) async fn perform_handshake(
 
 /// Run the VPN packet processing loop over the iroh QUIC connection.
 ///
-/// IP packets travel as length-prefixed frames on the reliable data stream
-/// (`data_send`/`data_recv`, the same bi-stream the handshake ran on). This
-/// function only shovels framed IP packets between the TUN device and that
-/// stream. Peer liveness is detected by `Connection::closed()` (QUIC
-/// keep-alive + idle timeout) — there is no application-level heartbeat.
-///
-/// `server_gso_enabled` is the server's advertised GSO capability. The stream
-/// is size-agnostic (QUIC packetizes it), so frames are never segmented for
-/// path MTU — only when GSO metadata was not negotiated.
-#[allow(clippy::too_many_arguments)]
+/// Each IP packet maps directly to one unreliable QUIC datagram (see
+/// [`crate::tunnel::stream`]); the handshake bi-stream (`data_send`/`data_recv`)
+/// stays open only as the control channel for server-address publications. This
+/// function shovels packets between the TUN device and datagrams, and drains
+/// control frames off the stream. Peer liveness is detected by
+/// `Connection::closed()` (QUIC keep-alive + idle timeout) — no app heartbeat.
 pub(crate) async fn run_tunnel(
     tun_device: TunDevice,
     connection: Connection,
     data_send: SendStream,
     data_recv: RecvStream,
-    server_gso_enabled: bool,
     bypass_route_guard: Option<AbortOnDropTask>,
     server_addr_tx: Option<mpsc::Sender<HashSet<IpAddr>>>,
     local_iroh_udp_ports: Arc<HashSet<u16>>,
@@ -920,66 +896,33 @@ pub(crate) async fn run_tunnel(
     let bypass_route_task = bypass_route_guard.map(AbortOnDropTask::disarm);
     let local_gso_enabled = tun_reader.offload_status().enabled;
     debug_assert_eq!(local_gso_enabled, tun_writer.offload_status().enabled);
-    let negotiated_gso = local_gso_enabled && server_gso_enabled;
     let buffer_size = tun_reader.buffer_size();
 
-    // Spawn outbound task (TUN -> frames -> data stream). The task owns the
-    // stream's send half: the TUN reader frames packets and writes them
-    // inline. Returns a disconnect reason on a fatal error.
-    let mut data_send = data_send;
+    // The client never writes on the stream now: IP packets ride datagrams and
+    // the only stream traffic is the server -> client ServerAddrs control
+    // frames. Hold the send half so the bi-stream stays established.
+    let _data_send = data_send;
+
+    // Spawn outbound task (TUN -> unreliable QUIC datagrams). Each TUN packet
+    // maps to one datagram; an offload super-frame is software-segmented into
+    // per-MSS packets, each its own datagram. Returns a disconnect reason on a
+    // fatal TUN error (connection loss is caught by the liveness task).
+    let conn_out = connection.clone();
     let local_iroh_udp_ports_out = local_iroh_udp_ports.clone();
     let mut outbound_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
         let mut read_storage = uninitialized_vec(buffer_size);
-        // Long-lived framing arena: frames are appended and split off as
-        // refcounted Bytes views, amortizing allocations across packets.
+        // Arena that per-datagram `Bytes` are split off, amortizing allocations
+        // across packets; scratch for software-segmenting offload super-frames.
         let mut arena = BytesMut::with_capacity(FRAME_ARENA_CHUNK);
-        // Reusable scratch for software-materializing offload super-frames,
-        // and the per-iteration list of frames to send.
         let mut seg_scratch: Vec<u8> = Vec::new();
-        let mut pending: Vec<Bytes> = Vec::new();
-        // Software GRO: on a non-GSO local TUN, coalesce consecutive
-        // same-flow TCP segments into offload-tagged super-frames so a
-        // GSO-capable peer can hand them to its kernel via TSO.
-        let software_gro = !tun_reader.vnet_hdr_enabled();
-        if software_gro {
-            log::info!(
-                "Software GRO enabled for outbound TCP (local TUN has no offload support; event-driven drain-then-flush)"
-            );
-        }
-        let mut gro_table = TcpGroTable::new();
-        // Persistent ReadBuf: tracks the initialized region across
-        // iterations so the TUN reader's `initialize_unfilled()` only
-        // zeroes the buffer once instead of on every read.
+        let mut dropped_too_large: u64 = 0;
+        let mut warned_too_large = false;
+        // Persistent ReadBuf: tracks the initialized region across iterations so
+        // the TUN reader only zeroes the buffer once instead of on every read.
         let mut packet_buf = ReadBuf::uninit(&mut read_storage);
         loop {
             packet_buf.clear();
-            // Event-driven GRO: keep pulling segments that are already
-            // queued on the TUN; the instant it drains, emit every
-            // pending coalesced group and block for the next packet.
-            let read_result = if software_gro && !gro_table.is_empty() {
-                match tun_reader.try_read_buf(&mut packet_buf) {
-                    Some(read_result) => read_result,
-                    None => {
-                        pending.clear();
-                        if let Err(e) = build_gro_frames(
-                            &mut arena,
-                            &mut seg_scratch,
-                            &mut pending,
-                            &gro_table.flush_all(),
-                            true,
-                        ) {
-                            log::warn!("Failed to frame coalesced packet: {}", e);
-                        } else if let Err(reason) = write_frames(&mut data_send, &mut pending).await
-                        {
-                            return Some(reason.to_string());
-                        }
-                        tun_reader.read_buf(&mut packet_buf).await
-                    }
-                }
-            } else {
-                tun_reader.read_buf(&mut packet_buf).await
-            };
-            match read_result {
+            match tun_reader.read_buf(&mut packet_buf).await {
                 Ok(()) if !packet_buf.filled().is_empty() => {
                     let raw_packet = packet_buf.filled();
                     let (offload, packet) = match tun_reader.split_frame(raw_packet) {
@@ -998,66 +941,33 @@ pub(crate) async fn run_tunnel(
                         continue;
                     }
 
-                    if software_gro {
-                        // Non-GSO TUN frames never carry offload metadata;
-                        // push the plain IP packet through the GRO table.
-                        let result = gro_table.push(packet);
-                        if !result.outputs.is_empty() {
-                            pending.clear();
-                            if let Err(e) = build_gro_frames(
-                                &mut arena,
-                                &mut seg_scratch,
-                                &mut pending,
-                                &result.outputs,
-                                true,
-                            ) {
-                                log::warn!("Failed to frame coalesced packet: {}", e);
-                            } else if let Err(reason) =
-                                write_frames(&mut data_send, &mut pending).await
-                            {
-                                return Some(reason.to_string());
-                            }
-                        }
-                        if !result.pass_through {
-                            continue;
-                        }
-                        // Pass-through: fall through to the plain
-                        // framing below, avoiding any packet copy.
-                    }
-
-                    // Frame the packet (software-segmenting GSO super-frames
-                    // only when the peer did not negotiate GSO) and send.
-                    pending.clear();
-                    if let Err(e) = build_frames(
+                    let outcome = send_ip_datagrams(
+                        &conn_out,
                         &mut arena,
                         &mut seg_scratch,
-                        &mut pending,
                         offload.as_ref(),
                         packet,
-                        negotiated_gso,
-                    ) {
-                        log::warn!("Failed to frame packet: {}", e);
-                        continue;
-                    }
-                    if let Err(reason) = write_frames(&mut data_send, &mut pending).await {
-                        return Some(reason.to_string());
+                    );
+                    if outcome.dropped_too_large > 0 {
+                        dropped_too_large += outcome.dropped_too_large;
+                        if !warned_too_large {
+                            warned_too_large = true;
+                            log::warn!(
+                                "Dropping packet(s) exceeding the current QUIC datagram size \
+                                 (path MTU still ramping up, or too small); the inner flow \
+                                 adapts. Further such drops are counted silently."
+                            );
+                        }
                     }
                 }
                 Ok(()) => {}
                 Err(e) => {
                     log::error!("TUN read error: {}", e);
-                    // Flush pending coalesced groups before shutting down.
-                    pending.clear();
-                    if build_gro_frames(
-                        &mut arena,
-                        &mut seg_scratch,
-                        &mut pending,
-                        &gro_table.flush_all(),
-                        true,
-                    )
-                    .is_ok()
-                    {
-                        let _ = write_frames(&mut data_send, &mut pending).await;
+                    if dropped_too_large > 0 {
+                        log::debug!(
+                            "Outbound task dropped {} oversized packet(s) this session",
+                            dropped_too_large
+                        );
                     }
                     return Some(format!("TUN read error: {}", e));
                 }
@@ -1143,42 +1053,58 @@ pub(crate) async fn run_tunnel(
         }
     });
 
-    // Spawn inbound task (data stream frames -> TUN writer channel). The task
-    // owns the stream's receive half. Returns a disconnect reason if the
-    // stream ends or errors.
-    let mut data_recv = data_recv;
+    // Spawn data-inbound task (unreliable datagrams -> TUN writer channel).
+    // Each datagram body is a raw IP packet (no offload metadata). Returns a
+    // disconnect reason when the connection ends.
+    let conn_in = connection.clone();
     let mut inbound_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
+        loop {
+            match conn_in.read_datagram().await {
+                Ok(packet) => {
+                    let req = InboundTunWrite {
+                        packet,
+                        offload: None,
+                    };
+                    if !enqueue_inbound_tun_write(&tun_write_tx, req).await {
+                        log::trace!("TUN writer channel closed");
+                        return None;
+                    }
+                }
+                Err(e) => {
+                    log::debug!("Datagram read ended: {}", e);
+                    return Some(format!("datagram read ended: {}", e));
+                }
+            }
+        }
+    });
+
+    // Spawn control task (reliable stream -> bypass-route manager). The stream
+    // now carries only the server's periodic candidate-address publications;
+    // hand each set to the bypass-route manager (add-only, filtered to
+    // VPN-covered IPs there). Returns a disconnect reason when the stream ends.
+    let mut data_recv = data_recv;
+    let mut control_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
         // Sink for server-published candidate addresses; `None` when no bypass
         // manager is running (the VPN installs no capturing routes).
         let server_addr_tx = server_addr_tx;
         // Frame receive buffer, sized once for the largest legal frame body.
         let mut frame_buf = vec![0u8; MAX_FRAME_BODY];
-        // Long-lived arena packets are copied into (once, out of the receive
-        // buffer) and split off as refcounted Bytes for the TUN writer.
-        let mut pkt_arena = BytesMut::with_capacity(FRAME_ARENA_CHUNK);
-        // Reusable scratch for software-materializing offload super-frames.
-        let mut seg_scratch: Vec<u8> = Vec::new();
-        let mut pending_segments: Vec<Bytes> = Vec::new();
         loop {
             let body_len = match read_frame(&mut data_recv, &mut frame_buf).await {
                 Ok(Some(len)) => len,
                 Ok(None) => {
-                    log::debug!("Data stream finished by peer");
-                    return Some("data stream closed by peer".to_string());
+                    log::debug!("Control stream finished by peer");
+                    return Some("control stream closed by peer".to_string());
                 }
                 Err(e) => {
-                    log::debug!("Data stream read ended: {}", e);
+                    log::debug!("Control stream read ended: {}", e);
                     return Some(e.to_string());
                 }
             };
 
-            let body = match classify(&frame_buf[..body_len]) {
-                Ok(Frame::Ip(body)) => body,
+            match classify(&frame_buf[..body_len]) {
                 Ok(Frame::ServerAddrs(body)) => {
-                    // The server periodically publishes its candidate underlay
-                    // addresses; hand them to the bypass-route manager (add-only,
-                    // filtered to VPN-covered IPs there). `try_send` so the
-                    // receive hot loop never blocks — a dropped update is
+                    // `try_send` so the loop never blocks — a dropped update is
                     // recovered by the next periodic publish.
                     if let Some(ref tx) = server_addr_tx {
                         match ServerAddrsMsg::decode(body) {
@@ -1191,64 +1117,11 @@ pub(crate) async fn run_tunnel(
                             Err(e) => log::warn!("Invalid server addrs frame: {}", e),
                         }
                     }
-                    continue;
                 }
                 Err(e) => {
                     // The length prefix already delimited the frame, so an
                     // unknown type is skippable without losing sync.
-                    log::trace!("Ignoring undecodable frame: {}", e);
-                    continue;
-                }
-            };
-
-            let (offload, packet) = match parse_ip_packet_v2(body) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    log::warn!("Invalid IP frame from peer: {}", e);
-                    continue;
-                }
-            };
-
-            if let Some(meta) = offload {
-                if !local_gso_enabled {
-                    let materialized =
-                        materialize_offload_into(&meta, packet, &mut seg_scratch, |seg| {
-                            pending_segments.push(copy_packet_to_arena(&mut pkt_arena, seg));
-                            Ok(())
-                        });
-                    if let Err(e) = materialized {
-                        pending_segments.clear();
-                        log::warn!("Dropping packet with unsupported offload metadata: {}", e);
-                        continue;
-                    }
-                    for packet in pending_segments.drain(..) {
-                        let req = InboundTunWrite {
-                            packet,
-                            offload: None,
-                        };
-                        if !enqueue_inbound_tun_write(&tun_write_tx, req).await {
-                            log::trace!("TUN writer channel closed");
-                            return None;
-                        }
-                    }
-                } else {
-                    let req = InboundTunWrite {
-                        packet: copy_packet_to_arena(&mut pkt_arena, packet),
-                        offload: Some(meta),
-                    };
-                    if !enqueue_inbound_tun_write(&tun_write_tx, req).await {
-                        log::trace!("TUN writer channel closed");
-                        return None;
-                    }
-                }
-            } else {
-                let req = InboundTunWrite {
-                    packet: copy_packet_to_arena(&mut pkt_arena, packet),
-                    offload: None,
-                };
-                if !enqueue_inbound_tun_write(&tun_write_tx, req).await {
-                    log::trace!("TUN writer channel closed");
-                    return None;
+                    log::trace!("Ignoring undecodable control frame: {}", e);
                 }
             }
         }
@@ -1267,16 +1140,19 @@ pub(crate) async fn run_tunnel(
     // Wait for any task to complete (or error), then clean up all tasks
     let (first_task, first_result, remaining) = tokio::select! {
         result = &mut outbound_handle => {
-            ("outbound", result, vec![("inbound", inbound_handle), ("liveness", liveness_handle), ("tun-writer", tun_writer_handle)])
+            ("outbound", result, vec![("inbound", inbound_handle), ("control", control_handle), ("liveness", liveness_handle), ("tun-writer", tun_writer_handle)])
         }
         result = &mut inbound_handle => {
-            ("inbound", result, vec![("outbound", outbound_handle), ("liveness", liveness_handle), ("tun-writer", tun_writer_handle)])
+            ("inbound", result, vec![("outbound", outbound_handle), ("control", control_handle), ("liveness", liveness_handle), ("tun-writer", tun_writer_handle)])
+        }
+        result = &mut control_handle => {
+            ("control", result, vec![("outbound", outbound_handle), ("inbound", inbound_handle), ("liveness", liveness_handle), ("tun-writer", tun_writer_handle)])
         }
         result = &mut liveness_handle => {
-            ("liveness", result, vec![("outbound", outbound_handle), ("inbound", inbound_handle), ("tun-writer", tun_writer_handle)])
+            ("liveness", result, vec![("outbound", outbound_handle), ("inbound", inbound_handle), ("control", control_handle), ("tun-writer", tun_writer_handle)])
         }
         result = &mut tun_writer_handle => {
-            ("tun-writer", result, vec![("outbound", outbound_handle), ("inbound", inbound_handle), ("liveness", liveness_handle)])
+            ("tun-writer", result, vec![("outbound", outbound_handle), ("inbound", inbound_handle), ("control", control_handle), ("liveness", liveness_handle)])
         }
     };
 
@@ -2218,7 +2094,6 @@ mod tests {
             assigned_ip6: Some("fd00::2".parse().unwrap()),
             network6: Some("fd00::/64".parse().unwrap()),
             server_ip6: Some("fd00::1".parse().unwrap()),
-            server_gso_enabled: true,
             server_addrs: Vec::new(),
         }
     }
@@ -2236,11 +2111,11 @@ mod tests {
     }
 
     #[test]
-    fn network_params_eq_ignores_gso() {
+    fn network_params_eq_ignores_non_routing_fields() {
         let a = sample_server_info();
         let mut b = sample_server_info();
         // Fields not part of the routing/TUN identity must not affect equality.
-        b.server_gso_enabled = !a.server_gso_enabled;
+        b.server_addrs = vec!["203.0.113.9".parse().unwrap()];
         assert_eq!(
             NetworkParams::from_server_info(&a),
             NetworkParams::from_server_info(&b)

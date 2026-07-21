@@ -160,8 +160,6 @@ pub struct ClientStatus {
     pub gateway6: Option<String>,
     /// Tunnel MTU (the fixed protocol constant, shown while connected).
     pub mtu: Option<u16>,
-    /// Whether GSO was negotiated for the current session.
-    pub gso_negotiated: Option<bool>,
     /// IPv4 routes (CIDRs) directed through the tunnel for this session.
     #[serde(default)]
     pub routes: Vec<String>,
@@ -199,7 +197,6 @@ pub struct ClientConnectedInfo {
     pub network6: Option<String>,
     pub gateway6: Option<String>,
     pub mtu: u16,
-    pub gso_negotiated: bool,
     /// IPv4 routes (CIDRs) actually directed through the tunnel.
     pub routes: Vec<String>,
     /// IPv6 routes (CIDRs) actually directed through the tunnel.
@@ -366,7 +363,6 @@ impl ClientStatusHandle {
             network6: info.network6,
             gateway6: info.gateway6,
             mtu: connected.then_some(info.mtu),
-            gso_negotiated: connected.then_some(info.gso_negotiated),
             routes: info.routes,
             routes6: info.routes6,
             connection: connection.as_ref().map(|snapshot| snapshot.description.clone()),
@@ -821,9 +817,6 @@ fn print_client_text(c: &ClientStatus) {
         if let Some(mtu) = c.mtu {
             println!("MTU:            {mtu}");
         }
-        if let Some(gso) = c.gso_negotiated {
-            println!("GSO negotiated: {gso}");
-        }
         if c.routes.is_empty() {
             println!("Routes:         (none)");
         } else {
@@ -926,7 +919,6 @@ mod tests {
                 network: Some("10.0.0.0/24".into()),
                 gateway: Some("10.0.0.1".into()),
                 mtu: 1280,
-                gso_negotiated: true,
                 routes: vec!["0.0.0.0/0".into()],
                 ..Default::default()
             },
@@ -950,7 +942,6 @@ mod tests {
         assert_eq!(snap.mode, "ipv4");
         assert_eq!(snap.assigned_ip.as_deref(), Some("10.0.0.2"));
         assert_eq!(snap.mtu, Some(1280));
-        assert_eq!(snap.gso_negotiated, Some(true));
         assert_eq!(snap.routes, vec!["0.0.0.0/0".to_string()]);
         assert_eq!(snap.connection.as_deref(), Some("relay https://relay.example"));
         assert_eq!(snap.custom_relays[0].working, Some(true));

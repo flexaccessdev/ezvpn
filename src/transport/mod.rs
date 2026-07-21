@@ -36,7 +36,7 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// are considered dead and closed. With [`QUIC_KEEP_ALIVE_INTERVAL`] enabled,
 /// this timeout only triggers for truly unresponsive peers.
 ///
-/// The data path is a reliable QUIC stream with no application-level
+/// The data path is unreliable QUIC datagrams with no application-level
 /// heartbeat: peer liveness is detected entirely by QUIC keep-alive plus this
 /// idle timeout (a dead peer stops sending keep-alives and the connection
 /// closes after this elapses, resolving `Connection::closed()`). 30s gives
@@ -92,6 +92,16 @@ pub const QUIC_INITIAL_MTU: u16 = 1200;
 /// this is a constant, not a knob.
 pub const QUIC_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
 
+/// QUIC unreliable-datagram receive and send buffer size (bytes).
+///
+/// The data path maps each IP packet directly to one unreliable QUIC datagram,
+/// so datagrams must be enabled (a `None` receive buffer would tell the peer we
+/// cannot receive them). A full send buffer drops the packet WireGuard-style
+/// (the inner flow retransmits), and a full receive buffer drops the oldest
+/// queued datagrams; 4 MB is ample headroom for either direction without
+/// unbounded buffering. Fixed constant, not a knob.
+pub const QUIC_DATAGRAM_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
 /// Build the fixed QUIC transport config used by both client and server.
 ///
 /// Every setting is a constant: CUBIC congestion control, 8 MB windows, the
@@ -121,9 +131,12 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     // handshake. Discovery config and min_mtu keep their defaults.
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
 
-    // The data path is a reliable stream; QUIC datagrams are unused, so
-    // disable datagram receipt entirely.
-    transport_config = transport_config.datagram_receive_buffer_size(None);
+    // The data path maps each IP packet to one unreliable QUIC datagram, so
+    // datagrams must be enabled in both directions (a `None` receive buffer
+    // advertises to the peer that we cannot receive them).
+    transport_config =
+        transport_config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER_SIZE));
+    transport_config = transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_BUFFER_SIZE);
 
     Ok(transport_config.build())
 }
