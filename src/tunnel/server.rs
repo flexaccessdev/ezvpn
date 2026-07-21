@@ -928,12 +928,19 @@ impl VpnServer {
 
         // Accept incoming connections until the endpoint closes or the watchdog
         // reports a fatal, unrecoverable loss of relay connectivity.
+        let mut watchdog_alive = true;
         let watchdog_fired = loop {
             tokio::select! {
                 biased;
-                _ = &mut fatal_rx => {
-                    break true;
-                }
+                res = &mut fatal_rx, if watchdog_alive => match res {
+                    // Explicit fatal signal from the watchdog: exit for restart.
+                    Ok(()) => break true,
+                    // Sender dropped without signaling (watchdog returned on
+                    // normal shutdown, or panicked). Not fatal: disable this
+                    // branch so the completed receiver is never re-polled and
+                    // let the `accept()` None path below drive shutdown.
+                    Err(_) => watchdog_alive = false,
+                },
                 incoming = endpoint.accept() => match incoming {
                     Some(incoming) => {
                         let server = server.clone();
@@ -2203,11 +2210,12 @@ async fn relay_watchdog(endpoint: Endpoint, fatal: oneshot::Sender<()>) {
     let mut soft_recovery_tried = false;
 
     loop {
-        tokio::time::sleep(RELAY_WATCHDOG_CHECK_INTERVAL).await;
-
-        // Normal shutdown: the endpoint is closing, stop watching.
-        if endpoint.is_closed() {
-            return;
+        tokio::select! {
+            biased;
+            // Normal shutdown: return as soon as the endpoint closes instead of
+            // waiting out the current sleep tick.
+            _ = endpoint.closed() => return,
+            _ = tokio::time::sleep(RELAY_WATCHDOG_CHECK_INTERVAL) => {}
         }
 
         let status = status_watcher.get();
