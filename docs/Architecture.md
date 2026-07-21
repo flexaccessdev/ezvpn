@@ -140,8 +140,7 @@ sequenceDiagram
     loop Packet Flow
         C->>C: Application sends packet
         C->>C: TUN captures packet
-        C->>S: Send over QUIC (encrypted)
-        S->>S: Unframe IP packet
+        C->>S: Raw IP packet as one QUIC datagram (encrypted, no framing)
         S->>S: TUN injects packet
         S->>S: Forward to destination
     end

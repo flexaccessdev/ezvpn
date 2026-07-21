@@ -179,10 +179,13 @@ async fn datagram_backpressure_preserves_queued_packets() {
         assert_eq!(outcome.dropped_other, 0, "packet {sequence} not evicted");
     }
 
-    let received = tokio::time::timeout(Duration::from_secs(10), accept_task)
+    let mut received = tokio::time::timeout(Duration::from_secs(10), accept_task)
         .await
         .expect("receiver completed before timeout")
         .expect("receiver task succeeded");
+    // Datagrams are unreliable and may arrive out of order; only membership
+    // matters here — ordering is not part of the backpressure guarantee.
+    received.sort_unstable();
     assert_eq!(received, (0..PACKET_COUNT).collect::<Vec<_>>());
 
     conn.close(0u32.into(), b"done");

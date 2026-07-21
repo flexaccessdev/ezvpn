@@ -624,7 +624,8 @@ Linux GSO is automatic:
 - No GSO config toggle is exposed.
 - If Linux offload setup fails, VPN traffic continues in non-GSO mode and logs
   a warning.
-- Connection setup logs include local, remote, and negotiated GSO status.
+- Connection setup logs report the local GSO status only (GSO is never
+  negotiated with the peer).
 
 ## Throughput Notes
 
