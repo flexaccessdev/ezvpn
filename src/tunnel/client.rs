@@ -915,6 +915,7 @@ pub(crate) async fn run_tunnel(
         // across packets; scratch for software-segmenting offload super-frames.
         let mut arena = BytesMut::with_capacity(FRAME_ARENA_CHUNK);
         let mut seg_scratch: Vec<u8> = Vec::new();
+        let mut pending: Vec<Bytes> = Vec::new();
         let mut dropped_too_large: u64 = 0;
         let mut warned_too_large = false;
         // Persistent ReadBuf: tracks the initialized region across iterations so
@@ -945,9 +946,11 @@ pub(crate) async fn run_tunnel(
                         &conn_out,
                         &mut arena,
                         &mut seg_scratch,
+                        &mut pending,
                         offload.as_ref(),
                         packet,
-                    );
+                    )
+                    .await;
                     if outcome.dropped_too_large > 0 {
                         dropped_too_large += outcome.dropped_too_large;
                         if !warned_too_large {

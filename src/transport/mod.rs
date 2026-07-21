@@ -55,19 +55,6 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// this interval even if iroh has not yet selected it for the active path.
 pub const SERVER_ADDR_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Kernel UDP socket buffer size that iroh's socket layer (netwatch) requests
-/// for `SO_RCVBUF`/`SO_SNDBUF`. Mirrors netwatch's private `SOCKET_BUFFER_SIZE`
-/// (`7 << 20`); kept here so the startup check warns against the same target.
-///
-/// Linux silently caps the request at `net.core.rmem_max` / `net.core.wmem_max`,
-/// so iroh's buffer is only this large when those sysctls are at least this
-/// value. We cannot read the applied size back (iroh owns the socket), so the
-/// startup check warns when the sysctl would clamp it.
-// Only the Linux startup check (`warn_if_socket_buffer_capped`) reads this, since
-// the `net.core.*_max` clamp it guards against is Linux-specific.
-#[cfg(target_os = "linux")]
-pub const IROH_SOCKET_BUFFER_REQUEST: usize = 7 << 20; // 7 MiB
-
 /// Initial QUIC path MTU (UDP payload bytes) before MTU discovery completes.
 ///
 /// 1200 is the QUIC protocol minimum (and quinn's `min_mtu` default), so the
@@ -92,15 +79,23 @@ pub const QUIC_INITIAL_MTU: u16 = 1200;
 /// this is a constant, not a knob.
 pub const QUIC_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
 
-/// QUIC unreliable-datagram receive and send buffer size (bytes).
+/// QUIC unreliable-datagram receive buffer size (bytes).
 ///
 /// The data path maps each IP packet directly to one unreliable QUIC datagram,
 /// so datagrams must be enabled (a `None` receive buffer would tell the peer we
-/// cannot receive them). A full send buffer drops the packet WireGuard-style
-/// (the inner flow retransmits), and a full receive buffer drops the oldest
-/// queued datagrams; 4 MB is ample headroom for either direction without
-/// unbounded buffering. Fixed constant, not a knob.
-pub const QUIC_DATAGRAM_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+/// cannot receive them). A full receive buffer drops the oldest queued
+/// datagrams; 4 MB gives the application enough headroom to drain scheduler
+/// bursts without making the kernel socket size part of the protocol.
+pub const QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// QUIC unreliable-datagram send queue size (bytes).
+///
+/// This is deliberately much smaller than the receive queue. The application
+/// uses `send_datagram_wait`, so this is a bounded handoff to QUIC's pacer and
+/// congestion controller, not a multi-megabyte reservoir of stale inner TCP
+/// packets. Keeping roughly 200 MTU-sized packets absorbs scheduler jitter
+/// while applying backpressure before latency and loss multiply.
+pub const QUIC_DATAGRAM_SEND_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Build the fixed QUIC transport config used by both client and server.
 ///
@@ -135,8 +130,9 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     // datagrams must be enabled in both directions (a `None` receive buffer
     // advertises to the peer that we cannot receive them).
     transport_config =
-        transport_config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_BUFFER_SIZE));
-    transport_config = transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_BUFFER_SIZE);
+        transport_config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE));
+    transport_config =
+        transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_SIZE);
 
     Ok(transport_config.build())
 }

@@ -166,8 +166,8 @@ When `network6` is configured on the server, clients normally receive IPv6 addre
 MTU and QUIC transport settings are fixed protocol constants, WireGuard/Tailscale-style. They are not configurable, not negotiated, and not carried in the handshake; both sides derive identical values from constants in the code:
 
 - **MTU**: the inner TUN MTU is `VPN_MTU = 1280` (`src/config/mod.rs`) on client, server, and iOS — the IPv6 minimum link MTU and the same fixed value Tailscale uses, mobile-safe on essentially any real path. It is deliberately not negotiated or derived from live path measurements — a fixed constant is trivially deterministic across reconnects. The data path maps each IP packet to one unreliable QUIC datagram, so the datagram size is capped by the live path MTU: a packet that exceeds the current `max_datagram_size()` is **dropped, not fragmented** (counted by `packets_dropped_too_large`), WireGuard-style — the inner flow retransmits and adapts. On the wire, `QUIC_INITIAL_MTU` is 1200 (the QUIC protocol minimum), so the first packets survive any path; DPLPMTUD probes upward to 1452 right after the handshake, at which point full-size (1280-byte) packets fit in one datagram.
-- **Transport**: both endpoints build the identical fixed QUIC transport config from `build_quic_transport_config` (`src/transport/mod.rs`): CUBIC congestion control, 8 MB connection/stream receive and send windows (`QUIC_WINDOW_SIZE`), a 4 MB datagram send/receive buffer (`QUIC_DATAGRAM_BUFFER_SIZE`), 15 s keep-alive, and 30 s idle timeout. QUIC datagrams are enabled — they carry the IP data path. Because nothing differs between the sides, there is no transport dictation in the handshake and no reconnect-to-upgrade step.
-- **Server queues**: the per-client control channel (1024 frames, `ServerAddrs` only) and the aggregate TUN-writer queue (512 packets) are fixed constants in `src/tunnel/server.rs`. IP packets to a client are sent directly on that client's connection as datagrams; QUIC's datagram send buffer drops (WireGuard-style, counted by `packets_dropped_full`) when full, so one slow client never head-of-line blocks the TUN reader or other clients.
+- **Transport**: both endpoints build the identical fixed QUIC transport config from `build_quic_transport_config` (`src/transport/mod.rs`): CUBIC congestion control, 8 MB connection/stream receive and send windows (`QUIC_WINDOW_SIZE`), a 4 MB datagram receive buffer, a 256 KiB datagram send buffer, 15 s keep-alive, and 30 s idle timeout. Sends wait for room in the bounded queue so QUIC's pacer and congestion controller regulate TUN reads instead of the non-blocking API silently evicting old datagrams. QUIC datagrams are enabled — they carry the IP data path. Because nothing differs between the sides, there is no transport dictation in the handshake and no reconnect-to-upgrade step.
+- **Server queues**: each client has a bounded 1024-packet data queue and an independent writer that awaits that connection's QUIC send capacity. A full queue drops only that client's packet (WireGuard-style, counted by `packets_dropped_full`), so one slow client never head-of-line blocks the TUN reader or other clients. The aggregate client-to-TUN writer queue is 512 packets; control publications use a separate bounded channel.
 
 ### Direct IP over QUIC Integration
 
@@ -292,7 +292,7 @@ A datagram can only carry a single ~MTU-sized packet, so no coalesced super-fram
 
 ### Throughput Design
 
-- **Direct datagram sends**: both the client TUN reader and the server TUN reader send IP packets as datagrams inline on the connection (`send_ip_datagrams`), with no per-packet channel or writer task on the data path. The server's per-client writer task now owns the stream send half only for `ServerAddrs` control frames. The TUN writer is a dedicated task fed over an mpsc channel (no per-packet mutex).
+- **Bounded paced sends**: the client TUN reader awaits `send_datagram_wait`, applying QUIC backpressure directly. The server TUN reader feeds a bounded queue per client and each independent writer awaits its connection's send capacity, preserving client isolation. This avoids iroh's non-waiting `send_datagram` behavior, which may silently evict older queued datagrams while reporting success.
 - **Batched TUN writes**: the TUN writer drains up to `WRITE_BATCH_SIZE` (256) inbound packets per `recv_many` to amortize task wakeups, then coalesces same-flow runs into kernel GSO writes where supported.
 - **Datagram arena**: per-datagram `Bytes` are split off a long-lived 64 KB `BytesMut` (`copy_packet_to_arena`), so the allocator is hit once per arena chunk instead of once per datagram. Inbound datagrams arrive as owned `Bytes` from `read_datagram` and cross the TUN-writer channel with no copy.
 - **Zero-copy sends**: `Bytes` flow from the arena to the QUIC datagram send without copying.
@@ -702,7 +702,7 @@ past a corrupt length).
 - Client send (outbound): TUN reader task in `client.rs` - `send_ip_datagrams()` on the connection
 - Client receive (inbound): datagram task in `client.rs` - `Connection::read_datagram()`; control task - `read_frame()` then `classify()`
 - Client liveness: task awaiting `Connection::closed()` in `client.rs`
-- Server send: TUN reader task in `server.rs` - `send_client_datagrams()` on each destination client's connection
+- Server send: TUN reader task in `server.rs` - `queue_client_datagrams()` to each destination client's independent writer
 - Server receive: `handle_client_data()` in `server.rs` - `Connection::read_datagram()`
 
 **Compatibility note:** Peers must speak the same framing version; there is no backward compatibility at 0.0.x.

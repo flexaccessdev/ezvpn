@@ -214,16 +214,18 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
     let shutdown = Arc::new(Notify::new());
     let shutdown_worker = Arc::clone(&shutdown);
 
-    // The worker thread owns a dedicated current-thread runtime and drives the
-    // whole tunnel lifetime. Setup success/failure is reported back over a
-    // one-shot channel so `ezvpn_start` can surface a lock-held / offline error
-    // synchronously before returning; after that the loop runs until shutdown.
+    // The worker thread owns a dedicated multi-thread runtime and drives the
+    // whole tunnel lifetime. Separate workers keep UDP receive/QUIC pacing from
+    // being starved by TUN and route-management work. Setup success/failure is
+    // reported back over a one-shot channel so `ezvpn_start` can surface a
+    // lock-held / offline error synchronously before returning; after that the
+    // loop runs until shutdown.
     let (setup_tx, setup_rx) = mpsc::channel::<Result<ClientStatusHandle, String>>();
 
     let worker = thread::Builder::new()
         .name("ezvpn-tunnel".to_string())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
             {

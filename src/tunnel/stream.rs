@@ -83,22 +83,56 @@ impl DatagramSendOutcome {
 /// packet is software-segmented into per-MSS plain packets first, each sent as
 /// its own datagram. The datagram body is the raw IP packet — no framing.
 ///
-/// Non-blocking ([`Connection::send_datagram`]): a packet exceeding the live
-/// `max_datagram_size()` is dropped (not fragmented), and a full send buffer
-/// drops too, both WireGuard-style. `arena` amortizes the per-datagram `Bytes`
+/// Sending waits for room in the bounded QUIC datagram queue. This lets QUIC's
+/// pacer and congestion controller regulate the TUN reader instead of silently
+/// evicting old datagrams under load. `arena` amortizes the per-datagram `Bytes`
 /// allocation.
-pub fn send_ip_datagrams(
+pub async fn send_ip_datagrams(
     conn: &Connection,
     arena: &mut BytesMut,
     seg_scratch: &mut Vec<u8>,
+    pending: &mut Vec<Bytes>,
     offload: Option<&VirtioNetHdr>,
     packet: &[u8],
 ) -> DatagramSendOutcome {
     let mut outcome = DatagramSendOutcome::default();
+    prepare_ip_datagrams(
+        conn,
+        arena,
+        seg_scratch,
+        pending,
+        offload,
+        packet,
+        &mut outcome,
+    );
+    for datagram in pending.drain(..) {
+        match conn.send_datagram_wait(datagram).await {
+            Ok(()) => outcome.sent += 1,
+            Err(SendDatagramError::TooLarge) => outcome.dropped_too_large += 1,
+            Err(_) => outcome.dropped_other += 1,
+        }
+    }
+    outcome
+}
+
+/// Materialize a TUN packet into plain datagrams without sending them.
+///
+/// The server uses this to feed a bounded per-client queue, preserving client
+/// isolation while each client's writer awaits its own QUIC send capacity.
+pub(crate) fn prepare_ip_datagrams(
+    conn: &Connection,
+    arena: &mut BytesMut,
+    seg_scratch: &mut Vec<u8>,
+    pending: &mut Vec<Bytes>,
+    offload: Option<&VirtioNetHdr>,
+    packet: &[u8],
+    outcome: &mut DatagramSendOutcome,
+) {
+    pending.clear();
     match offload {
         Some(meta) => {
             let segmented = materialize_offload_into(meta, packet, seg_scratch, |seg| {
-                send_one_datagram(conn, arena, seg, &mut outcome);
+                prepare_one_datagram(conn, arena, seg, pending, outcome);
                 Ok(())
             });
             if let Err(e) = segmented {
@@ -106,16 +140,16 @@ pub fn send_ip_datagrams(
                 outcome.dropped_other += 1;
             }
         }
-        None => send_one_datagram(conn, arena, packet, &mut outcome),
+        None => prepare_one_datagram(conn, arena, packet, pending, outcome),
     }
-    outcome
 }
 
-/// Send a single plain IP packet as one unreliable datagram, updating `outcome`.
-fn send_one_datagram(
+/// Prepare a single plain IP packet for datagram transmission.
+fn prepare_one_datagram(
     conn: &Connection,
     arena: &mut BytesMut,
     packet: &[u8],
+    pending: &mut Vec<Bytes>,
     outcome: &mut DatagramSendOutcome,
 ) {
     // Datagrams are capped by the live path MTU; an oversized packet is dropped
@@ -133,12 +167,7 @@ fn send_one_datagram(
             return;
         }
     }
-    let bytes = copy_packet_to_arena(arena, packet);
-    match conn.send_datagram(bytes) {
-        Ok(()) => outcome.sent += 1,
-        Err(SendDatagramError::TooLarge) => outcome.dropped_too_large += 1,
-        Err(_) => outcome.dropped_other += 1,
-    }
+    pending.push(copy_packet_to_arena(arena, packet));
 }
 
 /// Classify a control-frame body by its leading message-type byte.

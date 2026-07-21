@@ -16,6 +16,7 @@ use ezvpn::tunnel::stream::{
 };
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use std::sync::Arc;
+use std::time::Duration;
 
 const TEST_ALPN: &[u8] = b"ezvpn-datagram-test/0";
 
@@ -57,6 +58,7 @@ async fn ip_packets_roundtrip_as_datagrams() {
 
     let mut arena = BytesMut::new();
     let mut seg_scratch: Vec<u8> = Vec::new();
+    let mut pending = Vec::new();
 
     // A minimal IP packet fits in one datagram and round-trips intact.
     let small = {
@@ -64,7 +66,15 @@ async fn ip_packets_roundtrip_as_datagrams() {
         p[0] = 0x45;
         p
     };
-    let outcome = send_ip_datagrams(&conn, &mut arena, &mut seg_scratch, None, &small);
+    let outcome = send_ip_datagrams(
+        &conn,
+        &mut arena,
+        &mut seg_scratch,
+        &mut pending,
+        None,
+        &small,
+    )
+    .await;
     assert_eq!(outcome.sent, 1, "small packet is sent as one datagram");
     assert_eq!(outcome.dropped_too_large, 0);
 
@@ -77,7 +87,15 @@ async fn ip_packets_roundtrip_as_datagrams() {
         p[0] = 0x45;
         p
     };
-    let outcome = send_ip_datagrams(&conn, &mut arena, &mut seg_scratch, None, &big);
+    let outcome = send_ip_datagrams(
+        &conn,
+        &mut arena,
+        &mut seg_scratch,
+        &mut pending,
+        None,
+        &big,
+    )
+    .await;
     assert_eq!(outcome.sent, 0, "oversized packet is never sent");
     assert_eq!(
         outcome.dropped_too_large, 1,
@@ -86,6 +104,65 @@ async fn ip_packets_roundtrip_as_datagrams() {
 
     conn.close(0u32.into(), b"done");
     let _ = accept_task.await;
+    client.close().await;
+}
+
+/// Sending more than the bounded QUIC queue can hold waits for the pacer
+/// instead of silently evicting older datagrams.
+#[tokio::test]
+async fn datagram_backpressure_preserves_queued_packets() {
+    const PACKET_COUNT: u32 = 512;
+    const PACKET_SIZE: usize = 900;
+
+    let server = bind_endpoint().await;
+    let client = bind_endpoint().await;
+    let server_addr = server.addr();
+
+    let accept_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("incoming connection");
+        let conn = incoming.await.expect("accept connection");
+        let mut received = Vec::with_capacity(PACKET_COUNT as usize);
+        for _ in 0..PACKET_COUNT {
+            let datagram = conn.read_datagram().await.expect("read datagram");
+            received.push(u32::from_be_bytes(
+                datagram[1..5].try_into().expect("sequence bytes"),
+            ));
+        }
+        received
+    });
+
+    let conn = client
+        .connect(server_addr, TEST_ALPN)
+        .await
+        .expect("connect to server");
+    let mut arena = BytesMut::new();
+    let mut seg_scratch = Vec::new();
+    let mut pending = Vec::new();
+
+    for sequence in 0..PACKET_COUNT {
+        let mut packet = vec![0u8; PACKET_SIZE];
+        packet[0] = 0x45;
+        packet[1..5].copy_from_slice(&sequence.to_be_bytes());
+        let outcome = send_ip_datagrams(
+            &conn,
+            &mut arena,
+            &mut seg_scratch,
+            &mut pending,
+            None,
+            &packet,
+        )
+        .await;
+        assert_eq!(outcome.sent, 1, "packet {sequence} queued");
+        assert_eq!(outcome.dropped_other, 0, "packet {sequence} not evicted");
+    }
+
+    let received = tokio::time::timeout(Duration::from_secs(10), accept_task)
+        .await
+        .expect("receiver completed before timeout")
+        .expect("receiver task succeeded");
+    assert_eq!(received, (0..PACKET_COUNT).collect::<Vec<_>>());
+
+    conn.close(0u32.into(), b"done");
     client.close().await;
 }
 

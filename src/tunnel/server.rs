@@ -8,7 +8,7 @@
 use crate::net::buffer::uninitialized_vec;
 use crate::config::{Ip6Strategy, VPN_MTU, VpnServerConfig, validate_ip6_strategy};
 use crate::tunnel::stream::{
-    FRAME_ARENA_CHUNK, encode_server_addrs_frame, send_ip_datagrams, write_frames,
+    FRAME_ARENA_CHUNK, encode_server_addrs_frame, prepare_ip_datagrams, write_frames,
 };
 use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
 use crate::control::{ClientEntry, ServerStatsView, ServerStatus, StatusSnapshot};
@@ -99,6 +99,9 @@ struct ClientState {
     /// The iroh connection: the TUN reader sends IP packets to this client as
     /// unreliable datagrams on it, and status reporting reads its live paths.
     connection: Connection,
+    /// Bounded handoff to this client's datagram writer. A full queue drops
+    /// only this client's packet and never stalls routing for other clients.
+    datagram_tx: mpsc::Sender<Bytes>,
 }
 
 /// Per-client context used by the data handler.
@@ -1204,6 +1207,35 @@ impl VpnServer {
         // IP packets to this client are sent as datagrams by the TUN reader.
         let (packet_tx, mut packet_rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_SIZE);
 
+        // Keep a separate bounded data queue per client. Its writer uses the
+        // awaitable datagram API, so QUIC congestion applies backpressure here
+        // without allowing one slow client to block the server TUN reader.
+        let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_SIZE);
+        let datagram_conn = connection.clone();
+        let datagram_stats = self.stats.clone();
+        let datagram_writer_handle = tokio::spawn(async move {
+            while let Some(datagram) = datagram_rx.recv().await {
+                match datagram_conn.send_datagram_wait(datagram).await {
+                    Ok(()) => {
+                        datagram_stats
+                            .packets_to_clients
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(iroh::endpoint::SendDatagramError::TooLarge) => {
+                        datagram_stats
+                            .packets_dropped_too_large
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        datagram_stats
+                            .packets_dropped_full
+                            .fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        });
+
         // Create oneshot channel for writer error signaling. When the writer
         // fails, it sends the error here to trigger immediate cleanup.
         let (writer_error_tx, writer_error_rx) = oneshot::channel::<String>();
@@ -1272,6 +1304,7 @@ impl VpnServer {
             assigned_ip,
             assigned_ip6,
             connection: connection.clone(),
+            datagram_tx,
         };
 
         // Reconnect handling: if a client with the same (EndpointId, DeviceId) exists,
@@ -1325,6 +1358,7 @@ impl VpnServer {
 
         // Abort writer task if still running (cleanup on any exit path)
         writer_handle.abort();
+        datagram_writer_handle.abort();
 
         if let Err(ref e) = result {
             log::error!("Client {} data error: {}", remote_id, e);
@@ -1411,33 +1445,47 @@ impl VpnServer {
         }
     }
 
-    /// Send an IP packet (optionally offload-tagged) to a client as one or more
-    /// unreliable QUIC datagrams, folding the result into the server stats.
-    fn send_client_datagrams(
+    /// Queue an IP packet (optionally offload-tagged) for one client's datagram
+    /// writer, folding preparation and bounded-queue drops into server stats.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_client_datagrams(
         conn: &Connection,
+        datagram_tx: &mpsc::Sender<Bytes>,
         arena: &mut BytesMut,
         seg_scratch: &mut Vec<u8>,
+        pending: &mut Vec<Bytes>,
         offload: Option<&VirtioNetHdr>,
         packet: &[u8],
         stats: &Arc<VpnServerStats>,
     ) {
-        let outcome = send_ip_datagrams(conn, arena, seg_scratch, offload, packet);
-        if outcome.sent > 0 {
-            stats
-                .packets_to_clients
-                .fetch_add(outcome.sent, Ordering::Relaxed);
-        }
+        let mut outcome = Default::default();
+        prepare_ip_datagrams(
+            conn,
+            arena,
+            seg_scratch,
+            pending,
+            offload,
+            packet,
+            &mut outcome,
+        );
         if outcome.dropped_too_large > 0 {
             stats
                 .packets_dropped_too_large
                 .fetch_add(outcome.dropped_too_large, Ordering::Relaxed);
         }
         if outcome.dropped_other > 0 {
-            // Send-buffer full (a slow client drops its own packets,
-            // WireGuard-style) or the connection went away.
             stats
                 .packets_dropped_full
                 .fetch_add(outcome.dropped_other, Ordering::Relaxed);
+        }
+        for datagram in pending.drain(..) {
+            match datagram_tx.try_send(datagram) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    stats.packets_dropped_full.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            }
         }
     }
 
@@ -1641,6 +1689,7 @@ impl VpnServer {
         // (a GSO super-frame cannot fit in a single datagram).
         let mut arena = BytesMut::with_capacity(FRAME_ARENA_CHUNK);
         let mut seg_scratch: Vec<u8> = Vec::new();
+        let mut pending: Vec<Bytes> = Vec::new();
 
         // Persistent ReadBuf: tracks the initialized region across iterations
         // so the TUN reader's `initialize_unfilled()` only zeroes the buffer
@@ -1705,18 +1754,20 @@ impl VpnServer {
 
             // Look up the destination client's connection (lock-free DashMap
             // read) and send the packet as unreliable datagram(s).
-            let connection = match self.clients.get(&client_key) {
-                Some(c) => c.connection.clone(),
+            let (connection, datagram_tx) = match self.clients.get(&client_key) {
+                Some(c) => (c.connection.clone(), c.datagram_tx.clone()),
                 None => {
                     self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
 
-            Self::send_client_datagrams(
+            Self::queue_client_datagrams(
                 &connection,
+                &datagram_tx,
                 &mut arena,
                 &mut seg_scratch,
+                &mut pending,
                 offload.as_ref(),
                 packet_ref,
                 &self.stats,

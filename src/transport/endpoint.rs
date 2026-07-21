@@ -167,49 +167,6 @@ pub fn print_relay_status(relay_config: &RelayConfig) {
     }
 }
 
-/// Warn (Linux only) when `net.core.rmem_max` / `net.core.wmem_max` would clamp
-/// the UDP socket buffer that iroh requests, silently shrinking burst tolerance.
-///
-/// iroh's socket layer (netwatch) requests a 7 MiB `SO_RCVBUF`/`SO_SNDBUF`, but
-/// Linux silently caps the request at these sysctls (default ≈ 208 KiB) and
-/// reports no error, so a too-small ceiling drops inbound datagram bursts with no
-/// feedback. We do not own the socket, so this is detect-and-warn only — it never
-/// mutates host sysctls. On non-Linux targets it compiles to a no-op.
-fn warn_if_socket_buffer_capped() {
-    #[cfg(target_os = "linux")]
-    {
-        const TARGET: usize = crate::transport::IROH_SOCKET_BUFFER_REQUEST;
-        for (knob, path, sock) in [
-            (
-                "net.core.rmem_max",
-                "/proc/sys/net/core/rmem_max",
-                "SO_RCVBUF",
-            ),
-            (
-                "net.core.wmem_max",
-                "/proc/sys/net/core/wmem_max",
-                "SO_SNDBUF",
-            ),
-        ] {
-            match std::fs::read_to_string(path) {
-                Ok(contents) => match contents.trim().parse::<usize>() {
-                    // The Linux cap applies to the requested (un-doubled) value,
-                    // so compare the sysctl directly against the target.
-                    Ok(current) if current < TARGET => log::warn!(
-                        "{knob} = {current} is below {TARGET} (7 MiB); the kernel will silently \
-                         clamp iroh's {sock} to this size, dropping inbound datagram bursts under \
-                         load (seen as inner-TCP retransmits). Raise it to use the full buffer: \
-                         sudo sysctl -w {knob}={TARGET}"
-                    ),
-                    Ok(current) => log::debug!("{knob} = {current} (>= {TARGET}, ok)"),
-                    Err(e) => log::debug!("could not parse {path}: {e}"),
-                },
-                Err(e) => log::debug!("could not read {path}: {e}"),
-            }
-        }
-    }
-}
-
 /// Create a base endpoint builder with common configuration.
 ///
 /// iroh internet discovery (pkarr publishing + DNS-based lookup of
@@ -226,7 +183,6 @@ fn warn_if_socket_buffer_capped() {
 ///   Initials to every configured relay, so the handshake succeeds via whichever
 ///   relay the server is homed on.
 pub fn create_endpoint_builder(relay_config: &RelayConfig) -> Result<EndpointBuilder> {
-    warn_if_socket_buffer_capped();
     let transport_config = build_quic_transport_config()?;
     // iroh 1.0 requires the crypto provider to be set explicitly on the
     // builder when starting from the `Empty` preset — the `tls-ring` feature
