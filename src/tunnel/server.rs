@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
@@ -49,6 +49,81 @@ const CLIENT_CHANNEL_SIZE: usize = 1024;
 /// Aggregate client→TUN writer queue depth (fixed). Shared by all clients, so
 /// it bounds memory (~750 KB worst case) while absorbing bursts.
 const TUN_WRITER_CHANNEL_SIZE: usize = 512;
+
+/// How often the server verifies that iroh still has a connected home relay.
+const HOME_RELAY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum continuous home-relay outage before the server exits for restart.
+const HOME_RELAY_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Update the beginning of a continuous relay outage and report whether it has
+/// reached the fatal threshold. Any connected home relay resets the outage.
+fn home_relay_outage_expired(
+    disconnected_since: &mut Option<Instant>,
+    any_connected: bool,
+    now: Instant,
+) -> bool {
+    if any_connected {
+        *disconnected_since = None;
+        return false;
+    }
+
+    let since = disconnected_since.get_or_insert(now);
+    now.duration_since(*since) >= HOME_RELAY_DISCONNECT_TIMEOUT
+}
+
+/// Fail the server after a continuous home-relay outage. Returning an error
+/// makes foreground runs fail loudly and lets the recommended service-manager
+/// setup recreate the endpoint instead of leaving a stale relay session alive.
+async fn watch_home_relay(endpoint: Endpoint) -> VpnResult<()> {
+    let mut statuses = endpoint.home_relay_status();
+    let mut interval = tokio::time::interval(HOME_RELAY_CHECK_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut disconnected_since = None;
+
+    loop {
+        interval.tick().await;
+        let current = statuses.get();
+        let any_connected = current.iter().any(|status| status.is_connected());
+        let outage_started = !any_connected && disconnected_since.is_none();
+        let previous_outage = disconnected_since;
+        let expired =
+            home_relay_outage_expired(&mut disconnected_since, any_connected, Instant::now());
+
+        if outage_started {
+            log::warn!(
+                "No home relay is connected; server will restart if the outage lasts {}s",
+                HOME_RELAY_DISCONNECT_TIMEOUT.as_secs()
+            );
+        } else if any_connected
+            && let Some(since) = previous_outage
+        {
+            log::info!(
+                "Home relay connection recovered after {:.1}s",
+                since.elapsed().as_secs_f64()
+            );
+        }
+
+        if expired {
+            let details = if current.is_empty() {
+                "no home relay selected".to_string()
+            } else {
+                current
+                    .iter()
+                    .map(|status| match status.last_error() {
+                        Some(error) => format!("{}: {error:#}", status.url()),
+                        None => format!("{}: disconnected", status.url()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            return Err(VpnError::Signaling(format!(
+                "no home relay connected for {}s ({details})",
+                HOME_RELAY_DISCONNECT_TIMEOUT.as_secs()
+            )));
+        }
+    }
+}
 
 /// Performance statistics for the VPN server.
 ///
@@ -914,34 +989,47 @@ impl VpnServer {
             }
         });
 
-        // Accept incoming connections
-        loop {
-            match endpoint.accept().await {
-                Some(incoming) => {
-                    let server = server.clone();
-                    let tun_write_tx = tun_write_tx.clone();
-                    let local_iroh_udp_ports = local_iroh_udp_ports.clone();
-                    let endpoint = endpoint.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = server
-                            .handle_connection(
-                                incoming,
-                                tun_write_tx,
-                                local_iroh_udp_ports,
-                                endpoint,
-                            )
-                            .await
-                        {
-                            log::error!("Connection error: {}", e);
-                        }
-                    });
+        // Accept incoming connections while independently verifying that iroh's
+        // home relay remains usable. A stale relay session otherwise leaves the
+        // endpoint alive but undiscoverable, causing clients to time out forever.
+        let relay_watchdog = watch_home_relay(endpoint.clone());
+        tokio::pin!(relay_watchdog);
+        let run_result = loop {
+            tokio::select! {
+                watchdog_result = &mut relay_watchdog => {
+                    if let Err(error) = &watchdog_result {
+                        log::error!("Home relay watchdog failed: {error}");
+                        endpoint.close().await;
+                    }
+                    break watchdog_result;
                 }
-                None => {
-                    log::info!("Endpoint closed, shutting down");
-                    break;
+                incoming = endpoint.accept() => match incoming {
+                    Some(incoming) => {
+                        let server = server.clone();
+                        let tun_write_tx = tun_write_tx.clone();
+                        let local_iroh_udp_ports = local_iroh_udp_ports.clone();
+                        let endpoint = endpoint.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = server
+                                .handle_connection(
+                                    incoming,
+                                    tun_write_tx,
+                                    local_iroh_udp_ports,
+                                    endpoint,
+                                )
+                                .await
+                            {
+                                log::error!("Connection error: {}", e);
+                            }
+                        });
+                    }
+                    None => {
+                        log::info!("Endpoint closed, shutting down");
+                        break Ok(());
+                    }
                 }
             }
-        }
+        };
 
         // Graceful shutdown: drop channel sender to signal TUN writer to exit,
         // then await both tasks to ensure clean termination.
@@ -959,7 +1047,7 @@ impl VpnServer {
         }
 
         log::info!("TUN tasks shutdown complete");
-        Ok(())
+        run_result
     }
 
     /// Handle an incoming VPN connection.
@@ -2305,6 +2393,58 @@ fn extract_udp_ports(packet: &[u8]) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_relay_outage_requires_one_continuous_minute() {
+        let start = Instant::now();
+        let mut disconnected_since = None;
+
+        assert!(!home_relay_outage_expired(
+            &mut disconnected_since,
+            false,
+            start
+        ));
+        assert!(!home_relay_outage_expired(
+            &mut disconnected_since,
+            false,
+            start + Duration::from_secs(59)
+        ));
+        assert!(home_relay_outage_expired(
+            &mut disconnected_since,
+            false,
+            start + HOME_RELAY_DISCONNECT_TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn home_relay_recovery_resets_outage_timer() {
+        let start = Instant::now();
+        let mut disconnected_since = None;
+
+        assert!(!home_relay_outage_expired(
+            &mut disconnected_since,
+            false,
+            start
+        ));
+        assert!(!home_relay_outage_expired(
+            &mut disconnected_since,
+            true,
+            start + Duration::from_secs(59)
+        ));
+        assert_eq!(disconnected_since, None);
+
+        let second_outage = start + Duration::from_secs(120);
+        assert!(!home_relay_outage_expired(
+            &mut disconnected_since,
+            false,
+            second_outage
+        ));
+        assert!(!home_relay_outage_expired(
+            &mut disconnected_since,
+            false,
+            second_outage + Duration::from_secs(59)
+        ));
+    }
 
     /// Helper to create a random EndpointId for testing
     fn random_endpoint_id() -> EndpointId {

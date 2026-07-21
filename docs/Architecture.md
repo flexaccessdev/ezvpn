@@ -241,6 +241,14 @@ re-homes onto — which is why a client configured with only a subset of the
 server's relays can reach it only while the server's home relay is in that
 subset. Configure both sides with the full relay list.
 
+**Server home-relay watchdog.** Once online, the server checks iroh's
+`home_relay_status()` every five seconds. If no home relay remains connected for
+60 continuous seconds, the server closes its endpoint and exits with an error.
+Any connected status resets the outage timer. This turns an endpoint whose stale
+home-relay session is still locally alive but no longer reachable by clients into
+a visible failure; the recommended service-manager `Restart=on-failure` policy
+then recreates the endpoint and relay session.
+
 This is the same behavior as tunnel-rs (`Disable internet discovery
 automatically when custom relays are configured`): a deployment that runs custom
 relays contacts no public iroh infrastructure at all.
