@@ -7,39 +7,39 @@
 //! connection capabilities.
 
 use crate::error::{VpnError, VpnResult};
-use crate::tunnel::offload::{VIRTIO_NET_HDR_LEN, VirtioNetHdr};
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// VPN protocol version.
 ///
-/// Version 6: the data path is a reliable QUIC stream. The handshake bi-stream
-/// stays open after the response and carries length-prefixed data frames (see
-/// [`crate::tunnel::stream`]) instead of the former unreliable QUIC datagrams.
+/// Version 7: each IP packet maps directly to one unreliable, unordered QUIC
+/// datagram (WireGuard-style — see [`crate::tunnel::stream`]). The handshake
+/// bi-stream stays open only as the control channel for server-address
+/// publications. This reverses version 6's reliable-stream data path.
 /// MTU and QUIC transport tuning remain fixed, WireGuard/Tailscale-style: the
 /// tunnel MTU is the protocol constant [`crate::config::VPN_MTU`], and the
 /// transport config is [`crate::transport::build_quic_transport_config`].
-pub const VPN_PROTOCOL_VERSION: u16 = 6;
+pub const VPN_PROTOCOL_VERSION: u16 = 7;
 
 /// Fixed ALPN protocol identifier for the VPN tunnel.
 ///
 /// A peer whose advertised ALPN does not match this exact value is rejected
 /// during QUIC ALPN negotiation, before any application streams are opened.
 ///
-/// The `6` is the ALPN/format version, kept in lockstep with
+/// The `7` is the ALPN/format version, kept in lockstep with
 /// [`VPN_PROTOCOL_VERSION`]: a peer advertising a different ALPN segment
-/// (e.g. the older datagram-based `ezvpn/5`) no longer matches and QUIC
-/// negotiation rejects it before the handshake.
-pub const VPN_ALPN: &[u8] = b"ezvpn/6";
+/// (e.g. the reliable-stream `ezvpn/6` or the older datagram-based `ezvpn/5`)
+/// no longer matches and QUIC negotiation rejects it before the handshake.
+pub const VPN_ALPN: &[u8] = b"ezvpn/7";
 
 /// VPN handshake request from client to server.
 ///
 /// Sent over the iroh QUIC handshake bi-stream to initiate VPN setup; after
-/// the response, the same bi-stream becomes the data channel. The client
-/// advertises its data-channel GSO capability here (the handshake leads the
-/// data frames on the same reliable stream, so there is no separate, racy
-/// capabilities message).
+/// the response, the bi-stream stays open as the control channel while IP
+/// packets ride unreliable datagrams. GSO is not negotiated: super-frames are
+/// never forwarded on the wire (they cannot fit in a datagram), and each side's
+/// TUN offload is a purely local concern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpnHandshake {
     /// Protocol version.
@@ -49,9 +49,6 @@ pub struct VpnHandshake {
     /// Authentication token (optional, for token-based auth).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
-    /// Whether the client can send/receive GSO metadata on data frames.
-    #[serde(default)]
-    pub gso_enabled: bool,
 }
 
 impl VpnHandshake {
@@ -61,19 +58,12 @@ impl VpnHandshake {
             version: VPN_PROTOCOL_VERSION,
             device_id,
             auth_token: None,
-            gso_enabled: false,
         }
     }
 
     /// Set the authentication token.
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
-        self
-    }
-
-    /// Advertise the client's data-channel GSO capability.
-    pub fn with_gso(mut self, enabled: bool) -> Self {
-        self.gso_enabled = enabled;
         self
     }
 
@@ -106,8 +96,6 @@ pub struct VpnHandshakeResponse {
     pub version: u16,
     /// Whether the handshake was accepted.
     pub accepted: bool,
-    /// Server-local TUN GSO/offload status.
-    pub server_gso_enabled: bool,
     /// Assigned VPN IP address for the client (IPv4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_ip: Option<Ipv4Addr>,
@@ -165,16 +153,10 @@ impl VpnHandshakeResponse {
     }
 
     /// Create an accepted response (IPv4 only).
-    pub fn accepted(
-        assigned_ip: Ipv4Addr,
-        network: Ipv4Net,
-        server_ip: Ipv4Addr,
-        server_gso_enabled: bool,
-    ) -> Self {
+    pub fn accepted(assigned_ip: Ipv4Addr, network: Ipv4Net, server_ip: Ipv4Addr) -> Self {
         Self {
             version: VPN_PROTOCOL_VERSION,
             accepted: true,
-            server_gso_enabled,
             assigned_ip: Some(assigned_ip),
             network: Some(network),
             server_ip: Some(server_ip),
@@ -194,12 +176,10 @@ impl VpnHandshakeResponse {
         assigned_ip6: Ipv6Addr,
         network6: Ipv6Net,
         server_ip6: Ipv6Addr,
-        server_gso_enabled: bool,
     ) -> Self {
         Self {
             version: VPN_PROTOCOL_VERSION,
             accepted: true,
-            server_gso_enabled,
             assigned_ip: Some(assigned_ip),
             network: Some(network),
             server_ip: Some(server_ip),
@@ -218,12 +198,10 @@ impl VpnHandshakeResponse {
         assigned_ip6: Ipv6Addr,
         network6: Ipv6Net,
         server_ip6: Ipv6Addr,
-        server_gso_enabled: bool,
     ) -> Self {
         Self {
             version: VPN_PROTOCOL_VERSION,
             accepted: true,
-            server_gso_enabled,
             assigned_ip: None,
             network: None,
             server_ip: None,
@@ -236,11 +214,10 @@ impl VpnHandshakeResponse {
     }
 
     /// Create a rejected response.
-    pub fn rejected(reason: impl Into<String>, server_gso_enabled: bool) -> Self {
+    pub fn rejected(reason: impl Into<String>) -> Self {
         Self {
             version: VPN_PROTOCOL_VERSION,
             accepted: false,
-            server_gso_enabled,
             assigned_ip: None,
             network: None,
             server_ip: None,
@@ -331,18 +308,16 @@ pub async fn read_message<R: tokio::io::AsyncReadExt + Unpin>(
 /// Maximum handshake message size (16 KB).
 pub const MAX_HANDSHAKE_SIZE: usize = 16 * 1024;
 
-/// Message types for the VPN data channel (length-prefixed frames on the
-/// reliable data stream).
+/// Message types for the reliable control channel (length-prefixed frames on
+/// the handshake stream that stays open — see [`crate::tunnel::stream`]).
 ///
-/// Each frame is `[len: u32 BE] [body]` (see [`crate::tunnel::stream`]); the
-/// body's leading byte is the message type and the remainder is type-specific.
-/// IP packet body: `[0x00] [offload_len: 1] [offload: 0|10] [ip_packet]`.
-/// Server-addresses body: `[0x01] [json(ServerAddrsMsg)]`.
+/// Each frame is `[len: u32 BE] [body]`; the body's leading byte is the message
+/// type and the remainder is type-specific. Server-addresses body:
+/// `[0x01] [json(ServerAddrsMsg)]`. IP packets are not framed here — they map
+/// directly to unreliable QUIC datagrams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DataMessageType {
-    /// IP packet frame.
-    IpPacket = 0x00,
     /// Server-published set of candidate iroh underlay addresses (server →
     /// client only). The client installs bypass routes for any that a VPN route
     /// would otherwise capture, pre-empting self-capture of a server address
@@ -354,7 +329,6 @@ impl DataMessageType {
     /// Convert from byte value.
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
-            0x00 => Some(Self::IpPacket),
             0x01 => Some(Self::ServerAddrs),
             _ => None,
         }
@@ -426,83 +400,18 @@ impl From<DataMessageType> for u8 {
     }
 }
 
-/// Parse a v2 IP packet frame payload (the frame body after the type byte).
-#[inline]
-pub fn parse_ip_packet_v2(frame_payload: &[u8]) -> VpnResult<(Option<VirtioNetHdr>, &[u8])> {
-    if frame_payload.is_empty() {
-        return Err(VpnError::Signaling("Empty IP frame payload".to_string()));
-    }
-
-    let offload_len = usize::from(frame_payload[0]);
-    if offload_len != 0 && offload_len != VIRTIO_NET_HDR_LEN {
-        return Err(VpnError::Signaling(format!(
-            "Invalid offload metadata length {} (expected 0 or {})",
-            offload_len, VIRTIO_NET_HDR_LEN
-        )));
-    }
-
-    let offload_end = 1 + offload_len;
-    if frame_payload.len() <= offload_end {
-        return Err(VpnError::Signaling(format!(
-            "IP frame payload too short: {} bytes",
-            frame_payload.len()
-        )));
-    }
-
-    let ip_version = frame_payload[offload_end] >> 4;
-    let ip_payload_len = frame_payload.len() - offload_end;
-    match ip_version {
-        4 => {
-            if ip_payload_len < 20 {
-                return Err(VpnError::Signaling(format!(
-                    "IPv4 packet too short: {} bytes (minimum 20)",
-                    ip_payload_len
-                )));
-            }
-        }
-        6 => {
-            if ip_payload_len < 40 {
-                return Err(VpnError::Signaling(format!(
-                    "IPv6 packet too short: {} bytes (minimum 40)",
-                    ip_payload_len
-                )));
-            }
-        }
-        _ => {
-            return Err(VpnError::Signaling(format!(
-                "Unsupported IP version: {}",
-                ip_version
-            )));
-        }
-    }
-
-    let offload = if offload_len == 0 {
-        None
-    } else {
-        Some(
-            VirtioNetHdr::from_bytes(&frame_payload[1..offload_end])
-                .map_err(|e| VpnError::Signaling(format!("Invalid offload metadata: {}", e)))?,
-        )
-    };
-
-    Ok((offload, &frame_payload[offload_end..]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_handshake_roundtrip() {
-        let handshake = VpnHandshake::new(12345)
-            .with_auth_token("test-token")
-            .with_gso(true);
+        let handshake = VpnHandshake::new(12345).with_auth_token("test-token");
         let encoded = handshake.encode().expect("encode handshake");
         let decoded = VpnHandshake::decode(&encoded).expect("decode handshake");
         assert_eq!(decoded.version, VPN_PROTOCOL_VERSION);
         assert_eq!(decoded.device_id, 12345);
         assert_eq!(decoded.auth_token, Some("test-token".to_string()));
-        assert!(decoded.gso_enabled);
     }
 
     #[test]
@@ -511,7 +420,6 @@ mod tests {
             version: 1,
             device_id: 7,
             auth_token: None,
-            gso_enabled: false,
         })
         .expect("serialize handshake");
 
@@ -528,12 +436,10 @@ mod tests {
             "10.0.0.2".parse().expect("parse IPv4"),
             "10.0.0.0/24".parse().expect("parse network"),
             "10.0.0.1".parse().expect("parse server ip"),
-            true,
         );
         let encoded = response.encode().expect("encode response");
         let decoded = VpnHandshakeResponse::decode(&encoded).expect("decode response");
         assert!(decoded.accepted);
-        assert!(decoded.server_gso_enabled);
         assert_eq!(
             decoded.assigned_ip,
             Some("10.0.0.2".parse().expect("parse IPv4"))
@@ -556,14 +462,12 @@ mod tests {
             assigned_ip6,
             network6,
             server_ip6,
-            false,
         );
 
         let encoded = response.encode().expect("encode response");
         let decoded = VpnHandshakeResponse::decode(&encoded).expect("decode response");
 
         assert!(decoded.accepted);
-        assert!(!decoded.server_gso_enabled);
         assert_eq!(decoded.assigned_ip, Some(assigned_ip));
         assert_eq!(decoded.network, Some(network));
         assert_eq!(decoded.server_ip, Some(server_ip));
@@ -586,7 +490,6 @@ mod tests {
             "10.0.0.2".parse().expect("parse IPv4"),
             "10.0.0.0/24".parse().expect("parse network"),
             "10.0.0.1".parse().expect("parse server ip"),
-            false,
         )
         .with_server_addrs(addrs.clone());
 
@@ -597,11 +500,10 @@ mod tests {
 
     #[test]
     fn test_response_rejected_roundtrip() {
-        let response = VpnHandshakeResponse::rejected("Server full", false);
+        let response = VpnHandshakeResponse::rejected("Server full");
         let encoded = response.encode().expect("encode response");
         let decoded = VpnHandshakeResponse::decode(&encoded).expect("decode response");
         assert!(!decoded.accepted);
-        assert!(!decoded.server_gso_enabled);
         assert_eq!(decoded.reject_reason, Some("Server full".to_string()));
     }
 
@@ -611,13 +513,12 @@ mod tests {
         let network6: Ipv6Net = "fd00::/64".parse().expect("parse network6");
         let server_ip6: Ipv6Addr = "fd00::1".parse().expect("parse server ip6");
 
-        let response = VpnHandshakeResponse::accepted_ipv6_only(assigned_ip6, network6, server_ip6, true);
+        let response = VpnHandshakeResponse::accepted_ipv6_only(assigned_ip6, network6, server_ip6);
 
         let encoded = response.encode().expect("encode response");
         let decoded = VpnHandshakeResponse::decode(&encoded).expect("decode response");
 
         assert!(decoded.accepted);
-        assert!(decoded.server_gso_enabled);
         assert_eq!(decoded.assigned_ip, None);
         assert_eq!(decoded.network, None);
         assert_eq!(decoded.server_ip, None);
@@ -632,7 +533,6 @@ mod tests {
         let response = VpnHandshakeResponse {
             version: VPN_PROTOCOL_VERSION,
             accepted: true,
-            server_gso_enabled: false,
             assigned_ip: None,
             network: None,
             server_ip: None,
@@ -658,7 +558,6 @@ mod tests {
             "10.0.0.2".parse().expect("parse IPv4"),
             "10.0.0.0/24".parse().expect("parse network"),
             "10.0.0.1".parse().expect("parse server ip"),
-            false,
         );
         response.network = None;
         assert!(!response.is_valid(), "missing network must be rejected");
@@ -676,7 +575,6 @@ mod tests {
             "fd00::2".parse().expect("parse IPv6"),
             "fd00::/64".parse().expect("parse network6"),
             "fd00::1".parse().expect("parse server ip6"),
-            false,
         );
         dual.server_ip6 = None;
         assert!(!dual.is_valid(), "missing IPv6 gateway must be rejected");
@@ -684,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_response_rejects_old_protocol_version() {
-        let mut response = VpnHandshakeResponse::rejected("nope", false);
+        let mut response = VpnHandshakeResponse::rejected("nope");
         response.version = 4;
         let raw = serde_json::to_vec(&response).expect("serialize response");
         let err = VpnHandshakeResponse::decode(&raw).expect_err("v2 response should be rejected");
@@ -696,23 +594,19 @@ mod tests {
 
     #[test]
     fn test_data_message_type_roundtrip() {
-        let msg_type = DataMessageType::from_byte(0x00).expect("valid message type");
-        assert_eq!(msg_type, DataMessageType::IpPacket);
-        assert_eq!(msg_type.as_byte(), 0x00);
-
-        let msg_type: DataMessageType = 0x00u8.try_into().expect("try_from should work");
-        assert_eq!(msg_type, DataMessageType::IpPacket);
-        let back: u8 = msg_type.into();
-        assert_eq!(back, 0x00);
-
         let msg_type = DataMessageType::from_byte(0x01).expect("valid message type");
         assert_eq!(msg_type, DataMessageType::ServerAddrs);
         assert_eq!(msg_type.as_byte(), 0x01);
+
+        let msg_type: DataMessageType = 0x01u8.try_into().expect("try_from should work");
+        assert_eq!(msg_type, DataMessageType::ServerAddrs);
+        let back: u8 = msg_type.into();
+        assert_eq!(back, 0x01);
     }
 
     #[test]
     fn test_data_message_type_invalid_bytes() {
-        for invalid in [0x02, 0x03, 0x10, 0x80, 0xff] {
+        for invalid in [0x00, 0x02, 0x03, 0x10, 0x80, 0xff] {
             assert!(
                 DataMessageType::from_byte(invalid).is_none(),
                 "from_byte(0x{:02x}) should return None",
@@ -743,20 +637,5 @@ mod tests {
             assert_eq!(err, InvalidMessageType(invalid));
             assert!(err.to_string().contains(&format!("0x{:02x}", invalid)));
         }
-    }
-
-    #[test]
-    fn test_parse_ip_packet_v2_rejects_invalid_offload_len() {
-        let payload = [7u8, 1, 2, 3, 4, 5];
-        let err = parse_ip_packet_v2(&payload).expect_err("invalid offload length must fail");
-        assert!(err.to_string().contains("Invalid offload metadata length"));
-    }
-
-    #[test]
-    fn test_parse_ip_packet_v2_rejects_empty_ip_payload() {
-        let mut payload = vec![VIRTIO_NET_HDR_LEN as u8];
-        payload.extend_from_slice(&[0u8; VIRTIO_NET_HDR_LEN]);
-        let err = parse_ip_packet_v2(&payload).expect_err("empty payload must fail");
-        assert!(err.to_string().contains("IP frame payload too short"));
     }
 }

@@ -83,11 +83,34 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             suffix: linux-arm64
+          # Fully static musl builds — no libc dependency, so these run anywhere
+          # (Alpine, distroless, minimal VMs) in addition to glibc systems. Viable
+          # because the crate graph has no OpenSSL (rustls + ring only).
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            suffix: linux-amd64-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            suffix: linux-arm64-musl
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # musl targets need the musl C toolchain (for compiling `ring`'s C/asm) and
+      # the rustup std for the target. Each runner is the target's native arch, so
+      # musl-gcc is a native compile, not a cross-compile.
+      - name: Set up musl toolchain
+        if: endsWith(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add ${{ matrix.target }}
       - name: Build
+        env:
+          # Point the `cc` crate at musl-gcc for the musl targets. The var names
+          # are target-scoped, so they are inert for the gnu builds.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --target ${{ matrix.target }}
       - name: Rename
         run: mv target/${{ matrix.target }}/release/ezvpn target/release/ezvpn-${{ matrix.suffix }}

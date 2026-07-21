@@ -9,7 +9,7 @@ pub mod paths;
 
 use anyhow::{Context, Result};
 use iroh::endpoint::QuicTransportConfig;
-use noq_proto::congestion::CubicConfig;
+use noq_proto::congestion::Bbr3Config;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +36,7 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// are considered dead and closed. With [`QUIC_KEEP_ALIVE_INTERVAL`] enabled,
 /// this timeout only triggers for truly unresponsive peers.
 ///
-/// The data path is a reliable QUIC stream with no application-level
+/// The data path is unreliable QUIC datagrams with no application-level
 /// heartbeat: peer liveness is detected entirely by QUIC keep-alive plus this
 /// idle timeout (a dead peer stops sending keep-alives and the connection
 /// closes after this elapses, resolving `Connection::closed()`). 30s gives
@@ -55,35 +55,21 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// this interval even if iroh has not yet selected it for the active path.
 pub const SERVER_ADDR_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Kernel UDP socket buffer size that iroh's socket layer (netwatch) requests
-/// for `SO_RCVBUF`/`SO_SNDBUF`. Mirrors netwatch's private `SOCKET_BUFFER_SIZE`
-/// (`7 << 20`); kept here so the startup check warns against the same target.
-///
-/// Linux silently caps the request at `net.core.rmem_max` / `net.core.wmem_max`,
-/// so iroh's buffer is only this large when those sysctls are at least this
-/// value. We cannot read the applied size back (iroh owns the socket), so the
-/// startup check warns when the sysctl would clamp it.
-// Only the Linux startup check (`warn_if_socket_buffer_capped`) reads this, since
-// the `net.core.*_max` clamp it guards against is Linux-specific.
-#[cfg(target_os = "linux")]
-pub const IROH_SOCKET_BUFFER_REQUEST: usize = 7 << 20; // 7 MiB
-
 /// Initial QUIC path MTU (UDP payload bytes) before MTU discovery completes.
 ///
-/// 1200 is the QUIC protocol minimum (and quinn's `min_mtu` default), so the
-/// very first packets survive *any* path — cellular, tunnel-in-tunnel, PPPoE —
-/// with no early black-holing. DPLPMTUD's first run happens right after the
-/// handshake and binary-searches upward to its default `upper_bound` (1452), so
-/// LAN/broadband paths reach full size within a few RTTs.
+/// noq conservatively reserves at most 50 bytes for the QUIC short header,
+/// connection ID, packet number, AEAD tag, and DATAGRAM frame encoding. Adding
+/// that bound to the fixed inner MTU guarantees a complete VPN packet fits
+/// immediately after the handshake without assuming a 1500-byte underlay.
+/// Starting at QUIC's 1200-byte protocol minimum made the live datagram limit
+/// smaller than the TUN MTU, dropping full-sized inner TCP packets for several
+/// seconds while DPLPMTUD ramped upward.
 ///
-/// The primary deployment target is mobile / high-latency internet access, where
-/// an optimistic initial MTU (e.g. 1452) causes persistent packet loss on paths
-/// with a smaller real MTU until black-hole detection recovers. Reliability from
-/// packet one is worth the brief ramp-up. The path MTU only affects QUIC's own
-/// packetization of the data stream — application framing is size-independent —
-/// so discovery raising (or lowering) it is invisible above the transport.
-/// `min_mtu` and MTU discovery keep their defaults.
-pub const QUIC_INITIAL_MTU: u16 = 1200;
+/// DPLPMTUD and its 1200-byte minimum remain enabled, so a genuinely smaller
+/// underlay is detected and corrected downward. Such a path cannot carry the
+/// fixed 1280-byte inner MTU without fragmentation in any case.
+pub const QUIC_DATAGRAM_OVERHEAD_BUDGET: u16 = 50;
+pub const QUIC_INITIAL_MTU: u16 = crate::config::VPN_MTU + QUIC_DATAGRAM_OVERHEAD_BUDGET;
 
 /// QUIC connection/stream receive window and send window (bytes).
 ///
@@ -92,9 +78,27 @@ pub const QUIC_INITIAL_MTU: u16 = 1200;
 /// this is a constant, not a knob.
 pub const QUIC_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
 
+/// QUIC unreliable-datagram receive buffer size (bytes).
+///
+/// The data path maps each IP packet directly to one unreliable QUIC datagram,
+/// so datagrams must be enabled (a `None` receive buffer would tell the peer we
+/// cannot receive them). A full receive buffer drops the oldest queued
+/// datagrams; 4 MB gives the application enough headroom to drain scheduler
+/// bursts without making the kernel socket size part of the protocol.
+pub const QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// QUIC unreliable-datagram send queue size (bytes).
+///
+/// This is deliberately much smaller than the receive queue. The application
+/// uses `send_datagram_wait`, so this is a bounded handoff to QUIC's pacer and
+/// congestion controller, not a multi-megabyte reservoir of stale inner TCP
+/// packets. Keeping roughly 200 MTU-sized packets absorbs scheduler jitter
+/// while applying backpressure before latency and loss multiply.
+pub const QUIC_DATAGRAM_SEND_BUFFER_SIZE: usize = 256 * 1024;
+
 /// Build the fixed QUIC transport config used by both client and server.
 ///
-/// Every setting is a constant: CUBIC congestion control, 8 MB windows, the
+/// Every setting is a constant: BBRv3 congestion control, 8 MB windows, the
 /// keep-alive/idle timers above, and the protocol-minimum initial MTU. Both
 /// sides applying the identical config means nothing has to be negotiated.
 pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
@@ -107,23 +111,30 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL);
 
-    // CUBIC: the widely deployed loss-based default, fixed (no knob).
+    // BBRv3 uses a bandwidth/RTT model and explicitly paces transmissions. That
+    // is important for a VPN carrying TCP inside QUIC DATAGRAMs: CUBIC reacts
+    // to the same loss as the inner TCP connection, multiplying congestion-window
+    // reductions, while bursty sends overflow small platform UDP socket queues.
     transport_config =
-        transport_config.congestion_controller_factory(Arc::new(CubicConfig::default()));
+        transport_config.congestion_controller_factory(Arc::new(Bbr3Config::default()));
 
     // Fixed flow-control windows for connection + streams.
     transport_config = transport_config.receive_window(QUIC_WINDOW_SIZE.into());
     transport_config = transport_config.stream_receive_window(QUIC_WINDOW_SIZE.into());
     transport_config = transport_config.send_window(QUIC_WINDOW_SIZE.into());
 
-    // Start at the protocol-minimum path MTU so the first packets survive any
-    // path (see QUIC_INITIAL_MTU); MTU discovery probes upward right after the
-    // handshake. Discovery config and min_mtu keep their defaults.
+    // Start large enough for the fixed inner MTU (see QUIC_INITIAL_MTU).
+    // Discovery config and min_mtu keep their defaults, including downward
+    // black-hole recovery for smaller paths.
     transport_config = transport_config.initial_mtu(QUIC_INITIAL_MTU);
 
-    // The data path is a reliable stream; QUIC datagrams are unused, so
-    // disable datagram receipt entirely.
-    transport_config = transport_config.datagram_receive_buffer_size(None);
+    // The data path maps each IP packet to one unreliable QUIC datagram, so
+    // datagrams must be enabled in both directions (a `None` receive buffer
+    // advertises to the peer that we cannot receive them).
+    transport_config =
+        transport_config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE));
+    transport_config =
+        transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_SIZE);
 
     Ok(transport_config.build())
 }

@@ -282,7 +282,7 @@ Server-side settings are authoritative for VPN network parameters:
 The tunnel MTU and QUIC transport settings are fixed protocol constants
 (WireGuard/Tailscale-style — no tuning knobs): the MTU is always 1280
 (Tailscale's fixed value, the IPv6 minimum link MTU) and the transport always
-uses CUBIC with fixed windows. Nothing is negotiated; both sides derive the
+uses paced BBRv3 with fixed windows. Nothing is negotiated; both sides derive the
 same values from constants.
 
 Clients configure their server identity, auth token, routes, relay and
@@ -599,27 +599,24 @@ where the app applies DNS conditional forwarding in-tunnel itself (see
 
 ## Protocol, MTU, and GSO
 
-- Wire protocol v6 is required on both peers. Mixed-version pairs do not
+- Wire protocol v7 is required on both peers. Mixed-version pairs do not
   connect.
-- The data path sends raw IP packets over a single reliable QUIC
-  bidirectional stream (the handshake stream, kept open) protected by
-  QUIC/TLS 1.3.
-- IP packet frames are `[len: u32 BE][type][offload_len][offload?][ip_packet]`.
-  The stream is a byte pipe, so an explicit length prefix delimits messages.
-  Server address publications use their own frame type (`0x01`) with a JSON
-  body.
-- The initial QUIC path MTU is 1200, the QUIC protocol minimum, so the first
-  packets survive any path (cellular, tunnel-in-tunnel, PPPoE). QUIC path-MTU
-  discovery probes upward to 1452 right after the handshake. The path MTU only
-  affects QUIC's own packetization — application framing is size-independent.
+- Each raw IP packet is one unreliable, unordered QUIC DATAGRAM protected by
+  QUIC/TLS 1.3. The handshake stream stays open only for reliable server-address
+  control publications (`[len: u32 BE][0x01][json]`).
+- The initial QUIC UDP payload MTU is 1330: the fixed 1280-byte inner MTU plus
+  noq's conservative 50-byte QUIC DATAGRAM overhead bound. A full inner packet
+  therefore fits immediately without assuming a 1500-byte underlay. DPLPMTUD
+  remains enabled with a 1200-byte minimum and probes toward the real PMTU.
 - The inner TUN MTU is fixed at 1280 on both ends (the IPv6 minimum link MTU
   and the same fixed value Tailscale uses, mobile-safe on essentially any real
   path). It is a protocol constant, not a config knob, and is not carried in
   the handshake.
-- GSO super-frames ride the stream whole when both sides negotiated GSO and
-  are re-coalesced into kernel-TSO super-frames on receive where supported;
-  otherwise they are software-segmented into per-MSS packets. Path MTU never
-  forces segmentation or drops — QUIC retransmits and packetizes the stream.
+- GSO super-frames are segmented into plain per-MSS datagrams before transport
+  and consecutive received TCP packets are re-coalesced into kernel-TSO
+  super-frames where supported; otherwise packets are written individually.
+  GSO is purely local and is not negotiated. A packet larger than the live QUIC
+  datagram limit is dropped rather than fragmented.
 
 Linux GSO is automatic:
 
@@ -627,34 +624,21 @@ Linux GSO is automatic:
 - No GSO config toggle is exposed.
 - If Linux offload setup fails, VPN traffic continues in non-GSO mode and logs
   a warning.
-- Connection setup logs include local, remote, and negotiated GSO status.
+- Connection setup logs report the local GSO status only (GSO is never
+  negotiated with the peer).
 
 ## Throughput Notes
 
 There are no transport tuning knobs (WireGuard/Tailscale style). QUIC transport
-settings are fixed constants on both ends: CUBIC congestion control and 8 MB
+settings are fixed constants on both ends: paced BBRv3 congestion control and 8 MB
 receive/send windows, which cover most links.
 
-### Linux UDP Socket Buffers
-
-Both peers run iroh. Its socket layer requests 7 MiB UDP
-`SO_RCVBUF`/`SO_SNDBUF` buffers so the kernel can absorb bursty multi-Gbit
-traffic instead of silently dropping datagrams. Dropped datagrams show up as
-inner-TCP retransmits in tools such as `iperf3`.
-
-Linux silently caps that request at `net.core.rmem_max` / `net.core.wmem_max`,
-which default to about 208 KiB on many systems. The receive buffer is the one
-that usually matters most, because a too-small `SO_RCVBUF` causes drops. Raise
-both sysctls so the full request is honored:
-
-```bash
-sudo sysctl -w net.core.rmem_max=7340032
-sudo sysctl -w net.core.wmem_max=7340032
-```
-
-To persist across reboots, add them to `/etc/sysctl.d/99-ezvpn.conf`. `ezvpn`
-logs a startup warning with the exact command when either sysctl is below 7
-MiB. This is Linux-only; macOS uses `kern.ipc.maxsockbuf`.
+The datagram sender uses a small bounded queue and waits for QUIC's pacer during
+congestion. This prevents the non-blocking iroh API from silently replacing old
+inner packets with new ones and keeps bursts independent of platform socket
+buffer defaults. No Linux `net.core.rmem_max` or `net.core.wmem_max` tuning is
+required. iroh still uses UDP GSO/GRO or batched socket I/O where the platform
+supports it.
 
 ## Reconnect Behavior
 
