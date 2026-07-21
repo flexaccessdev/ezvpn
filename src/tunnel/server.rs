@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
@@ -914,34 +914,62 @@ impl VpnServer {
             }
         });
 
-        // Accept incoming connections
-        loop {
-            match endpoint.accept().await {
-                Some(incoming) => {
-                    let server = server.clone();
-                    let tun_write_tx = tun_write_tx.clone();
-                    let local_iroh_udp_ports = local_iroh_udp_ports.clone();
-                    let endpoint = endpoint.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = server
-                            .handle_connection(
-                                incoming,
-                                tun_write_tx,
-                                local_iroh_udp_ports,
-                                endpoint,
-                            )
-                            .await
-                        {
-                            log::error!("Connection error: {}", e);
-                        }
-                    });
-                }
-                None => {
-                    log::info!("Endpoint closed, shutting down");
-                    break;
-                }
+        // Relay connectivity watchdog. An idle server originates no traffic, so
+        // if iroh's relay actors silently die the server goes unreachable while
+        // still "running" and nothing re-establishes the relay path. The
+        // watchdog watches home-relay status and, on a sustained loss, signals
+        // here to exit so the supervisor restarts the process from a clean
+        // slate (see `relay_watchdog`). Aborted when `run` returns.
+        let (fatal_tx, mut fatal_rx) = oneshot::channel::<()>();
+        let watchdog_endpoint = endpoint.clone();
+        let watchdog_handle = tokio::spawn(async move {
+            relay_watchdog(watchdog_endpoint, fatal_tx).await;
+        });
+
+        // Accept incoming connections until the endpoint closes or the watchdog
+        // reports a fatal, unrecoverable loss of relay connectivity.
+        let mut watchdog_alive = true;
+        let watchdog_fired = loop {
+            tokio::select! {
+                biased;
+                res = &mut fatal_rx, if watchdog_alive => match res {
+                    // Explicit fatal signal from the watchdog: exit for restart.
+                    Ok(()) => break true,
+                    // Sender dropped without signaling (watchdog returned on
+                    // normal shutdown, or panicked). Not fatal: disable this
+                    // branch so the completed receiver is never re-polled and
+                    // let the `accept()` None path below drive shutdown.
+                    Err(_) => watchdog_alive = false,
+                },
+                incoming = endpoint.accept() => match incoming {
+                    Some(incoming) => {
+                        let server = server.clone();
+                        let tun_write_tx = tun_write_tx.clone();
+                        let local_iroh_udp_ports = local_iroh_udp_ports.clone();
+                        let endpoint = endpoint.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = server
+                                .handle_connection(
+                                    incoming,
+                                    tun_write_tx,
+                                    local_iroh_udp_ports,
+                                    endpoint,
+                                )
+                                .await
+                            {
+                                log::error!("Connection error: {}", e);
+                            }
+                        });
+                    }
+                    None => {
+                        log::info!("Endpoint closed, shutting down");
+                        break false;
+                    }
+                },
             }
-        }
+        };
+
+        watchdog_handle.abort();
 
         // Graceful shutdown: drop channel sender to signal TUN writer to exit,
         // then await both tasks to ensure clean termination.
@@ -959,6 +987,15 @@ impl VpnServer {
         }
 
         log::info!("TUN tasks shutdown complete");
+
+        // If the watchdog tripped, return an error so the process exits
+        // non-zero and the supervisor (systemd `Restart=on-failure`) restarts
+        // it. A clean endpoint close returns `Ok`.
+        if watchdog_fired {
+            return Err(VpnError::Signaling(
+                "home relay connectivity lost; exiting for supervisor restart".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2108,6 +2145,116 @@ fn read_ipv6_addr(packet: &[u8], offset: usize) -> Ipv6Addr {
     Ipv6Addr::from(bytes)
 }
 
+/// How often [`relay_watchdog`] samples home-relay connectivity.
+const RELAY_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long every home relay may stay disconnected before the watchdog attempts
+/// an in-process recovery ([`Endpoint::network_change`]).
+const RELAY_WATCHDOG_SOFT_GRACE: Duration = Duration::from_secs(45);
+
+/// How long every home relay may stay disconnected before the watchdog gives up
+/// and signals `run` to exit for the supervisor to restart the process.
+///
+/// Kept well above the systemd unit's `StartLimitIntervalSec` (60s) so a
+/// flapping relay cannot burn through `StartLimitBurst` restarts: the floor
+/// between two watchdog-driven restarts is `RELAY_WATCHDOG_HARD_GRACE` plus the
+/// startup relay probe, comfortably over a minute apart.
+const RELAY_WATCHDOG_HARD_GRACE: Duration = Duration::from_secs(120);
+
+/// What [`relay_watchdog`] should do given how long every home relay has been
+/// disconnected and whether the soft recovery was already attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogAction {
+    /// Still within grace; keep waiting.
+    Wait,
+    /// Grace exceeded: attempt in-process recovery ([`Endpoint::network_change`]).
+    SoftRecover,
+    /// Hard grace exceeded: exit for the supervisor to restart the process.
+    Fatal,
+}
+
+/// Decide the watchdog's next action. Pure so the escalation policy is unit
+/// tested without a live endpoint. `Fatal` takes precedence over `SoftRecover`,
+/// and the soft nudge fires at most once per unhealthy episode.
+fn watchdog_action(elapsed: Duration, soft_recovery_tried: bool) -> WatchdogAction {
+    if elapsed >= RELAY_WATCHDOG_HARD_GRACE {
+        WatchdogAction::Fatal
+    } else if !soft_recovery_tried && elapsed >= RELAY_WATCHDOG_SOFT_GRACE {
+        WatchdogAction::SoftRecover
+    } else {
+        WatchdogAction::Wait
+    }
+}
+
+/// Monitor home-relay connectivity and recover from a silent loss of all relay
+/// connections.
+///
+/// An idle VPN server originates no traffic, so once iroh's relay actors die
+/// (e.g. a relay WebSocket wedged behind a proxy) nothing re-establishes them:
+/// the server becomes unreachable while the process keeps running and logs
+/// nothing. Unlike a proxy with constant client traffic — which respawns dead
+/// relay actors organically — the server has no such trigger, so it needs an
+/// active check.
+///
+/// This task watches [`Endpoint::home_relay_status`]. While at least one home
+/// relay is connected it does nothing. When every home relay stays disconnected
+/// (or the set is empty) past [`RELAY_WATCHDOG_SOFT_GRACE`] it nudges iroh with
+/// [`Endpoint::network_change`] to force a re-probe/redial; if still down at
+/// [`RELAY_WATCHDOG_HARD_GRACE`] it sends `fatal` so `run` exits non-zero and
+/// the supervisor restarts the process (which re-binds the endpoint and
+/// re-probes every relay from scratch). Returns early if the endpoint closes
+/// (normal shutdown).
+async fn relay_watchdog(endpoint: Endpoint, fatal: oneshot::Sender<()>) {
+    let mut status_watcher = endpoint.home_relay_status();
+    let mut unhealthy_since: Option<Instant> = None;
+    let mut soft_recovery_tried = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            // Normal shutdown: return as soon as the endpoint closes instead of
+            // waiting out the current sleep tick.
+            _ = endpoint.closed() => return,
+            _ = tokio::time::sleep(RELAY_WATCHDOG_CHECK_INTERVAL) => {}
+        }
+
+        let status = status_watcher.get();
+        let connected = status.iter().any(|relay| relay.is_connected());
+        if connected {
+            if unhealthy_since.take().is_some() {
+                log::info!("Relay watchdog: home relay connectivity recovered");
+            }
+            soft_recovery_tried = false;
+            continue;
+        }
+
+        let since = *unhealthy_since.get_or_insert_with(Instant::now);
+        let elapsed = since.elapsed();
+        log::warn!(
+            "Relay watchdog: no home relay connected for {}s ({} known)",
+            elapsed.as_secs(),
+            status.len()
+        );
+
+        match watchdog_action(elapsed, soft_recovery_tried) {
+            WatchdogAction::Wait => {}
+            WatchdogAction::SoftRecover => {
+                log::warn!("Relay watchdog: nudging iroh with network_change()");
+                endpoint.network_change().await;
+                soft_recovery_tried = true;
+            }
+            WatchdogAction::Fatal => {
+                log::error!(
+                    "Relay watchdog: home relay still down after {}s; exiting for supervisor restart",
+                    elapsed.as_secs()
+                );
+                let _ = fatal.send(());
+                return;
+            }
+        }
+    }
+}
+
 /// Collect local UDP ports bound by the iroh endpoint.
 fn collect_local_iroh_udp_ports(endpoint: &Endpoint) -> HashSet<u16> {
     endpoint.addr().ip_addrs().map(|addr| addr.port()).collect()
@@ -2305,6 +2452,53 @@ fn extract_udp_ports(packet: &[u8]) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watchdog_waits_within_soft_grace() {
+        assert_eq!(
+            watchdog_action(Duration::from_secs(0), false),
+            WatchdogAction::Wait
+        );
+        assert_eq!(
+            watchdog_action(RELAY_WATCHDOG_SOFT_GRACE - Duration::from_secs(1), false),
+            WatchdogAction::Wait
+        );
+    }
+
+    #[test]
+    fn watchdog_soft_recovers_once_after_soft_grace() {
+        // At/after the soft grace (but before hard), nudge once.
+        assert_eq!(
+            watchdog_action(RELAY_WATCHDOG_SOFT_GRACE, false),
+            WatchdogAction::SoftRecover
+        );
+        // Already nudged: keep waiting, do not nudge again this episode.
+        assert_eq!(
+            watchdog_action(RELAY_WATCHDOG_SOFT_GRACE, true),
+            WatchdogAction::Wait
+        );
+    }
+
+    #[test]
+    fn watchdog_is_fatal_after_hard_grace() {
+        // Hard grace wins regardless of whether the soft nudge ran.
+        assert_eq!(
+            watchdog_action(RELAY_WATCHDOG_HARD_GRACE, false),
+            WatchdogAction::Fatal
+        );
+        assert_eq!(
+            watchdog_action(RELAY_WATCHDOG_HARD_GRACE, true),
+            WatchdogAction::Fatal
+        );
+    }
+
+    #[test]
+    fn watchdog_grace_ordering_is_sane() {
+        // The escalation only makes sense if soft fires strictly before hard,
+        // leaving a window for in-process recovery before a restart.
+        assert!(RELAY_WATCHDOG_SOFT_GRACE < RELAY_WATCHDOG_HARD_GRACE);
+        assert!(RELAY_WATCHDOG_CHECK_INTERVAL < RELAY_WATCHDOG_SOFT_GRACE);
+    }
 
     /// Helper to create a random EndpointId for testing
     fn random_endpoint_id() -> EndpointId {
