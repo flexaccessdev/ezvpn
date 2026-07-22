@@ -248,9 +248,20 @@ impl TunDevice {
         tun_config
             .address(config.address)
             .netmask(config.netmask)
-            .destination(config.destination)
             .mtu(config.mtu)
             .up();
+
+        // `destination` is the point-to-point peer address on macOS/Linux, but
+        // the `tun` crate's Windows backend treats it as the adapter's default
+        // gateway and installs a metric-0 `0.0.0.0/0` route for it
+        // (CreateIpForwardEntry2 with PrefixLength=0) — silently turning a
+        // split tunnel into a full IPv4 tunnel that outranks every physical
+        // interface. Skip it on Windows: the gateway is reachable through the
+        // explicit host route the client adds (see `add_routes` for
+        // `server_info.network`), and split-tunnel prefixes are always routed
+        // explicitly.
+        #[cfg(not(target_os = "windows"))]
+        tun_config.destination(config.destination);
 
         // Set device name if specified
         if let Some(ref name) = config.name {
