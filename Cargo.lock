@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "ezvpn"
-version = "0.0.34"
+version = "0.0.35"
 dependencies = [
  "anyhow",
  "base64",
@@ -928,6 +928,7 @@ dependencies = [
  "toml",
  "tun",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

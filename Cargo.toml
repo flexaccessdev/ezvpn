@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.34"
+version = "0.0.35"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -56,6 +56,16 @@ daemonix = "0.1"
 # instead of assuming C:\ when the env var is missing.
 [target.'cfg(windows)'.dependencies]
 known-folders = "1"
+# Route add/remove on the TUN interface goes through the IP Helper API
+# (CreateIpForwardEntry2 / DeleteIpForwardEntry2) instead of shelling out to
+# netsh — typed error codes instead of parsing localized netsh output, and no
+# per-route process spawn. Same version the `tun` crate already pulls in.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 
 # Desktop-only: on-link subnet enumeration for the connect-time split-tunnel
 # overlap refusal (src/net/local_networks.rs). iOS has its own Swift port of
