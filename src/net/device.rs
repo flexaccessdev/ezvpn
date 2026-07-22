@@ -931,6 +931,151 @@ fn is_already_exists_error(stderr: &str) -> bool {
 }
 
 // ============================================================================
+// Windows IP Helper route operations
+// ============================================================================
+
+/// Windows route-table manipulation via the IP Helper API.
+///
+/// WireGuard and Tailscale manage routes with `CreateIpForwardEntry2` /
+/// `DeleteIpForwardEntry2` against the interface LUID rather than shelling out
+/// to `netsh`; this module does the same. Beyond matching that practice, the
+/// API returns typed error codes — `netsh` prints localized text, so detecting
+/// "already exists" by English string match silently breaks idempotency on
+/// non-English Windows — and it avoids spawning a console subprocess (and the
+/// `CREATE_NO_WINDOW` dance) for every route.
+#[cfg(target_os = "windows")]
+mod windows_routes {
+    use super::RouteAddOutcome;
+    use std::io;
+    use std::net::IpAddr;
+    use windows_sys::Win32::Foundation::{
+        ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR,
+    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        ConvertInterfaceAliasToLuid, CreateIpForwardEntry2, DeleteIpForwardEntry2,
+        MIB_IPFORWARD_ROW2,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT};
+
+    /// Route metric for TUN routes. Matches the metric the previous
+    /// `netsh interface … add route` calls produced, so upgrading does not
+    /// change effective route selection on existing setups.
+    const ROUTE_METRIC: u32 = 256;
+
+    /// Resolve an interface alias (the TUN device name) to its LUID.
+    fn interface_luid(tun_name: &str) -> io::Result<NET_LUID_LH> {
+        let alias: Vec<u16> = tun_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+        match unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) } {
+            NO_ERROR => Ok(luid),
+            status => Err(io::Error::from_raw_os_error(status as i32)),
+        }
+    }
+
+    /// Build the forward row for `dest/prefix_len` on the interface.
+    ///
+    /// The next hop is left unspecified (`0.0.0.0` / `::`), making this an
+    /// on-link interface route — the same shape the previous
+    /// `netsh … interface=<tun>` calls (no `nexthop=`) created. Zeroing the
+    /// struct leaves the remaining fields (`Loopback`, `Publish`, `Origin`, …)
+    /// at their documented defaults; lifetimes are set to infinite so the
+    /// route lives until explicitly deleted (`store=active` semantics — it
+    /// does not survive a reboot because the wintun adapter itself doesn't).
+    fn forward_row(luid: NET_LUID_LH, dest: IpAddr, prefix_len: u8) -> MIB_IPFORWARD_ROW2 {
+        let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+        row.InterfaceLuid = luid;
+        row.DestinationPrefix.PrefixLength = prefix_len;
+        match dest {
+            IpAddr::V4(a) => {
+                row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+                row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr =
+                    u32::from_ne_bytes(a.octets());
+                row.NextHop.Ipv4.sin_family = AF_INET;
+            }
+            IpAddr::V6(a) => {
+                row.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
+                row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte = a.octets();
+                row.NextHop.Ipv6.sin6_family = AF_INET6;
+            }
+        }
+        row.Metric = ROUTE_METRIC;
+        // Administratively added — the same origin netsh stamps (shows as
+        // "NetMgmt" in Get-NetRoute), and what the route-cleanup key expects.
+        row.Protocol = MIB_IPPROTO_NETMGMT;
+        row.ValidLifetime = u32::MAX;
+        row.PreferredLifetime = u32::MAX;
+        row
+    }
+
+    /// Add an on-link route through the interface.
+    pub fn add_route(
+        tun_name: &str,
+        dest: IpAddr,
+        prefix_len: u8,
+    ) -> io::Result<RouteAddOutcome> {
+        let row = forward_row(interface_luid(tun_name)?, dest, prefix_len);
+        match unsafe { CreateIpForwardEntry2(&row) } {
+            NO_ERROR => Ok(RouteAddOutcome::Added),
+            ERROR_OBJECT_ALREADY_EXISTS => Ok(RouteAddOutcome::AlreadyExisted),
+            status => Err(io::Error::from_raw_os_error(status as i32)),
+        }
+    }
+
+    /// Remove a route added by [`add_route`]. `ERROR_NOT_FOUND` (already
+    /// removed, e.g. the adapter is gone) is success: removal is idempotent.
+    pub fn delete_route(tun_name: &str, dest: IpAddr, prefix_len: u8) -> io::Result<()> {
+        let row = forward_row(interface_luid(tun_name)?, dest, prefix_len);
+        match unsafe { DeleteIpForwardEntry2(&row) } {
+            NO_ERROR | ERROR_NOT_FOUND => Ok(()),
+            status => Err(io::Error::from_raw_os_error(status as i32)),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn forward_row_v4_is_onlink_netmgmt() {
+            let luid = NET_LUID_LH { Value: 42 };
+            let row = forward_row(luid, "10.1.2.0".parse().unwrap(), 24);
+            unsafe {
+                assert_eq!(row.InterfaceLuid.Value, 42);
+                assert_eq!(row.DestinationPrefix.PrefixLength, 24);
+                assert_eq!(row.DestinationPrefix.Prefix.Ipv4.sin_family, AF_INET);
+                assert_eq!(
+                    row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr,
+                    u32::from_ne_bytes([10, 1, 2, 0])
+                );
+                // On-link: next hop family set, address left unspecified.
+                assert_eq!(row.NextHop.Ipv4.sin_family, AF_INET);
+                assert_eq!(row.NextHop.Ipv4.sin_addr.S_un.S_addr, 0);
+            }
+            assert_eq!(row.Metric, ROUTE_METRIC);
+            assert_eq!(row.Protocol, MIB_IPPROTO_NETMGMT);
+        }
+
+        #[test]
+        fn forward_row_v6_is_onlink_netmgmt() {
+            let luid = NET_LUID_LH { Value: 7 };
+            let row = forward_row(luid, "fd00::".parse().unwrap(), 8);
+            unsafe {
+                assert_eq!(row.DestinationPrefix.PrefixLength, 8);
+                assert_eq!(row.DestinationPrefix.Prefix.Ipv6.sin6_family, AF_INET6);
+                assert_eq!(
+                    row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte[0],
+                    0xfd
+                );
+                assert_eq!(row.NextHop.Ipv6.sin6_family, AF_INET6);
+                assert_eq!(row.NextHop.Ipv6.sin6_addr.u.Byte, [0u8; 16]);
+            }
+            assert_eq!(row.Metric, ROUTE_METRIC);
+        }
+    }
+}
+
+// ============================================================================
 // Generic Route Trait and Implementations
 // ============================================================================
 
@@ -968,7 +1113,8 @@ fn is_already_exists_error(stderr: &str) -> bool {
 ///
 /// - Be cheap to copy (`Copy` + `Clone` semantics).
 /// - Provide platform‑specific argument builders for macOS (`route` /
-///   `networksetup`) and Linux (`ip route`).
+///   `networksetup`) and Linux (`ip route`), and the destination prefix for
+///   the Windows IP Helper forward row.
 ///
 /// Most consumers should not need to implement `Route` directly; instead they
 /// use the existing concrete route types provided by this crate.
@@ -992,13 +1138,11 @@ pub trait Route: std::fmt::Display + Copy {
     #[cfg(target_os = "linux")]
     fn linux_delete_args(&self, tun_name: &str) -> Vec<String>;
 
-    /// Build command args for adding a route on Windows.
+    /// Destination network address and prefix length for the Windows IP
+    /// Helper forward row (`MIB_IPFORWARD_ROW2`). Windows routes are managed
+    /// through the API rather than command args — see [`windows_routes`].
     #[cfg(target_os = "windows")]
-    fn windows_add_args(&self, tun_name: &str) -> Vec<String>;
-
-    /// Build command args for removing a route on Windows.
-    #[cfg(target_os = "windows")]
-    fn windows_delete_args(&self, tun_name: &str) -> Vec<String>;
+    fn windows_prefix(&self) -> (IpAddr, u8);
 }
 
 impl Route for Ipv4Net {
@@ -1053,30 +1197,8 @@ impl Route for Ipv4Net {
     }
 
     #[cfg(target_os = "windows")]
-    fn windows_add_args(&self, tun_name: &str) -> Vec<String> {
-        // For TUN interfaces, we don't specify a nexthop - the route goes directly
-        // through the interface. On Windows, nexthop=0.0.0.0 can cause errors.
-        vec![
-            "interface".into(),
-            "ipv4".into(),
-            "add".into(),
-            "route".into(),
-            format!("prefix={}", self),
-            format!("interface={}", tun_name),
-            "store=active".into(),
-        ]
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_delete_args(&self, tun_name: &str) -> Vec<String> {
-        vec![
-            "interface".into(),
-            "ipv4".into(),
-            "delete".into(),
-            "route".into(),
-            format!("prefix={}", self),
-            format!("interface={}", tun_name),
-        ]
+    fn windows_prefix(&self) -> (IpAddr, u8) {
+        (IpAddr::V4(self.network()), self.prefix_len())
     }
 }
 
@@ -1130,30 +1252,8 @@ impl Route for Ipv6Net {
     }
 
     #[cfg(target_os = "windows")]
-    fn windows_add_args(&self, tun_name: &str) -> Vec<String> {
-        // For TUN interfaces, we don't specify a nexthop - the route goes directly
-        // through the interface. On Windows, nexthop=:: can cause errors.
-        vec![
-            "interface".into(),
-            "ipv6".into(),
-            "add".into(),
-            "route".into(),
-            format!("prefix={}", self),
-            format!("interface={}", tun_name),
-            "store=active".into(),
-        ]
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_delete_args(&self, tun_name: &str) -> Vec<String> {
-        vec![
-            "interface".into(),
-            "ipv6".into(),
-            "delete".into(),
-            "route".into(),
-            format!("prefix={}", self),
-            format!("interface={}", tun_name),
-        ]
+    fn windows_prefix(&self) -> (IpAddr, u8) {
+        (IpAddr::V6(self.network()), self.prefix_len())
     }
 }
 
@@ -1174,12 +1274,14 @@ pub enum RouteAddOutcome {
     AlreadyExisted,
 }
 
-/// Handle the output of a route add command (generic version).
+/// Handle the output of a route add command (macOS/Linux; Windows uses the
+/// typed IP Helper results in [`windows_routes`] instead of parsing output).
 ///
 /// - On success: logs info, returns [`RouteAddOutcome::Added`]
 /// - On failure with "route exists": logs warning, returns
 ///   [`RouteAddOutcome::AlreadyExisted`] (idempotent, not owned for cleanup)
 /// - On other failure: returns error
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn handle_route_add_output<R: Route>(
     output: std::process::Output,
     route: &R,
@@ -1220,7 +1322,8 @@ fn handle_route_add_output<R: Route>(
     }
 }
 
-/// Handle the output of a route remove command (generic, best-effort).
+/// Handle the output of a route remove command (macOS/Linux, best-effort).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn handle_route_remove_output<R: Route>(output: std::process::Output, route: &R, tun_name: &str) {
     if output.status.success() {
         log::info!("Removed {} {} via {}", R::LABEL, route, tun_name);
@@ -1269,16 +1372,24 @@ async fn add_route_generic<R: Route>(tun_name: &str, route: &R) -> VpnResult<Rou
 
     #[cfg(target_os = "windows")]
     {
-        let args = route.windows_add_args(tun_name);
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = Command::new("netsh")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(&args_ref)
-            .output()
-            .await
-            .map_err(|e| VpnError::tun_device_with_source("Failed to execute netsh command", e))?;
-
-        handle_route_add_output(output, route, tun_name)
+        let (dest, prefix_len) = route.windows_prefix();
+        match windows_routes::add_route(tun_name, dest, prefix_len) {
+            Ok(RouteAddOutcome::Added) => {
+                log::info!("Added {} {} via {}", R::LABEL, route, tun_name);
+                Ok(RouteAddOutcome::Added)
+            }
+            Ok(RouteAddOutcome::AlreadyExisted) => {
+                log::warn!("{} {} already exists (treating as success)", R::LABEL, route);
+                Ok(RouteAddOutcome::AlreadyExisted)
+            }
+            Err(e) => Err(VpnError::tun_device(format!(
+                "Failed to add {} {} via {}: {}",
+                R::LABEL,
+                route,
+                tun_name,
+                e
+            ))),
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -1322,16 +1433,11 @@ async fn remove_route_generic<R: Route>(tun_name: &str, route: &R) -> VpnResult<
 
     #[cfg(target_os = "windows")]
     {
-        let args = route.windows_delete_args(tun_name);
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = Command::new("netsh")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(&args_ref)
-            .output()
-            .await
-            .map_err(|e| VpnError::tun_device_with_source("Failed to execute netsh command", e))?;
-
-        handle_route_remove_output(output, route, tun_name);
+        let (dest, prefix_len) = route.windows_prefix();
+        match windows_routes::delete_route(tun_name, dest, prefix_len) {
+            Ok(()) => log::info!("Removed {} {} via {}", R::LABEL, route, tun_name),
+            Err(e) => log::warn!("Failed to remove {} {}: {}", R::LABEL, route, e),
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -1386,31 +1492,12 @@ fn remove_route_sync_generic<R: Route>(tun_name: &str, route: &R) {
 
     #[cfg(target_os = "windows")]
     {
-        let args = route.windows_delete_args(tun_name);
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let result = std::process::Command::new("netsh")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(&args_ref)
-            .output();
-
-        match result {
-            Ok(output) if output.status.success() => {
-                log::info!("Removed {} {} via {}", R::LABEL, route, tun_name);
-            }
-            Ok(output) => {
-                // Windows netsh outputs error messages to stdout, not stderr
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let error_msg = if stderr.trim().is_empty() {
-                    stdout.trim().to_string()
-                } else {
-                    stderr.trim().to_string()
-                };
-                log::warn!("Failed to remove {} {}: {}", R::LABEL, route, error_msg);
-            }
-            Err(e) => {
-                log::warn!("Failed to execute netsh route delete command: {}", e);
-            }
+        // The IP Helper call is synchronous already, so the Drop path shares
+        // the exact code the async path uses.
+        let (dest, prefix_len) = route.windows_prefix();
+        match windows_routes::delete_route(tun_name, dest, prefix_len) {
+            Ok(()) => log::info!("Removed {} {} via {}", R::LABEL, route, tun_name),
+            Err(e) => log::warn!("Failed to remove {} {}: {}", R::LABEL, route, e),
         }
     }
 

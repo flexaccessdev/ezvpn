@@ -928,6 +928,7 @@ dependencies = [
  "toml",
  "tun",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
