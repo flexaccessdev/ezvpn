@@ -176,22 +176,29 @@ async fn datagram_backpressure_preserves_queued_packets() {
     let mut seg_scratch = Vec::new();
     let mut pending = Vec::new();
 
-    for sequence in 0..PACKET_COUNT {
-        let mut packet = vec![0u8; PACKET_SIZE];
-        packet[0] = 0x45;
-        packet[1..5].copy_from_slice(&sequence.to_be_bytes());
-        let outcome = send_ip_datagrams(
-            &conn,
-            &mut arena,
-            &mut seg_scratch,
-            &mut pending,
-            None,
-            &packet,
-        )
-        .await;
-        assert_eq!(outcome.sent, 1, "packet {sequence} queued");
-        assert_eq!(outcome.dropped_other, 0, "packet {sequence} not evicted");
-    }
+    // Bound the whole send loop: `send_ip_datagrams` awaits queue capacity, so a
+    // receiver that stopped draining would otherwise wedge it here indefinitely
+    // rather than surfacing as a test failure.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for sequence in 0..PACKET_COUNT {
+            let mut packet = vec![0u8; PACKET_SIZE];
+            packet[0] = 0x45;
+            packet[1..5].copy_from_slice(&sequence.to_be_bytes());
+            let outcome = send_ip_datagrams(
+                &conn,
+                &mut arena,
+                &mut seg_scratch,
+                &mut pending,
+                None,
+                &packet,
+            )
+            .await;
+            assert_eq!(outcome.sent, 1, "packet {sequence} queued");
+            assert_eq!(outcome.dropped_other, 0, "packet {sequence} not evicted");
+        }
+    })
+    .await
+    .expect("sender completed before timeout");
 
     let mut received = tokio::time::timeout(Duration::from_secs(30), accept_task)
         .await
