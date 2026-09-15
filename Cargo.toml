@@ -115,4 +115,4 @@ panic = "abort"
 # patch rather than a git dependency so `flexaccess-iroh`'s `iroh` resolves to
 # the same package (see its README, "Consumers on a fork of iroh").
 [patch.crates-io]
-iroh = { git = "https://github.com/andrewtheguy/iroh.git", branch = "ezvpn-send-backpressure-1.2.0" }
+iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send-backpressure-1.2.0" }
