@@ -619,12 +619,18 @@ has no real use case anyway, but it now behaves the same everywhere.
 
 ### Auto-Reconnect and Connection Health
 
-VPN mode includes automatic reconnection when the tunnel connection fails. This handles scenarios like server restarts or network partitions.
+VPN mode includes automatic reconnection when a connection attempt fails or the tunnel connection drops. This handles scenarios like server restarts, a server that is not up yet when the client starts (boot order, maintenance), or network partitions.
 
 **Configuration:**
-- `auto_reconnect = true` (default): Automatically reconnect on connection loss
-- `auto_reconnect = false`: Exit on first disconnection
-- `max_reconnect_attempts`: Limit total attempts (unlimited if not set)
+- `auto_reconnect = true` (default): Retry every failed connection attempt — the first one included — and every lost connection with backoff
+- `auto_reconnect = false`: Exit on the first failed attempt or drop
+- `max_reconnect_attempts`: Cap on consecutive retries before giving up (unlimited if not set); a successful connection resets the count, so the cap is per outage
+
+**Reconnect policy** (`VpnClient::run_with_reconnect`, `src/tunnel/client.rs`):
+- Every recoverable failure (`ConnectionLost` / `Network` / `Signaling` — see `VpnError::is_recoverable`) is retried. The first attempt is no different from any later one: a server that is down or not up yet is the ordinary case, not an error to exit on.
+- Permanent errors (`AuthenticationFailed` / `Config` / `TunDevice` / `ServerConfigChanged` / `RouteOverlapsLocalNetwork`, …) never retry — the same credential and config would fail the same way every time.
+- A long outage costs one bounded connect (`CONNECT_TIMEOUT`, 30 s) per attempt on the endpoint the client already holds, once a minute at the backoff cap. The desktop client has no event that cuts a backoff step short (no network-path or foreground signal), so the server's return is noticed up to a minute late; the mobile apps run their own reconnect policy around the fd-based session and never enter this loop.
+- The loop publishes its progress through `ClientStatusHandle::set_reconnecting` (failed attempts, last error, next attempt due) into the `ClientStatus` snapshot — `failed_attempts`, `last_error`, `next_attempt_secs` — which `ezvpn client status` prints on a `Reconnecting:` line while down and the Windows app reads through `ezvpn_status`.
 
 **Health Monitoring:**
 
@@ -688,19 +694,19 @@ sequenceDiagram
 
     alt auto_reconnect = true
         RC->>RC: Calculate backoff delay
-        RC->>RC: Wait (1s, 2s, 4s... up to 30s)
+        RC->>RC: Wait (1s, 2s, 4s... up to 60s)
         RC->>VPN: Reconnect
     else auto_reconnect = false
         RC->>RC: Exit with error
     end
 ```
 
-**Reconnection Backoff:**
+**Reconnection Backoff** (`BACKOFF_*` in `src/tunnel/client.rs`):
 - Base delay: 1 second
-- Exponential growth: 1s → 2s → 4s → 8s → 16s → 30s
-- Maximum delay: 30 seconds (mobile-friendly: Wi-Fi↔cellular transitions cause bursts of early failures, and a minute-long dead window is a poor phone experience)
+- Exponential growth: 1s → 2s → 4s → … → 32s → 60s
+- Maximum delay: 60 seconds. The early steps catch a server restart within a minute or two; past them the doubling settles at the cap, so a server that stays down for hours or days is probed once a minute for as long as it takes, while its return is still noticed within a minute. A cap of several minutes would save little and read as a hang to anyone watching.
 - Jitter: 0-500ms added to prevent thundering herd
-- Counter reset: Resets to 0 after successful tunnel operation
+- Counter reset: a tunnel that came up resets the consecutive-failure count, so the drop that ends it is the first failure of a fresh series (1s backoff)
 
 ### Relay Failover (Server, Custom Relays)
 

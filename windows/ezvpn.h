@@ -115,7 +115,12 @@ EzvpnHandle *ezvpn_start(const char *config_json, char *out_buf, size_t out_len)
  *    "custom_relays":[{"url":"https://relay.example/","working":true,
  *                      "error":null}],"bypass_addrs":[]}
  * `state` is "disconnected" while connecting/reconnecting and "connected" once
- * the handshake succeeds. Per-family fields are null when unassigned.
+ * the handshake succeeds. Per-family fields are null when unassigned. While
+ * down, failed_attempts (consecutive failures in the current outage),
+ * last_error, and next_attempt_secs (seconds until the reconnect loop tries
+ * again; 0 while an attempt is in progress, null when none is pending) say how
+ * far the retry loop has got — a backoff step can be up to 60s once a long
+ * outage has pushed it to the cap.
  *
  * custom_relays reports each configured custom relay's health from an on-demand
  * GET of its /healthz endpoint (checked in parallel, only when this snapshot is

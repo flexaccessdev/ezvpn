@@ -63,6 +63,9 @@ fn pipe_name(role: LockRole, instance: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// A status snapshot for either a server or a client instance.
+// Built once per status request and immediately serialized; boxing the larger
+// client variant would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum StatusSnapshot {
@@ -144,6 +147,14 @@ pub struct ClientStatus {
     pub device_id: String,
     /// Seconds since the current session's handshake completed (when connected).
     pub connected_since_secs: Option<u64>,
+    /// Consecutive failed connection attempts in the current outage (0 while
+    /// connected, or before the first attempt has failed).
+    pub failed_attempts: u32,
+    /// Seconds until the next connection attempt is due while backing off;
+    /// `Some(0)` while an attempt is in progress, `None` when none is pending.
+    pub next_attempt_secs: Option<u64>,
+    /// What the last connection attempt failed with, while the tunnel is down.
+    pub last_error: Option<String>,
     /// `"ipv4"`, `"ipv6"`, `"dual-stack"`, or `"none"` while disconnected.
     pub mode: String,
     /// Assigned IPv4 VPN address.
@@ -221,8 +232,22 @@ pub type ConnectionProbe = Arc<dyn Fn() -> ConnectionSnapshotFuture + Send + Syn
 /// built. The returned addresses are *collected*, not necessarily *applied*.
 pub type BypassRoutesProbe = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
-/// Internal shared client state. `connected_at` is a monotonic `Instant`, so it
-/// is kept here rather than in the serializable [`ClientStatus`].
+/// What the reconnect loop is doing while the tunnel is down. All fields are
+/// at their defaults while connected, and before the first attempt has failed.
+#[derive(Debug, Clone, Default)]
+struct ReconnectState {
+    /// Consecutive failed connection attempts in the current outage.
+    failed_attempts: u32,
+    /// What the most recent attempt failed with.
+    last_error: Option<String>,
+    /// When the next attempt is due. Already in the past while an attempt is
+    /// in progress; `None` when there is no attempt to wait for.
+    next_attempt_at: Option<std::time::Instant>,
+}
+
+/// Internal shared client state. `connected_at` and the reconnect loop's
+/// `next_attempt_at` are monotonic `Instant`s, so they are kept here rather
+/// than in the serializable [`ClientStatus`].
 struct ClientStateInner {
     instance: String,
     connected: bool,
@@ -232,6 +257,8 @@ struct ClientStateInner {
     info: ClientConnectedInfo,
     connection_probe: Option<ConnectionProbe>,
     bypass_routes_probe: Option<BypassRoutesProbe>,
+    /// The reconnect loop's progress through the current outage.
+    reconnect: ReconnectState,
     /// Daemon log-file path (set only when started with `--daemon`).
     log_file: Option<String>,
 }
@@ -257,6 +284,7 @@ impl ClientStatusHandle {
                 info: ClientConnectedInfo::default(),
                 connection_probe: None,
                 bypass_routes_probe: None,
+                reconnect: ReconnectState::default(),
                 log_file: None,
             })),
         }
@@ -283,9 +311,13 @@ impl ClientStatusHandle {
         guard.info = info;
         guard.connection_probe = Some(connection);
         guard.bypass_routes_probe = bypass;
+        // Connected: the outage, if there was one, is over.
+        guard.reconnect = ReconnectState::default();
     }
 
     /// Mark the client disconnected (e.g. tunnel ended, awaiting reconnect).
+    /// Leaves the reconnect progress alone: the reconnect loop publishes it
+    /// through [`Self::set_reconnecting`] right after.
     pub fn set_disconnected(&self) {
         let mut guard = self.inner.write().expect("client status lock poisoned");
         guard.connected = false;
@@ -293,6 +325,23 @@ impl ClientStatusHandle {
         guard.info = ClientConnectedInfo::default();
         guard.connection_probe = None;
         guard.bypass_routes_probe = None;
+    }
+
+    /// Record a failed connection attempt and when the reconnect loop will try
+    /// again, for the status readout while the tunnel is down. Cleared by
+    /// [`Self::set_connected`].
+    pub fn set_reconnecting(
+        &self,
+        failed_attempts: u32,
+        last_error: String,
+        next_attempt_at: std::time::Instant,
+    ) {
+        let mut guard = self.inner.write().expect("client status lock poisoned");
+        guard.reconnect = ReconnectState {
+            failed_attempts,
+            last_error: Some(last_error),
+            next_attempt_at: Some(next_attempt_at),
+        };
     }
 
     /// Build the current snapshot wrapped for the control protocol.
@@ -316,6 +365,7 @@ impl ClientStatusHandle {
             info,
             probe,
             bypass_probe,
+            reconnect,
             log_file,
         ) = {
             let guard = self.inner.read().expect("client status lock poisoned");
@@ -328,6 +378,7 @@ impl ClientStatusHandle {
                 guard.info.clone(),
                 guard.connection_probe.clone(),
                 guard.bypass_routes_probe.clone(),
+                guard.reconnect.clone(),
                 guard.log_file.clone(),
             )
         };
@@ -355,6 +406,11 @@ impl ClientStatusHandle {
             server_node_id,
             device_id,
             connected_since_secs: connected_at.map(|t| t.elapsed().as_secs()),
+            failed_attempts: reconnect.failed_attempts,
+            next_attempt_secs: reconnect
+                .next_attempt_at
+                .map(|at| at.saturating_duration_since(std::time::Instant::now()).as_secs()),
+            last_error: reconnect.last_error,
             mode: mode.into(),
             assigned_ip: info.assigned_ip,
             network: info.network,
@@ -793,6 +849,19 @@ fn print_client_text(c: &ClientStatus) {
     if let Some(secs) = c.connected_since_secs {
         println!("Connected for:  {}", fmt_uptime(secs));
     }
+    // While down, say how far the retry loop has got and when it tries again,
+    // so a backoff step of minutes reads as waiting, not stuck.
+    if c.failed_attempts > 0 {
+        let next = match c.next_attempt_secs {
+            Some(secs) if secs > 0 => format!("next in {}", fmt_uptime(secs)),
+            _ => "trying now".to_string(),
+        };
+        let plural = if c.failed_attempts == 1 { "" } else { "s" };
+        println!("Reconnecting:   {} failed attempt{plural}, {next}", c.failed_attempts);
+        if let Some(error) = &c.last_error {
+            println!("Last error:     {error}");
+        }
+    }
     for relay in &c.custom_relays {
         let state = match relay.working {
             Some(true) => "working",
@@ -953,6 +1022,54 @@ mod tests {
         assert!(snap.connection.is_none());
         assert!(snap.custom_relays.is_empty());
         assert!(snap.bypass_addrs.is_empty());
+    }
+
+    /// The reconnect loop's progress shows up in the snapshot while the
+    /// tunnel is down and is cleared by the next successful connection.
+    #[tokio::test]
+    async fn client_handle_reports_reconnect_progress() {
+        let handle = ClientStatusHandle::new("default".into(), "server-node".into(), 1);
+        let snap = handle.client_status().await;
+        assert_eq!(snap.failed_attempts, 0);
+        assert!(snap.next_attempt_secs.is_none());
+        assert!(snap.last_error.is_none());
+
+        // A backoff of minutes reads as a countdown, not stuck.
+        handle.set_reconnecting(
+            3,
+            "server not up yet".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(300),
+        );
+        let snap = handle.client_status().await;
+        assert_eq!(snap.state, "disconnected");
+        assert_eq!(snap.failed_attempts, 3);
+        assert!(matches!(snap.next_attempt_secs, Some(secs) if (295..=300).contains(&secs)));
+        assert_eq!(snap.last_error.as_deref(), Some("server not up yet"));
+
+        // An attempt in progress: the due time is already in the past.
+        handle.set_reconnecting(4, "still down".into(), std::time::Instant::now());
+        let snap = handle.client_status().await;
+        assert_eq!(snap.failed_attempts, 4);
+        assert_eq!(snap.next_attempt_secs, Some(0));
+
+        handle.set_connected(
+            ClientConnectedInfo { mtu: 1280, ..Default::default() },
+            Arc::new(|| {
+                Box::pin(async {
+                    ConnectionSnapshot {
+                        description: "direct".into(),
+                        paths: Vec::new(),
+                        custom_relays: Vec::new(),
+                    }
+                })
+            }),
+            None,
+        );
+        let snap = handle.client_status().await;
+        assert_eq!(snap.state, "connected");
+        assert_eq!(snap.failed_attempts, 0, "a connection clears the outage");
+        assert!(snap.next_attempt_secs.is_none());
+        assert!(snap.last_error.is_none());
     }
 
     // Exercises `socket_path`, which only exists on Unix; the Windows control

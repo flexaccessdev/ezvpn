@@ -1256,43 +1256,58 @@ pub(crate) async fn run_tunnel(
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 impl VpnClient {
-    /// Connect to the VPN server with automatic reconnection on failure.
+    /// Connect to the VPN server and keep it connected: retry every
+    /// recoverable failure with exponential backoff.
     ///
-    /// This method wraps `connect()` with a reconnection loop that handles
-    /// transient failures using exponential backoff (1s → 2s → 4s → ... → 30s max).
+    /// Wraps [`Self::connect`] in a reconnect loop. Every recoverable failure
+    /// (see [`VpnError::is_recoverable`]) — a connection attempt that fails,
+    /// the **first one included**, or an established tunnel that drops — is
+    /// retried after a backoff that starts at 1s and doubles to
+    /// [`BACKOFF_MAX_MS`] (60s). A server that is down, or not up yet, is the
+    /// ordinary case (boot order, maintenance), not a reason to exit: the
+    /// client waits it out and connects when the server appears. A long outage
+    /// is cheap to sit through — one bounded connect
+    /// ([`crate::transport::endpoint::CONNECT_TIMEOUT`]) a minute once the
+    /// backoff has reached its cap — while still noticing the server's return
+    /// within a minute.
+    ///
+    /// The loop publishes its progress through the status handle
+    /// ([`ClientStatusHandle::set_reconnecting`]: failed attempts, last error,
+    /// next attempt due), so `ezvpn client status` shows a backoff step as
+    /// waiting, not stuck.
     ///
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for connections
     /// * `relay_config` - Selects the relay map and whether internet discovery
     ///   is used; custom relays are attached as dial hints (see [`Self::connect`]).
-    /// * `max_attempts` - Maximum total connection attempts (None = unlimited).
-    ///   This counts all attempts including the initial one:
-    ///   - `Some(1)` = try once, exit on any failure (no retries)
-    ///   - `Some(3)` = try up to 3 times total (initial + 2 retries)
-    ///   - `None` = retry indefinitely on recoverable errors
+    /// * `max_attempts` - Cap on consecutive retries — attempts after a
+    ///   failure, before the next success — after which the loop gives up with
+    ///   [`VpnError::MaxReconnectAttemptsExceeded`] (`None` = unlimited). A
+    ///   successful connection resets the count, so the cap is per outage:
+    ///   - `Some(1)` = one retry per outage, then give up
+    ///   - `Some(3)` = up to three retries per outage
     ///
     /// # Error Handling
-    /// Only recoverable errors (see [`VpnError::is_recoverable`]) trigger retries:
+    /// Only recoverable errors trigger retries:
     /// - `ConnectionLost`, `Network`, `Signaling` → retry with backoff
     /// - `AuthenticationFailed`, `Config`, `TunDevice`, `ServerConfigChanged`,
-    ///   `RouteOverlapsLocalNetwork`, etc. → exit immediately
-    ///
-    /// This prevents infinite retry loops on permanent failures like invalid tokens.
+    ///   `RouteOverlapsLocalNetwork`, etc. → exit immediately: the same
+    ///   credential and config would fail the same way every time.
     pub async fn run_with_reconnect(
         &self,
         endpoint: &Endpoint,
         relay_config: &RelayConfig,
         max_attempts: Option<NonZeroU32>,
     ) -> VpnResult<()> {
-        let mut attempt = 0u32;
+        // Consecutive failed attempts in the current outage; 0 until the first
+        // failure, and reset by a tunnel that came up (see below).
+        let mut failures = 0u32;
 
         loop {
-            attempt = attempt.saturating_add(1);
-
-            if attempt == 1 {
+            if failures == 0 {
                 log::info!("Connecting to VPN server...");
             } else {
-                log::info!("VPN reconnection attempt #{}", attempt);
+                log::info!("VPN reconnection attempt #{}", failures + 1);
             }
 
             match self.connect(endpoint, relay_config).await {
@@ -1302,30 +1317,38 @@ impl VpnClient {
                     return Ok(());
                 }
                 Err(e) if e.is_recoverable() => {
-                    // Reset attempt counter if this was a ConnectionLost (tunnel ran successfully)
+                    // `ConnectionLost` is only ever produced by a tunnel that
+                    // was fully up (`run_vpn_loop`): the outage before it, if
+                    // any, ended with that connection, and this drop opens a
+                    // new one with the drop as its first failure.
                     if matches!(e, VpnError::ConnectionLost(_)) {
-                        attempt = 0;
+                        failures = 0;
                     }
+                    failures = failures.saturating_add(1);
 
-                    // Check max attempts (None = unlimited)
+                    // The cap counts retries, not failures: `max` retries are
+                    // granted, the failure after them ends the session.
                     if let Some(max) = max_attempts
-                        && attempt >= max.get()
+                        && failures > max.get()
                     {
-                        log::error!("Max reconnection attempts ({}) exceeded", max);
+                        log::error!("Giving up after {max} reconnect attempt(s): {e}");
                         return Err(VpnError::MaxReconnectAttemptsExceeded(max));
                     }
 
-                    // Calculate backoff delay
-                    let delay = calculate_backoff(attempt);
+                    let delay = calculate_backoff(failures);
                     log::warn!(
-                        "Connection lost ({}), reconnecting in {:.1}s{}",
-                        e,
+                        "{e}; reconnecting in {:.1}s (attempt {failures}{})",
                         delay.as_secs_f64(),
                         if let Some(max) = max_attempts {
-                            format!(" (attempt {}/{})", attempt, max)
+                            format!("/{max}")
                         } else {
                             String::new()
                         }
+                    );
+                    self.status.set_reconnecting(
+                        failures,
+                        e.to_string(),
+                        std::time::Instant::now() + delay,
                     );
 
                     tokio::time::sleep(delay).await;
@@ -1749,12 +1772,19 @@ async fn resolve_relay_url(
 
 /// Backoff constants for reconnection delay calculation.
 ///
-/// The cap is 30s (not the more common 60s): the primary use case is mobile,
-/// where Wi-Fi↔cellular transitions produce bursts of early connect failures
-/// and a minute-long dead window after ~7 attempts is a poor experience.
-/// Jitter keeps the retry herd spread out.
+/// Base 1s, doubling per consecutive failed attempt, capped at
+/// [`BACKOFF_MAX_MS`] (60s). The early steps (1s, 2s, 4s, …) catch a server
+/// restart within a minute or two; past them the doubling settles at the cap,
+/// so a server that stays down for hours or days is probed once a minute for
+/// as long as it takes. Each probe is one bounded connect on the endpoint the
+/// client already holds, so an outage of any length is cheap to sit through
+/// while still noticing the server's return within a minute — a wait of
+/// several minutes saves little and reads as a hang to anyone watching. The
+/// mobile apps are unaffected: they run their own reconnect policy around the
+/// fd-based session and never enter this loop. Jitter keeps the retry herd
+/// spread out.
 const BACKOFF_BASE_MS: u64 = 1000; // 1 second
-const BACKOFF_MAX_MS: u64 = 30000; // 30 seconds
+const BACKOFF_MAX_MS: u64 = 60_000; // 60 seconds
 const BACKOFF_JITTER_MS: u64 = 500;
 
 /// Calculate exponential backoff delay with jitter.
@@ -1775,7 +1805,7 @@ fn calculate_backoff(attempt: u32) -> Duration {
 /// * `attempt` - Current attempt number (1-based)
 /// * `rng` - Random number generator for jitter
 fn calculate_backoff_with_rng(attempt: u32, rng: &mut impl Rng) -> Duration {
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s, ...
+    // Exponential backoff: 1s, 2s, 4s, ..., 32s, 60s, 60s, ...
     let multiplier = 2_u64.saturating_pow(attempt.saturating_sub(1));
     let base_delay_ms = BACKOFF_BASE_MS.saturating_mul(multiplier);
 
@@ -2088,24 +2118,30 @@ mod tests {
         // Attempt 5: base = 16000ms
         let d5 = calculate_backoff_with_rng(5, &mut rng);
         assert!(d5.as_millis() >= 16000 && d5.as_millis() < 16500);
+
+        // Attempt 6: base = 32s, the last step under the 60s cap
+        let d6 = calculate_backoff_with_rng(6, &mut rng);
+        assert!(d6.as_millis() >= 32_000 && d6.as_millis() < 32_500);
     }
 
     #[test]
     fn test_backoff_capped_at_max() {
         let mut rng = ChaCha8Rng::seed_from_u64(12345);
 
-        // Attempt 6+: base = 32000ms exceeds the cap, so the result is exactly
-        // the 30s cap regardless of jitter. Hardcoded so an upward drift of
+        // Attempt 7+: base = 64s exceeds the cap, so the result is exactly
+        // the 60s cap regardless of jitter. Hardcoded so a drift of
         // BACKOFF_MAX_MS fails this test.
-        let d6 = calculate_backoff_with_rng(6, &mut rng);
-        assert_eq!(d6, Duration::from_millis(30_000));
-
         let d7 = calculate_backoff_with_rng(7, &mut rng);
-        assert_eq!(d7, Duration::from_millis(30_000));
+        assert_eq!(d7, Duration::from_millis(60_000));
 
-        // Very high attempt still capped
+        let d10 = calculate_backoff_with_rng(10, &mut rng);
+        assert_eq!(d10, Duration::from_millis(60_000));
+
+        // Very high attempts (past where 2^n saturates) stay capped
         let d100 = calculate_backoff_with_rng(100, &mut rng);
-        assert_eq!(d100, Duration::from_millis(30_000));
+        assert_eq!(d100, Duration::from_millis(60_000));
+        let dmax = calculate_backoff_with_rng(u32::MAX, &mut rng);
+        assert_eq!(dmax, Duration::from_millis(60_000));
     }
 
     #[test]

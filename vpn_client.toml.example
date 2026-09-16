@@ -23,13 +23,16 @@ role = "vpnclient"
 # ============================================================================
 # Client-process behavior, not iroh transport settings.
 
-# Enable auto-reconnect on connection loss (default: true)
-# When true, client will automatically reconnect if the server restarts
-# or the connection is lost. When false, client exits on first disconnection.
+# Retry failed connection attempts and lost connections (default: true)
+# When true, the client retries with backoff (1s doubling to 60s) whenever a
+# connection attempt fails — the first one included, so a server that is not
+# up yet is waited out — or the connection is lost. When false, the client
+# exits on the first failed attempt or drop.
 # auto_reconnect = true
 
-# Maximum reconnect attempts (omit or comment out for unlimited)
-# Only applies when auto_reconnect = true
+# Cap on consecutive retries before giving up (omit or comment out for
+# unlimited). Counts retries within one outage; a successful connection resets
+# it. Only applies when auto_reconnect = true.
 # Must be a positive integer (1 or greater)
 # max_reconnect_attempts = 5
 
