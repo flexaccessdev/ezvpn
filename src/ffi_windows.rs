@@ -60,7 +60,11 @@
 //! "custom_relays":[{"url":"https://relay.example/","working":true,"error":null}],
 //! ...}`. `state` is
 //! `"disconnected"` while connecting/reconnecting and `"connected"` once the
-//! handshake succeeds.
+//! handshake succeeds. While down, `failed_attempts` (consecutive failures in
+//! the current outage), `last_error`, and `next_attempt_secs` (seconds until
+//! the reconnect loop tries again; `0` while an attempt is in progress) say
+//! how far the retry loop has got — a backoff step can be up to 60s once a
+//! long outage has pushed it to the cap.
 
 use std::ffi::{CStr, c_char, c_int};
 use std::num::NonZeroU32;

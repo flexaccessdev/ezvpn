@@ -219,11 +219,11 @@ enum ClientAction {
         #[arg(long, conflicts_with = "no_auto_reconnect")]
         auto_reconnect: bool,
 
-        /// Disable auto-reconnect (exit on first disconnection)
+        /// Disable auto-reconnect (exit on the first failed connection attempt or drop)
         #[arg(long, conflicts_with = "auto_reconnect")]
         no_auto_reconnect: bool,
 
-        /// Maximum reconnect attempts (unlimited if not specified)
+        /// Cap on consecutive retries before giving up (unlimited if not specified)
         #[arg(long, conflicts_with = "no_auto_reconnect")]
         max_reconnect_attempts: Option<NonZeroU32>,
 

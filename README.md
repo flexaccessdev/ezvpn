@@ -350,8 +350,8 @@ machine-readable output.
 | `--route6 <CIDR>` | Additional IPv6 route through the VPN; repeatable |
 | `--relay-url <URL>` | Custom relay URL; repeatable |
 | `--auto-reconnect` | Force-enable reconnect |
-| `--no-auto-reconnect` | Disable reconnect |
-| `--max-reconnect-attempts <N>` | Limit reconnect attempts |
+| `--no-auto-reconnect` | Exit on the first failed connection attempt or drop instead of retrying |
+| `--max-reconnect-attempts <N>` | Cap consecutive retries before giving up (unlimited if unset) |
 | `--instance <NAME>` | Instance name for lock and status socket scope; default `default` |
 | `--daemon` | Fork into the background on Unix; logs to `<log_dir>/ezvpn-client-<instance>.log` |
 | `--congestion-control <NAME>` | QUIC congestion controller: `bbr3` (default), `cubic`, or `new-reno`. Testing knob; CLI-only |
@@ -695,8 +695,23 @@ supports it.
 ## Reconnect Behavior
 
 Client auto-reconnect is enabled by default. Disable it with
-`auto_reconnect = false` in config or `--no-auto-reconnect` on the CLI. Limit
-attempts with `max_reconnect_attempts` or `--max-reconnect-attempts`.
+`auto_reconnect = false` in config or `--no-auto-reconnect` on the CLI (the
+client then exits on the first failed attempt or drop). Cap consecutive retries
+with `max_reconnect_attempts` or `--max-reconnect-attempts`.
+
+- A failed connection attempt — the **first one included** — or a lost
+  connection is retried with exponential backoff (1 second doubling to 60
+  seconds, plus 0-500 ms of jitter), indefinitely unless capped. A server that
+  is down, or not up yet, is the ordinary case, not a reason to exit: the
+  client waits it out and connects when the server appears.
+- A long outage is cheap to sit through: once the backoff reaches its cap the
+  client makes one bounded connect attempt a minute, so the server's return
+  is noticed within a minute.
+- A permanent error (a rejected key, a malformed config, a TUN device that
+  cannot be created) never retries; that is the only kind of error the client
+  exits on.
+- `ezvpn client status` shows the outage's progress while down: failed
+  attempts so far, the last error, and when the next attempt is due.
 
 Liveness is detected by QUIC:
 
@@ -704,8 +719,6 @@ Liveness is detected by QUIC:
 - QUIC idle timeout is 30 seconds.
 - The client tears down and reconnects when the connection closes, peer liveness
   fails, or TUN/stream I/O fails.
-- Reconnect backoff starts at 1 second, doubles up to 30 seconds, and adds
-  0-500 ms of jitter.
 
 On reconnect, the client compares the server's network parameters against the
 first successful handshake:
