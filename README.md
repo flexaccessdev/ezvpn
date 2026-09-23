@@ -306,7 +306,7 @@ Server-side settings are authoritative for VPN network parameters:
 The tunnel MTU and QUIC transport settings are fixed protocol constants
 (WireGuard/Tailscale-style — no tuning knobs): the MTU is always 1280
 (Tailscale's fixed value, the IPv6 minimum link MTU) and the transport uses
-paced BBRv3 with fixed windows. Nothing is negotiated; both sides derive the
+Cubic congestion control with fixed windows. Nothing is negotiated; both sides derive the
 same values from constants. The one exception is congestion control, which
 CLI-only testing flags can change on the local sender (see
 [Throughput Notes](#throughput-notes)).
@@ -325,7 +325,7 @@ precedence over client config file values.
 |--------|-------------|
 | `-c, --config <FILE>` | Server config path |
 | `--default-config` | Use `vpn_server.toml` in the system config dir (`/etc/ezvpn` on Linux, `/usr/local/etc/ezvpn` on macOS, `%ProgramData%\ezvpn` on Windows) |
-| `--congestion-control <NAME>` | QUIC congestion controller: `bbr3` (default), `cubic`, or `new-reno`. Testing knob; CLI-only |
+| `--congestion-control <NAME>` | QUIC congestion controller: `cubic` (default), `bbr3`, or `new-reno`. Testing knob; CLI-only |
 | `--congestion-initial-window <BYTES>` | Initial congestion window, 2660–8388608; default is the controller's own (12000). Testing knob; CLI-only |
 
 `ezvpn server status` prints the running server's uptime, mode, connected
@@ -354,7 +354,7 @@ machine-readable output.
 | `--max-reconnect-attempts <N>` | Cap consecutive retries before giving up (unlimited if unset) |
 | `--instance <NAME>` | Instance name for lock and status socket scope; default `default` |
 | `--daemon` | Fork into the background on Unix; logs to `<log_dir>/ezvpn-client-<instance>.log` |
-| `--congestion-control <NAME>` | QUIC congestion controller: `bbr3` (default), `cubic`, or `new-reno`. Testing knob; CLI-only |
+| `--congestion-control <NAME>` | QUIC congestion controller: `cubic` (default), `bbr3`, or `new-reno`. Testing knob; CLI-only |
 | `--congestion-initial-window <BYTES>` | Initial congestion window, 2660–8388608; default is the controller's own (12000). Testing knob; CLI-only |
 
 With `--daemon`, the client validates its config and paths before forking, so
@@ -662,15 +662,18 @@ Linux GSO is automatic:
 ## Throughput Notes
 
 There are no transport tuning knobs (WireGuard/Tailscale style). QUIC transport
-settings are fixed constants on both ends: paced BBRv3 congestion control and 8 MB
-receive/send windows, which cover most links.
+settings are fixed constants on both ends: Cubic congestion control and 8 MB
+receive/send windows, which cover most links. Cubic outran paced BBRv3 on every
+path measured through the tunnel (LAN, and emulated 40 ms paths with and without
+a bottleneck); BBRv3 only kept a shorter queue at a deep-buffered bottleneck, and
+only in the server-to-client direction.
 
 The single exception is for measurement. `server start` and `client start` both
 accept:
 
 | Flag | Effect |
 |------|--------|
-| `--congestion-control <bbr3\|cubic\|new-reno>` | Selects the congestion controller. `bbr3` is the default and what production runs |
+| `--congestion-control <cubic\|bbr3\|new-reno>` | Selects the congestion controller. `cubic` is the default and what production runs |
 | `--congestion-initial-window <BYTES>` | Sets that controller's initial congestion window. Accepts 2660 (two initial-MTU packets) to 8388608 (the flow-control window); the default is the controller's own value, 12000 |
 
 These are CLI flags only — never config-file settings — so alternatives can be
@@ -680,7 +683,7 @@ not negotiated, so the two ends may run different settings (useful for isolating
 which direction a throughput change comes from):
 
 ```bash
-sudo ezvpn client start -c client.toml --congestion-control cubic --congestion-initial-window 30000
+sudo ezvpn client start -c client.toml --congestion-control bbr3 --congestion-initial-window 30000
 ```
 
 The chosen settings are logged at startup whenever they differ from the defaults.

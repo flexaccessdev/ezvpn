@@ -173,5 +173,5 @@ secret_file = "./vpn-server.key"
 # for the full design.
 
 # NOTE: There is no [iroh.transport] section. QUIC transport settings are
-# fixed constants on both ends: BBRv3 congestion control, 8 MB receive/send
+# fixed constants on both ends: Cubic congestion control, 8 MB receive/send
 # windows, 15 s keep-alive, and 30 s idle timeout.
