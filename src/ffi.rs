@@ -71,7 +71,6 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
@@ -107,7 +106,11 @@ pub struct EzvpnHandle {
     /// Set by [`EzvpnHandle::stop`] before the task is aborted; the task checks
     /// it before running the [`ExitHook`], so a loop that ends concurrently
     /// with `stop` stays silent as documented.
-    stopped: Arc<AtomicBool>,
+    ///
+    /// Callbacks hold the lock while they run, so `stop` (which takes it to set
+    /// the flag) waits for any in-flight callback before the caller may release
+    /// its context. A callback must therefore never call `stop` synchronously.
+    stopped: Arc<Mutex<bool>>,
     /// The live iroh connection (replaced on each reconnect), kept so [`ezvpn_conn_path`] can
     /// snapshot its paths on demand after `ezvpn_run` consumed the session.
     connection: Arc<Mutex<iroh::endpoint::Connection>>,
@@ -451,7 +454,7 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
             runtime,
             session: Some(session),
             task: None,
-            stopped: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(Mutex::new(false)),
             connection,
             endpoint,
             relay_config,
@@ -559,11 +562,13 @@ impl EzvpnHandle {
         };
 
         let stopped = self.stopped.clone();
-        // Like the exit hook, events stay silent once `stop` has been called.
+        // Like the exit hook, events stay silent once `stop` has been called,
+        // and run under the lock so `stop` waits for one in flight.
         let events = events.map(|events| {
             let stopped = stopped.clone();
             Arc::new(move |event| {
-                if !stopped.load(Ordering::Acquire) {
+                let stopped = lock_ignoring_poison(&stopped);
+                if !*stopped {
                     events(event);
                 }
             }) as SessionEvents
@@ -575,11 +580,13 @@ impl EzvpnHandle {
             let result = session.run(owned_fd.as_raw_fd(), events).await;
             drop(owned_fd);
             // `stop` sets the flag before aborting, so a loop that ends on its
-            // own in the same instant still honors "stop never notifies".
-            if let Some(hook) = on_exit
-                && !stopped.load(Ordering::Acquire)
-            {
-                hook(&result);
+            // own in the same instant still honors "stop never notifies"; the
+            // hook runs under the lock so `stop` waits for it.
+            if let Some(hook) = on_exit {
+                let stopped = lock_ignoring_poison(&stopped);
+                if !*stopped {
+                    hook(&result);
+                }
             }
             result
         });
@@ -599,9 +606,11 @@ impl EzvpnHandle {
     /// short-lived thread that owns the runtime, bounded by
     /// [`STOP_CLOSE_TIMEOUT`].
     pub(crate) fn stop(self: Box<Self>) {
-        // Silence the exit hook first: the abort below only lands at the
-        // task's next await point, and the loop may already be past its last.
-        self.stopped.store(true, Ordering::Release);
+        // Silence the exit hook and events first: the abort below only lands
+        // at the task's next await point, and the loop may already be past its
+        // last. Taking the lock waits out a callback already running, so none
+        // runs after this returns.
+        *lock_ignoring_poison(&self.stopped) = true;
         let EzvpnHandle {
             runtime,
             session,
@@ -708,7 +717,9 @@ impl EventTarget {
 /// place with backoff, reusing `tun_fd`, for as long as the handle runs.
 /// `on_event`, when non-null, is called from library threads with its progress
 /// (`EZVPN_EVENT_*`); a final `ENDED` or `RECONFIGURE` means the loop is over.
-/// No event is delivered once [`ezvpn_stop`] has been called. The handle must
+/// No event is delivered once [`ezvpn_stop`] has returned: it waits for a
+/// callback already in progress. The callback must therefore not call
+/// [`ezvpn_stop`] itself (dispatch it to another thread). The handle must
 /// still be passed to [`ezvpn_stop`] after a final event.
 ///
 /// # Safety
@@ -769,6 +780,12 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
         return;
     }
     unsafe { Box::from_raw(handle) }.stop();
+}
+
+/// Lock the stop flag, recovering it from a callback that panicked (the flag
+/// itself is always valid).
+fn lock_ignoring_poison(stopped: &Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
+    stopped.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if

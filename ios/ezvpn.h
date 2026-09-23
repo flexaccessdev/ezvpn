@@ -133,7 +133,9 @@ EzvpnHandle *ezvpn_connect(const char *config_json, char *out_buf, size_t out_le
 /*
  * Called on a library thread for each ezvpn_run event. `ctx` is the pointer
  * given to ezvpn_run; `message` is valid only during the call, or NULL. Never
- * called after ezvpn_stop.
+ * called once ezvpn_stop has returned: ezvpn_stop waits for a callback in
+ * progress, so the callback must not call ezvpn_stop itself (dispatch it to
+ * another queue).
  */
 typedef void (*ezvpn_event_cb)(void *ctx, int event, const char *message);
 
