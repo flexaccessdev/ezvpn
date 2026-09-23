@@ -2092,9 +2092,10 @@ async fn publish_server_addrs(
 /// connection closes or the client's writer is gone.
 /// Read the client's control stream: echo each heartbeat `Ping` as a `Pong`
 /// (queued on the control writer), and close the connection once no `Ping` has
-/// arrived for [`HEARTBEAT_TIMEOUT`], which ends the session through the
-/// datagram reader. Returns when the stream ends; connection loss is noticed by
-/// the session itself.
+/// arrived for [`HEARTBEAT_TIMEOUT`] — other frames do not extend the deadline.
+/// The stream ending or failing also closes the connection: without it the
+/// client can no longer prove liveness. Closing ends the session through the
+/// datagram reader.
 async fn run_heartbeat_responder(
     connection: Connection,
     mut recv: RecvStream,
@@ -2102,15 +2103,18 @@ async fn run_heartbeat_responder(
     label: String,
 ) {
     let mut frame_buf = vec![0u8; MAX_FRAME_BODY];
+    let mut deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
     loop {
-        let body_len = match tokio::time::timeout(HEARTBEAT_TIMEOUT, read_frame(&mut recv, &mut frame_buf)).await {
+        let body_len = match tokio::time::timeout_at(deadline, read_frame(&mut recv, &mut frame_buf)).await {
             Ok(Ok(Some(len))) => len,
             Ok(Ok(None)) => {
-                log::debug!("Client {label} finished its control stream");
+                log::debug!("Client {label} finished its control stream; closing its connection");
+                connection.close(0u32.into(), b"control stream finished");
                 return;
             }
             Ok(Err(e)) => {
-                log::debug!("Client {label} control stream read ended: {e}");
+                log::debug!("Client {label} control stream read ended: {e}; closing its connection");
+                connection.close(0u32.into(), b"control stream error");
                 return;
             }
             Err(_) => {
@@ -2124,6 +2128,7 @@ async fn run_heartbeat_responder(
         };
         match classify(&frame_buf[..body_len]) {
             Ok(Frame::Ping(seq)) => {
+                deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
                 // A full queue drops this pong; the client tolerates missed
                 // replies up to its timeout.
                 let _ = control_tx.try_send(encode_heartbeat_frame(DataMessageType::Pong, seq));
