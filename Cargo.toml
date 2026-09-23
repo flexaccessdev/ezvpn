@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.49"
+version = "0.0.50"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
