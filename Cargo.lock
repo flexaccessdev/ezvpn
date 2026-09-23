@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "ezvpn"
-version = "0.0.50"
+version = "0.0.51"
 dependencies = [
  "android_logger",
  "anyhow",
