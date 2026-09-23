@@ -32,6 +32,11 @@ use iroh::endpoint::{Connection, ReadExactError, RecvStream, SendDatagramError, 
 /// once per datagram.
 pub const FRAME_ARENA_CHUNK: usize = 64 * 1024;
 
+/// Maximum number of datagrams drained from a connection per
+/// `read_many_datagrams` call on the receive paths, amortizing the connection
+/// lock (shared with its driver) over a burst instead of taking it per packet.
+pub const DATAGRAM_READ_BATCH: usize = 64;
+
 /// Size of the `u32` big-endian control-frame length prefix.
 pub const FRAME_LEN_PREFIX: usize = 4;
 
@@ -105,35 +110,90 @@ pub async fn send_ip_datagrams(
         packet,
         &mut outcome,
     );
-    for datagram in pending.drain(..) {
-        match send_one_datagram(conn, datagram).await {
-            Ok(()) => outcome.sent += 1,
-            Err(SendDatagramError::TooLarge) => outcome.dropped_too_large += 1,
-            Err(_) => outcome.dropped_other += 1,
-        }
-    }
+    // A terminal error is already counted in `outcome`; the connection's
+    // liveness is watched elsewhere.
+    let _ = send_datagram_batch(conn, pending, &mut outcome).await;
+    pending.clear();
     outcome
 }
 
-/// Send one prepared datagram, taking the non-waiting path when the bounded
-/// send buffer has room and awaiting `send_datagram_wait` only under
-/// backpressure.
+/// Queue prepared datagrams on `conn` without evicting any, taking the
+/// connection lock once per run that fits the send buffer rather than once per
+/// datagram, and awaiting `send_datagram_wait` only under backpressure.
 ///
-/// `datagram_send_buffer_space()` guarantees a fitting non-waiting send cannot
-/// evict older queued datagrams, and each connection has exactly one
-/// datagram-producing task (the client TUN reader / the server's per-client
-/// writer), so the check cannot race with another producer. This keeps the
-/// backpressure semantics while skipping the wait-future setup per datagram on
-/// the uncongested hot path.
-pub(crate) async fn send_one_datagram(
+/// The connection's state lock is shared with its driver, which holds it while
+/// it encrypts and sends, so per-datagram calls (a GSO super-frame segments into
+/// dozens of datagrams) serialize the producer against the driver. Here one
+/// `datagram_send_buffer_space()` read sizes the longest prefix that fits, and
+/// one `send_many_datagrams` queues it. `send_many_datagrams` evicts older
+/// datagrams to make room, so it is only ever handed a prefix the space check
+/// guarantees fits: each connection has exactly one datagram-producing task
+/// (the client TUN reader / the server's per-client writer) and the driver only
+/// frees space, so the check cannot race. When not even the next datagram fits,
+/// that one datagram awaits room, applying QUIC backpressure to the producer.
+///
+/// Counts every datagram in `outcome`. Returns the error that ended the batch
+/// early — anything but `TooLarge`, which only drops the oversized datagram —
+/// with the unsent remainder counted as `dropped_other`.
+pub async fn send_datagram_batch(
     conn: &Connection,
-    datagram: Bytes,
+    datagrams: &[Bytes],
+    outcome: &mut DatagramSendOutcome,
 ) -> Result<(), SendDatagramError> {
-    if conn.datagram_send_buffer_space() >= datagram.len() {
-        conn.send_datagram(datagram)
-    } else {
-        conn.send_datagram_wait(datagram).await
+    let mut rest = datagrams;
+    while let Some(first) = rest.first() {
+        let fit = fitting_prefix_len(rest, conn.datagram_send_buffer_space());
+        if fit == 0 {
+            // Backpressure: wait for room for the next datagram alone.
+            match conn.send_datagram_wait(first.clone()).await {
+                Ok(()) => outcome.sent += 1,
+                Err(SendDatagramError::TooLarge) => outcome.dropped_too_large += 1,
+                Err(e) => {
+                    outcome.dropped_other += rest.len() as u64;
+                    return Err(e);
+                }
+            }
+            rest = &rest[1..];
+            continue;
+        }
+        let (run, tail) = rest.split_at(fit);
+        match conn.send_many_datagrams(run) {
+            Ok(queued) => {
+                outcome.sent += queued as u64;
+                rest = &rest[queued..];
+            }
+            // The path MTU shrank below a datagram prepared against the old size,
+            // which rejects the whole run: send it one datagram at a time so only
+            // the oversized ones are dropped. The run fits, so none waits.
+            Err(SendDatagramError::TooLarge) => {
+                for datagram in run {
+                    match conn.send_datagram(datagram.clone()) {
+                        Ok(()) => outcome.sent += 1,
+                        Err(SendDatagramError::TooLarge) => outcome.dropped_too_large += 1,
+                        Err(_) => outcome.dropped_other += 1,
+                    }
+                }
+                rest = tail;
+            }
+            Err(e) => {
+                outcome.dropped_other += rest.len() as u64;
+                return Err(e);
+            }
+        }
     }
+    Ok(())
+}
+
+/// Length of the longest prefix of `datagrams` whose total size fits `space`.
+fn fitting_prefix_len(datagrams: &[Bytes], space: usize) -> usize {
+    let mut used = 0;
+    datagrams
+        .iter()
+        .take_while(|datagram| {
+            used += datagram.len();
+            used <= space
+        })
+        .count()
 }
 
 /// Materialize a TUN packet into plain datagrams without sending them.
@@ -150,10 +210,12 @@ pub(crate) fn prepare_ip_datagrams(
     outcome: &mut DatagramSendOutcome,
 ) {
     pending.clear();
+    // One lookup per TUN packet, not per segment: it takes the connection lock.
+    let max_size = conn.max_datagram_size();
     match offload {
         Some(meta) => {
             let segmented = materialize_offload_into(meta, packet, seg_scratch, |seg| {
-                prepare_one_datagram(conn, arena, seg, pending, outcome);
+                prepare_one_datagram(max_size, arena, seg, pending, outcome);
                 Ok(())
             });
             if let Err(e) = segmented {
@@ -161,13 +223,14 @@ pub(crate) fn prepare_ip_datagrams(
                 outcome.dropped_other += 1;
             }
         }
-        None => prepare_one_datagram(conn, arena, packet, pending, outcome),
+        None => prepare_one_datagram(max_size, arena, packet, pending, outcome),
     }
 }
 
-/// Prepare a single plain IP packet for datagram transmission.
+/// Prepare a single plain IP packet for datagram transmission, given the
+/// connection's current `max_datagram_size()`.
 fn prepare_one_datagram(
-    conn: &Connection,
+    max_size: Option<usize>,
     arena: &mut BytesMut,
     packet: &[u8],
     pending: &mut Vec<Bytes>,
@@ -175,7 +238,7 @@ fn prepare_one_datagram(
 ) {
     // Datagrams are capped by the live path MTU; an oversized packet is dropped
     // (not fragmented) so TCP/PMTUD can adapt while DPLPMTUD raises the path.
-    match conn.max_datagram_size() {
+    match max_size {
         Some(max) if packet.len() <= max => {}
         Some(_) => {
             outcome.dropped_too_large += 1;
@@ -324,6 +387,23 @@ mod tests {
                 assert_eq!(decoded, msg);
             }
         }
+    }
+
+    // The prefix is what `send_datagram_batch` hands to the evicting batch send,
+    // so it must never exceed the space the buffer reported.
+    #[test]
+    fn test_fitting_prefix_len_never_exceeds_space() {
+        let batch: Vec<Bytes> = [100, 200, 300]
+            .into_iter()
+            .map(|len| Bytes::from(vec![0u8; len]))
+            .collect();
+        assert_eq!(fitting_prefix_len(&batch, 0), 0);
+        assert_eq!(fitting_prefix_len(&batch, 99), 0);
+        assert_eq!(fitting_prefix_len(&batch, 100), 1, "exact fit counts");
+        assert_eq!(fitting_prefix_len(&batch, 599), 2);
+        assert_eq!(fitting_prefix_len(&batch, 600), 3);
+        assert_eq!(fitting_prefix_len(&batch, usize::MAX), 3);
+        assert_eq!(fitting_prefix_len(&[], 600), 0);
     }
 
     #[test]

@@ -127,17 +127,19 @@ pub const QUIC_ACK_REORDERING_THRESHOLD: u32 = 1;
 
 /// Congestion controller for the QUIC tunnel connection.
 ///
-/// [`CongestionControl::Bbr3`] is the default and what production runs; the
+/// [`CongestionControl::Cubic`] is the default and what production runs; the
 /// other variants exist so alternatives can be measured on a real path without
 /// recompiling. The controller only governs the local sender, so the two ends
 /// of a tunnel may run different ones.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum CongestionControl {
-    /// Paced BBRv3: what production runs (rationale in
-    /// `build_quic_transport_config`).
-    #[default]
+    /// Paced BBRv3: a bandwidth/RTT model that keeps the queue shorter at a
+    /// deep-buffered bottleneck, but measured slower than Cubic on every path
+    /// (see `build_quic_transport_config`).
     Bbr3,
-    /// Loss-based CUBIC, the common TCP/QUIC default elsewhere.
+    /// Loss-based CUBIC, the common TCP/QUIC default: what production runs
+    /// (rationale in `build_quic_transport_config`).
+    #[default]
     Cubic,
     /// Loss-based NewReno, the RFC 9002 reference controller.
     NewReno,
@@ -184,7 +186,7 @@ pub fn parse_congestion_initial_window(raw: &str) -> Result<u64, String> {
 }
 
 /// The congestion-control settings the CLI may override, defaulting to what
-/// production runs (paced BBRv3 with noq's stock initial window).
+/// production runs (Cubic with noq's stock initial window).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CongestionConfig {
     /// Which controller drives the local sender.
@@ -267,7 +269,7 @@ pub fn congestion_config() -> CongestionConfig {
 
 /// Build the fixed QUIC transport config used by both client and server.
 ///
-/// Every setting is a constant: BBRv3 congestion control, 8 MB windows, the
+/// Every setting is a constant: Cubic congestion control, 8 MB windows, the
 /// keep-alive/idle timers above, and the protocol-minimum initial MTU. Both
 /// sides applying the identical config means nothing has to be negotiated. The
 /// congestion controller is the one setting the CLI can change (see
@@ -283,12 +285,17 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.max_idle_timeout(Some(idle_timeout));
     transport_config = transport_config.keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL);
 
-    // BBRv3 uses a bandwidth/RTT model and explicitly paces transmissions. That
-    // is important for a VPN carrying TCP inside QUIC DATAGRAMs: Cubic reacts
-    // to the same loss as the inner TCP connection, multiplying congestion-window
-    // reductions, while bursty sends overflow small platform UDP socket queues.
-    // `--congestion-control` / `--congestion-initial-window` can change this
-    // for measurement.
+    // Cubic. Measured through the tunnel with one inner TCP flow, on a LAN path
+    // and on emulated 40 ms paths (clean, 0.5% random loss, and a 200 Mbit/s
+    // bottleneck with a ~1.4 BDP queue), Cubic moved 11-51% more than BBRv3 in
+    // every case and filled the bottleneck (89% vs 75-80%). BBRv3's one gain was
+    // a shorter queue at that bottleneck in the server->client direction (80 vs
+    // 148 ms loaded RTT; barely any the other way, and more loaded latency than
+    // Cubic on the LAN). Its premise for a tunnel, that the outer controller's
+    // loss response multiplies the inner TCP's, did not show: under random loss
+    // the inner TCP's own response caps the flow whichever controller runs
+    // outside. `--congestion-control` / `--congestion-initial-window` can change
+    // this for measurement.
     transport_config =
         transport_config.congestion_controller_factory(congestion_config().factory());
 
@@ -344,11 +351,11 @@ mod tests {
     }
 
     #[test]
-    fn congestion_config_defaults_to_stock_bbr3() {
+    fn congestion_config_defaults_to_stock_cubic() {
         let config = CongestionConfig::default();
-        assert_eq!(config.control, CongestionControl::Bbr3);
+        assert_eq!(config.control, CongestionControl::Cubic);
         assert_eq!(config.initial_window, None);
-        assert_eq!(config.to_string(), "bbr3");
+        assert_eq!(config.to_string(), "cubic");
     }
 
     #[test]

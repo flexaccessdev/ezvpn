@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.49"
+version = "0.0.50"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -109,10 +109,29 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 
-# Forked from iroh v1.2.0. This branch preserves established-path transport
-# backpressure so noq retains and retries the transmit instead of treating a
-# local discard as successful. Cargo.lock pins the tested branch commit. A
-# patch rather than a git dependency so `flexaccess-iroh`'s `iroh` resolves to
-# the same package (see its README, "Consumers on a fork of iroh").
+# Forks of the transport stack, applied as patches rather than git
+# dependencies so every crate in the graph (`flexaccess-iroh`, iroh itself)
+# resolves to the same package (see flexaccess-iroh's README, "Consumers on a
+# fork of iroh"). Cargo.lock pins each tested branch commit.
 [patch.crates-io]
-iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send-backpressure-1.2.0" }
+# Forked from iroh v1.2.0. Preserves established-path transport backpressure so
+# noq retains and retries the transmit instead of treating a local discard as
+# successful, and exposes noq's batch datagram send/receive on `Connection`
+# (one connection-lock acquisition per burst instead of per packet).
+iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-batch-datagrams-1.2.0" }
+# Forked from noq v1.3.0. Stamps each received batch as it is read rather than
+# once per endpoint-driver poll, and makes BBRv3 skip a non-positive RTT
+# sample: a stale receive timestamp read as a zero RTT, which the 10 s min-RTT
+# filter held, zeroing the BDP and leaving the congestion window erratic on
+# sub-millisecond paths. All three crates come from the fork so the graph holds
+# a single `noq-udp`.
+noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
+noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
+noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
+# Forked from netwatch v0.19.3 (n0-computer/net-tools). Sizes iroh's UDP
+# socket buffers with SO_RCVBUFFORCE/SO_SNDBUFFORCE when the process holds
+# CAP_NET_ADMIN (the VPN runs as root), so Linux's default
+# net.core.rmem_max/wmem_max (~208 KiB) no longer caps the 7 MiB request and
+# overflows the receive queue under load. Unprivileged, the capped options
+# apply as before.
+netwatch = { git = "https://github.com/flexaccessdev/net-tools.git", branch = "ezvpn-bufforce-0.19.3" }

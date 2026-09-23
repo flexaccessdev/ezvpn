@@ -19,7 +19,8 @@ use crate::auth::ClientKey;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::config::VpnClientConfig;
 use crate::tunnel::stream::{
-    FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify, read_frame, send_ip_datagrams,
+    DATAGRAM_READ_BATCH, FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify, read_frame,
+    send_ip_datagrams,
 };
 use crate::net::device::{
     BypassRouteGuard, Route6Guard, RouteGuard, TunConfig, TunDevice, UnderlayGateway,
@@ -1093,20 +1094,24 @@ pub(crate) async fn run_tunnel(
     });
 
     // Spawn data-inbound task (unreliable datagrams -> TUN writer channel).
-    // Each datagram body is a raw IP packet (no offload metadata). Returns a
-    // disconnect reason when the connection ends.
+    // Each datagram body is a raw IP packet (no offload metadata); they are
+    // drained in batches, one connection lock per burst. Returns a disconnect
+    // reason when the connection ends.
     let conn_in = connection.clone();
     let mut inbound_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
+        let mut datagrams = vec![Bytes::new(); DATAGRAM_READ_BATCH];
         loop {
-            match conn_in.read_datagram().await {
-                Ok(packet) => {
-                    let req = InboundTunWrite {
-                        packet,
-                        offload: None,
-                    };
-                    if !enqueue_inbound_tun_write(&tun_write_tx, req).await {
-                        log::trace!("TUN writer channel closed");
-                        return None;
+            match conn_in.read_many_datagrams(&mut datagrams).await {
+                Ok(count) => {
+                    for packet in datagrams[..count].iter_mut().map(std::mem::take) {
+                        let req = InboundTunWrite {
+                            packet,
+                            offload: None,
+                        };
+                        if !enqueue_inbound_tun_write(&tun_write_tx, req).await {
+                            log::trace!("TUN writer channel closed");
+                            return None;
+                        }
                     }
                 }
                 Err(e) => {
