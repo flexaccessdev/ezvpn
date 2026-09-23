@@ -333,8 +333,9 @@ pub const MAX_HANDSHAKE_SIZE: usize = 16 * 1024;
 ///
 /// Each frame is `[len: u32 BE] [body]`; the body's leading byte is the message
 /// type and the remainder is type-specific. Server-addresses body:
-/// `[0x01] [json(ServerAddrsMsg)]`. IP packets are not framed here — they map
-/// directly to unreliable QUIC datagrams.
+/// `[0x01] [json(ServerAddrsMsg)]`; heartbeat bodies: `[0x02 | 0x03] [seq: u64
+/// BE]`. IP packets are not framed here — they map directly to unreliable QUIC
+/// datagrams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DataMessageType {
@@ -343,6 +344,12 @@ pub enum DataMessageType {
     /// would otherwise capture, pre-empting self-capture of a server address
     /// iroh has not yet selected (see [`ServerAddrsMsg`]).
     ServerAddrs = 0x01,
+    /// Application heartbeat request (client → server only), sent every
+    /// `HEARTBEAT_INTERVAL`. The server answers each with a [`Self::Pong`]
+    /// carrying the same sequence number.
+    Ping = 0x02,
+    /// Application heartbeat reply (server → client only).
+    Pong = 0x03,
 }
 
 impl DataMessageType {
@@ -350,6 +357,8 @@ impl DataMessageType {
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0x01 => Some(Self::ServerAddrs),
+            0x02 => Some(Self::Ping),
+            0x03 => Some(Self::Pong),
             _ => None,
         }
     }
@@ -634,11 +643,16 @@ mod tests {
         assert_eq!(msg_type, DataMessageType::ServerAddrs);
         let back: u8 = msg_type.into();
         assert_eq!(back, 0x01);
+
+        assert_eq!(DataMessageType::from_byte(0x02), Some(DataMessageType::Ping));
+        assert_eq!(DataMessageType::from_byte(0x03), Some(DataMessageType::Pong));
+        assert_eq!(DataMessageType::Ping.as_byte(), 0x02);
+        assert_eq!(DataMessageType::Pong.as_byte(), 0x03);
     }
 
     #[test]
     fn test_data_message_type_invalid_bytes() {
-        for invalid in [0x00, 0x02, 0x03, 0x10, 0x80, 0xff] {
+        for invalid in [0x00, 0x04, 0x10, 0x80, 0xff] {
             assert!(
                 DataMessageType::from_byte(invalid).is_none(),
                 "from_byte(0x{:02x}) should return None",
@@ -661,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_data_message_type_try_from_invalid() {
-        for invalid in [0x02, 0x10, 0x80, 0xff] {
+        for invalid in [0x04, 0x10, 0x80, 0xff] {
             let result: Result<DataMessageType, _> = invalid.try_into();
             assert!(result.is_err(), "TryFrom(0x{:02x}) should fail", invalid);
 

@@ -8,8 +8,9 @@
 use crate::net::buffer::uninitialized_vec;
 use crate::config::{Ip6Strategy, VPN_MTU, VpnServerConfig, validate_ip6_strategy};
 use crate::tunnel::stream::{
-    DATAGRAM_READ_BATCH, DatagramSendOutcome, FRAME_ARENA_CHUNK, encode_server_addrs_frame,
-    prepare_ip_datagrams, send_datagram_batch, write_frames,
+    DATAGRAM_READ_BATCH, DatagramSendOutcome, FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify,
+    encode_heartbeat_frame, encode_server_addrs_frame, prepare_ip_datagrams, read_frame,
+    send_datagram_batch, write_frames,
 };
 use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
 use crate::control::{ClientEntry, ServerStatsView, ServerStatus, StatusSnapshot};
@@ -17,11 +18,11 @@ use crate::error::{VpnError, VpnResult};
 use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
-use crate::transport::SERVER_ADDR_PUBLISH_INTERVAL;
+use crate::transport::{HEARTBEAT_TIMEOUT, SERVER_ADDR_PUBLISH_INTERVAL};
 use crate::transport::endpoint::RelayConfig;
 use flexaccess_iroh::relay_failover::fail_over_home_relay;
 use crate::tunnel::signaling::{
-    ClientAuthPayload, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
+    ClientAuthPayload, DataMessageType, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
     read_message, write_message,
 };
 use bytes::{Bytes, BytesMut};
@@ -1250,7 +1251,7 @@ impl VpnServer {
         }
 
         // Create channel for the client's control-stream writer task. The task
-        // owns the bi-stream's send half and writes only `ServerAddrs` frames;
+        // owns the bi-stream's send half and writes `ServerAddrs` and `Pong` frames;
         // IP packets to this client are sent as datagrams by the TUN reader.
         let (packet_tx, mut packet_rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_SIZE);
 
@@ -1352,6 +1353,16 @@ impl VpnServer {
             .await;
         });
 
+        // Answer the client's heartbeat on the control stream, and close a
+        // connection whose client has stopped pinging. The pong goes through the
+        // control writer like any other frame.
+        let heartbeat_handle = tokio::spawn(run_heartbeat_responder(
+            connection.clone(),
+            recv,
+            packet_tx.clone(),
+            remote_id.to_string(),
+        ));
+
         // Generate unique session ID for this connection
         // Used to detect stale cleanup when same client reconnects quickly
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
@@ -1401,9 +1412,6 @@ impl VpnServer {
             ip_to_endpoint: ip_to_endpoint.clone(),
             ip6_to_endpoint: ip6_to_endpoint.clone(),
         };
-        // The client sends IP packets as datagrams (read off the connection),
-        // not on the stream; hold the stream recv half open for the session.
-        let _recv = recv;
         let result = Self::handle_client_data(
             connection.clone(),
             ctx,
@@ -1417,6 +1425,7 @@ impl VpnServer {
         // Abort writer task if still running (cleanup on any exit path)
         writer_handle.abort();
         datagram_writer_handle.abort();
+        heartbeat_handle.abort();
 
         if let Err(ref e) = result {
             log::error!("Client {} data error: {}", remote_id, e);
@@ -2081,6 +2090,55 @@ async fn publish_server_addrs(
 /// [`SERVER_ADDR_PUBLISH_INTERVAL`] for loss tolerance, and promptly whenever
 /// the local address set changes ([`Endpoint::watch_addr`]). Ends when the
 /// connection closes or the client's writer is gone.
+/// Read the client's control stream: echo each heartbeat `Ping` as a `Pong`
+/// (queued on the control writer), and close the connection once no `Ping` has
+/// arrived for [`HEARTBEAT_TIMEOUT`] — other frames do not extend the deadline.
+/// The stream ending or failing also closes the connection: without it the
+/// client can no longer prove liveness. Closing ends the session through the
+/// datagram reader.
+async fn run_heartbeat_responder(
+    connection: Connection,
+    mut recv: RecvStream,
+    control_tx: mpsc::Sender<Bytes>,
+    label: String,
+) {
+    let mut frame_buf = vec![0u8; MAX_FRAME_BODY];
+    let mut deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
+    loop {
+        let body_len = match tokio::time::timeout_at(deadline, read_frame(&mut recv, &mut frame_buf)).await {
+            Ok(Ok(Some(len))) => len,
+            Ok(Ok(None)) => {
+                log::debug!("Client {label} finished its control stream; closing its connection");
+                connection.close(0u32.into(), b"control stream finished");
+                return;
+            }
+            Ok(Err(e)) => {
+                log::debug!("Client {label} control stream read ended: {e}; closing its connection");
+                connection.close(0u32.into(), b"control stream error");
+                return;
+            }
+            Err(_) => {
+                log::warn!(
+                    "Client {label} sent no heartbeat in {}s; closing its connection",
+                    HEARTBEAT_TIMEOUT.as_secs()
+                );
+                connection.close(0u32.into(), b"heartbeat timeout");
+                return;
+            }
+        };
+        match classify(&frame_buf[..body_len]) {
+            Ok(Frame::Ping(seq)) => {
+                deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
+                // A full queue drops this pong; the client tolerates missed
+                // replies up to its timeout.
+                let _ = control_tx.try_send(encode_heartbeat_frame(DataMessageType::Pong, seq));
+            }
+            Ok(other) => log::trace!("Ignoring unexpected control frame from {label}: {other:?}"),
+            Err(e) => log::trace!("Ignoring undecodable control frame from {label}: {e}"),
+        }
+    }
+}
+
 async fn run_server_addr_publisher(
     endpoint: Endpoint,
     connection: Connection,

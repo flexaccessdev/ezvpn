@@ -10,6 +10,9 @@
 //!    extension can build `NEPacketTunnelNetworkSettings`.
 //! 2. [`ezvpn_run`] — hand back the tun fd (obtained after applying the
 //!    network settings); spawns the data-stream loop on the embedded runtime.
+//!    Its optional exit callback reports a loop that ends on its own (server
+//!    gone, heartbeat timeout, fatal I/O error) so the extension can tear the
+//!    tunnel down instead of staying "connected" over a dead session.
 //! 3. [`ezvpn_stop`] — abort the loop, close the endpoint, free the handle.
 //!
 //! [`ezvpn_conn_path`] is an optional debug readout: an on-demand snapshot of
@@ -63,28 +66,28 @@
 //! }
 //! ```
 
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ipnet::{Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
-use crate::error::VpnResult;
+use crate::error::{VpnError, VpnResult};
 use crate::transport::endpoint::RelayConfig;
 use crate::transport::paths::{ConnPathKind, connection_snapshot};
 use crate::tunnel::dns_proxy::DnsProxyConfig;
-use crate::tunnel::mobile::{MobileConfig, MobileSession};
+use crate::tunnel::mobile::{MobileConfig, MobileSession, SessionEvent, SessionEvents};
 
 /// Callback run on the embedded runtime when the data loop started by
 /// [`EzvpnHandle::run`] ends on its own (peer close, idle timeout, fatal I/O
-/// error). Never invoked once [`EzvpnHandle::stop`] has been called — the
+/// error, or — with reconnect enabled — a non-recoverable error or changed
+/// network parameters). Never invoked once [`EzvpnHandle::stop`] has been called — the
 /// caller initiated that and needs no notification — even if the loop happens
 /// to end on its own at the same moment.
-pub(crate) type ExitHook = Box<dyn FnOnce(Result<(), String>) + Send + 'static>;
+pub(crate) type ExitHook = Box<dyn FnOnce(&VpnResult<()>) + Send + 'static>;
 
 /// Upper bound on the graceful endpoint close in [`EzvpnHandle::stop`]. The
 /// CONNECTION_CLOSE goes out immediately; this only caps how long the
@@ -103,10 +106,14 @@ pub struct EzvpnHandle {
     /// Set by [`EzvpnHandle::stop`] before the task is aborted; the task checks
     /// it before running the [`ExitHook`], so a loop that ends concurrently
     /// with `stop` stays silent as documented.
-    stopped: Arc<AtomicBool>,
-    /// Clone of the live iroh connection, kept so [`ezvpn_conn_path`] can
+    ///
+    /// Callbacks hold the lock while they run, so `stop` (which takes it to set
+    /// the flag) waits for any in-flight callback before the caller may release
+    /// its context. A callback must therefore never call `stop` synchronously.
+    stopped: Arc<Mutex<bool>>,
+    /// The live iroh connection (replaced on each reconnect), kept so [`ezvpn_conn_path`] can
     /// snapshot its paths on demand after `ezvpn_run` consumed the session.
-    connection: iroh::endpoint::Connection,
+    connection: Arc<Mutex<iroh::endpoint::Connection>>,
     /// Clone of the session's iroh endpoint, kept so [`EzvpnHandle::stop`] can
     /// close it gracefully after `ezvpn_run` consumed the session.
     endpoint: iroh::Endpoint,
@@ -440,14 +447,14 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
     })
     .to_string();
 
-    let connection = session.connection();
+    let connection = session.connection_cell();
     let endpoint = session.endpoint();
     Ok((
         EzvpnHandle {
             runtime,
             session: Some(session),
             task: None,
-            stopped: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(Mutex::new(false)),
             connection,
             endpoint,
             relay_config,
@@ -505,9 +512,13 @@ impl EzvpnHandle {
         // snapshot on the embedded runtime. Called from the app's own thread
         // (never a runtime worker), so `block_on` is safe and does not stall
         // the running tunnel task.
+        let connection = match self.connection.lock() {
+            Ok(current) => current.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         let snapshot = self
             .runtime
-            .block_on(connection_snapshot(&self.connection, &self.relay_config));
+            .block_on(connection_snapshot(&connection, &self.relay_config));
         let paths: Vec<_> = snapshot
             .paths
             .into_iter()
@@ -525,8 +536,15 @@ impl EzvpnHandle {
 
     /// The shared body of [`ezvpn_run`]: `dup` the tun fd synchronously, then
     /// spawn the data loop on the embedded runtime. `on_exit`, when given, runs
-    /// on the runtime once the loop ends on its own (see [`ExitHook`]).
-    pub(crate) fn run(&mut self, tun_fd: c_int, on_exit: Option<ExitHook>) -> Result<(), String> {
+    /// on the runtime once the loop ends on its own (see [`ExitHook`]);
+    /// `events`, when given, enables the in-place reconnect loop
+    /// ([`MobileSession::run`]).
+    pub(crate) fn run(
+        &mut self,
+        tun_fd: c_int,
+        on_exit: Option<ExitHook>,
+        events: Option<SessionEvents>,
+    ) -> Result<(), String> {
         let Some(session) = self.session.take() else {
             return Err("no pending session (already running or never connected)".to_string());
         };
@@ -544,18 +562,31 @@ impl EzvpnHandle {
         };
 
         let stopped = self.stopped.clone();
+        // Like the exit hook, events stay silent once `stop` has been called,
+        // and run under the lock so `stop` waits for one in flight.
+        let events = events.map(|events| {
+            let stopped = stopped.clone();
+            Arc::new(move |event| {
+                let stopped = lock_ignoring_poison(&stopped);
+                if !*stopped {
+                    events(event);
+                }
+            }) as SessionEvents
+        });
         let task = self.runtime.spawn(async move {
             // `owned_fd` is owned by this task and closed when it ends; `run`
             // dups it again into the TunDevice, so our copy outlives that
             // internal dup setup.
-            let result = session.run(owned_fd.as_raw_fd()).await;
+            let result = session.run(owned_fd.as_raw_fd(), events).await;
             drop(owned_fd);
             // `stop` sets the flag before aborting, so a loop that ends on its
-            // own in the same instant still honors "stop never notifies".
-            if let Some(hook) = on_exit
-                && !stopped.load(Ordering::Acquire)
-            {
-                hook(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+            // own in the same instant still honors "stop never notifies"; the
+            // hook runs under the lock so `stop` waits for it.
+            if let Some(hook) = on_exit {
+                let stopped = lock_ignoring_poison(&stopped);
+                if !*stopped {
+                    hook(&result);
+                }
             }
             result
         });
@@ -575,9 +606,11 @@ impl EzvpnHandle {
     /// short-lived thread that owns the runtime, bounded by
     /// [`STOP_CLOSE_TIMEOUT`].
     pub(crate) fn stop(self: Box<Self>) {
-        // Silence the exit hook first: the abort below only lands at the
-        // task's next await point, and the loop may already be past its last.
-        self.stopped.store(true, Ordering::Release);
+        // Silence the exit hook and events first: the abort below only lands
+        // at the task's next await point, and the loop may already be past its
+        // last. Taking the lock waits out a callback already running, so none
+        // runs after this returns.
+        *lock_ignoring_poison(&self.stopped) = true;
         let EzvpnHandle {
             runtime,
             session,
@@ -622,6 +655,54 @@ impl EzvpnHandle {
     }
 }
 
+/// [`ezvpn_run`] event: the session was lost (or a reconnect attempt failed)
+/// and the library is reconnecting; `message` is the reason.
+pub const EZVPN_EVENT_RECONNECTING: c_int = 1;
+/// [`ezvpn_run`] event: reconnected with unchanged network settings; traffic
+/// flows again. `message` is null.
+pub const EZVPN_EVENT_RECONNECTED: c_int = 2;
+/// [`ezvpn_run`] event (final): the tunnel ended and will not reconnect —
+/// a non-recoverable error such as rejected authentication. `message` is the
+/// reason, or null for a clean end.
+pub const EZVPN_EVENT_ENDED: c_int = 3;
+/// [`ezvpn_run`] event (final): the server handed back different network
+/// settings on reconnect (e.g. a restarted server re-allocated the address).
+/// The applied interface settings are stale: stop this handle and connect
+/// afresh. `message` describes the change.
+pub const EZVPN_EVENT_RECONFIGURE: c_int = 4;
+
+/// C event callback for [`ezvpn_run`]: `ctx` is the caller's pointer, passed
+/// back verbatim; `event` is one of the `EZVPN_EVENT_*` codes; `message` is
+/// NUL-terminated and valid only for the duration of the call, or null.
+pub type EzvpnEventCallback = extern "C" fn(ctx: *mut c_void, event: c_int, message: *const c_char);
+
+/// The caller's callback and opaque `ctx`, moved onto the runtime threads
+/// that report events. The caller guarantees `ctx` stays valid until
+/// [`ezvpn_stop`].
+#[derive(Clone, Copy)]
+struct EventTarget {
+    callback: EzvpnEventCallback,
+    ctx: *mut c_void,
+}
+// SAFETY: the pointer is never dereferenced here, only handed back to the
+// caller's callback, whose contract covers calls from any thread.
+unsafe impl Send for EventTarget {}
+unsafe impl Sync for EventTarget {}
+
+impl EventTarget {
+    fn emit(self, event: c_int, message: Option<&str>) {
+        match message {
+            None => (self.callback)(self.ctx, event, ptr::null()),
+            Some(m) => {
+                // Our messages carry no interior NUL; fall back rather than drop
+                // the event if one ever does.
+                let msg = CString::new(m).unwrap_or_else(|_| CString::from(c"(unprintable)"));
+                (self.callback)(self.ctx, event, msg.as_ptr());
+            }
+        }
+    }
+}
+
 /// Start the tunnel data loop on `tun_fd` (the extension's `utun` fd).
 ///
 /// Spawns the loop on the embedded runtime and returns immediately: `0` on
@@ -632,16 +713,51 @@ impl EzvpnHandle {
 /// close its own copy as soon as `ezvpn_run` returns — there is no race with the
 /// spawned task picking the fd up.
 ///
+/// A lost session (server restart, heartbeat or idle timeout) is reconnected in
+/// place with backoff, reusing `tun_fd`, for as long as the handle runs.
+/// `on_event`, when non-null, is called from library threads with its progress
+/// (`EZVPN_EVENT_*`); a final `ENDED` or `RECONFIGURE` means the loop is over.
+/// No event is delivered once [`ezvpn_stop`] has returned: it waits for a
+/// callback already in progress. The callback must therefore not call
+/// [`ezvpn_stop`] itself (dispatch it to another thread). The handle must
+/// still be passed to [`ezvpn_stop`] after a final event.
+///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`ezvpn_connect`] and not yet
 /// passed to [`ezvpn_stop`]. `tun_fd` must be a valid open file descriptor.
+/// `ctx` must remain valid for `on_event` until [`ezvpn_stop`] is called on
+/// this handle, and `on_event` must be safe to call from any thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ezvpn_run(handle: *mut EzvpnHandle, tun_fd: c_int) -> c_int {
+pub unsafe extern "C" fn ezvpn_run(
+    handle: *mut EzvpnHandle,
+    tun_fd: c_int,
+    on_event: Option<EzvpnEventCallback>,
+    ctx: *mut c_void,
+) -> c_int {
     if handle.is_null() {
         return -1;
     }
     let handle = unsafe { &mut *handle };
-    match handle.run(tun_fd, None) {
+    let target = on_event.map(|callback| EventTarget { callback, ctx });
+    let events: SessionEvents = Arc::new(move |event| {
+        let Some(target) = target else { return };
+        match event {
+            SessionEvent::Reconnecting(reason) => {
+                target.emit(EZVPN_EVENT_RECONNECTING, Some(&reason))
+            }
+            SessionEvent::Reconnected => target.emit(EZVPN_EVENT_RECONNECTED, None),
+        }
+    });
+    let hook = target.map(|target| {
+        Box::new(move |result: &VpnResult<()>| match result {
+            Ok(()) => target.emit(EZVPN_EVENT_ENDED, None),
+            Err(e @ VpnError::ServerConfigChanged(_)) => {
+                target.emit(EZVPN_EVENT_RECONFIGURE, Some(&e.to_string()))
+            }
+            Err(e) => target.emit(EZVPN_EVENT_ENDED, Some(&e.to_string())),
+        }) as ExitHook
+    });
+    match handle.run(tun_fd, hook, Some(events)) {
         Ok(()) => 0,
         Err(e) => {
             log::error!("ezvpn_run: {e}");
@@ -664,6 +780,12 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
         return;
     }
     unsafe { Box::from_raw(handle) }.stop();
+}
+
+/// Lock the stop flag, recovering it from a callback that panicked (the flag
+/// itself is always valid).
+fn lock_ignoring_poison(stopped: &Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
+    stopped.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if

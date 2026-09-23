@@ -632,23 +632,30 @@ VPN mode includes automatic reconnection when a connection attempt fails or the 
 **Reconnect policy** (`VpnClient::run_with_reconnect`, `src/tunnel/client.rs`):
 - Every recoverable failure (`ConnectionLost` / `Network` / `Signaling` — see `VpnError::is_recoverable`) is retried. The first attempt is no different from any later one: a server that is down or not up yet is the ordinary case, not an error to exit on.
 - Permanent errors (`AuthenticationFailed` / `Config` / `TunDevice` / `ServerConfigChanged` / `RouteOverlapsLocalNetwork`, …) never retry — the same credential and config would fail the same way every time.
-- A long outage costs one bounded connect (`CONNECT_TIMEOUT`, 30 s) per attempt on the endpoint the client already holds, once a minute at the backoff cap. The desktop client has no event that cuts a backoff step short (no network-path or foreground signal), so the server's return is noticed up to a minute late; the mobile apps run their own reconnect policy around the fd-based session and never enter this loop.
+- A long outage costs one bounded connect (`CONNECT_TIMEOUT`, 30 s) per attempt on the endpoint the client already holds, once a minute at the backoff cap. The desktop client has no event that cuts a backoff step short (no network-path or foreground signal), so the server's return is noticed up to a minute late.
+- The Apple app's fd-based session (`MobileSession::run`, `src/tunnel/mobile.rs`) runs the same backoff in place: it reconnects on the same endpoint, device id and utun fd, and reports progress through `ezvpn_run`'s event callback, which the extension shows as `reasserting`. If the server hands back different network settings (a restarted server re-allocated the address), the fd's interface is stale: the loop ends with `EZVPN_EVENT_RECONFIGURE` and the extension connects afresh and re-applies them. Android does not enable this yet; its service tears down on exit.
 - The loop publishes its progress through `ClientStatusHandle::set_reconnecting` (failed attempts, last error, next attempt due) into the `ClientStatus` snapshot — `failed_attempts`, `last_error`, `next_attempt_secs` — which `ezvpn client status` prints on a `Reconnecting:` line while down and the Windows app reads through `ezvpn_status`.
 
 **Health Monitoring:**
 
-The data path has no application-level heartbeat. Peer liveness is detected
-entirely by QUIC:
+Peer liveness is checked at two layers:
 
 - **QUIC keep-alive** (15s interval) keeps NAT mappings warm and exercises the path.
-- **QUIC idle timeout** (30s) closes a connection whose peer has gone silent.
-- The client awaits `Connection::closed()`; when it resolves (idle timeout, peer
-  close, or path failure) the tunnel tears down and (if enabled) reconnects.
+- **QUIC idle timeout** (30s) closes a connection whose peer has gone silent;
+  the client awaits `Connection::closed()`.
+- **Application heartbeat** on the control stream: the client sends a `Ping`
+  every 10s and the server's per-client session echoes it as a `Pong`. The
+  client ends the tunnel after 30s without a `Pong`, and the server closes a
+  connection after 30s without a `Ping`. QUIC keep-alive only proves that
+  something acknowledges packets at the transport layer; a client has been seen
+  sitting "connected" through the relay after a server restart until reconnected
+  by hand. The heartbeat is answered by the session itself, so it fails whenever
+  that session is gone.
 - TUN read/write errors, datagram read errors, and control-stream read/write
-  errors also end the tunnel.
+  errors also end the tunnel. Any of these (if enabled) triggers a reconnect.
 
-These keep-alive / idle-timeout values live in `src/transport/mod.rs`
-(`QUIC_KEEP_ALIVE_INTERVAL`, `QUIC_IDLE_TIMEOUT`).
+These values live in `src/transport/mod.rs` (`QUIC_KEEP_ALIVE_INTERVAL`,
+`QUIC_IDLE_TIMEOUT`, `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`).
 
 **Data path (datagrams):**
 
@@ -661,19 +668,22 @@ current `max_datagram_size()` is dropped, not fragmented (`send_ip_datagrams` in
 
 **Control channel (stream framing):**
 
-The handshake bi-stream stays open and carries only server-address publications.
+The handshake bi-stream stays open and carries server-address publications and the heartbeat.
 Each frame is a `u32` big-endian length prefix, then `[0x01]` (`DataMessageType::ServerAddrs`),
-then a JSON body. An announced body length of zero or above `MAX_FRAME_BODY` is a
+then a JSON body. Heartbeat frames are `[0x02]` (`Ping`, client → server) or
+`[0x03]` (`Pong`, server → client) followed by a `u64` big-endian sequence number
+that the `Pong` echoes. An announced body length of zero or above `MAX_FRAME_BODY` is a
 protocol violation and ends the connection (a byte stream cannot resynchronize
 past a corrupt length).
 
 **Implementation locations** (search by symbol name; line numbers may shift):
 - Type enum: `DataMessageType` in `signaling.rs`
 - Datagram data path: `send_ip_datagrams()` in `stream.rs`; receive via `Connection::read_datagram()`
-- Control framing: `encode_server_addrs_frame()` / `classify()` / `read_frame()` / `write_frames()` in `stream.rs`
+- Control framing: `encode_server_addrs_frame()` / `encode_heartbeat_frame()` / `classify()` / `read_frame()` / `write_frames()` in `stream.rs`
 - Client send (outbound): TUN reader task in `client.rs` - `send_ip_datagrams()` on the connection
 - Client receive (inbound): datagram task in `client.rs` - `Connection::read_datagram()`; control task - `read_frame()` then `classify()`
-- Client liveness: task awaiting `Connection::closed()` in `client.rs`
+- Client liveness: task awaiting `Connection::closed()` or `run_heartbeat()` in `client.rs`
+- Server heartbeat: `run_heartbeat_responder()` in `server.rs`
 - Server send: TUN reader task in `server.rs` - `queue_client_datagrams()` to each destination client's independent writer
 - Server receive: `handle_client_data()` in `server.rs` - `Connection::read_datagram()`
 

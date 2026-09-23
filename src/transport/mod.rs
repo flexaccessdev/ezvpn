@@ -45,13 +45,29 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// are considered dead and closed. With [`QUIC_KEEP_ALIVE_INTERVAL`] enabled,
 /// this timeout only triggers for truly unresponsive peers.
 ///
-/// The data path is unreliable QUIC datagrams with no application-level
-/// heartbeat: peer liveness is detected entirely by QUIC keep-alive plus this
-/// idle timeout (a dead peer stops sending keep-alives and the connection
-/// closes after this elapses, resolving `Connection::closed()`). 30s gives
-/// prompt dead-peer detection while comfortably exceeding the 15s keep-alive
-/// interval so a single lost keep-alive never trips it.
+/// A dead peer stops sending keep-alives and the connection closes after this
+/// elapses, resolving `Connection::closed()`. 30s gives prompt dead-peer
+/// detection while comfortably exceeding the 15s keep-alive interval so a single
+/// lost keep-alive never trips it. It is backed by the application heartbeat
+/// ([`HEARTBEAT_INTERVAL`] / [`HEARTBEAT_TIMEOUT`]), which does not depend on
+/// the QUIC layer noticing the loss.
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Interval at which the client sends an application `Ping` on the control
+/// stream; the server answers each with a `Pong`.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long either side waits for heartbeat traffic before declaring the
+/// session dead: the client for a `Pong`, the server for a `Ping`.
+///
+/// QUIC keep-alive only proves that *something* acknowledges packets at the
+/// transport layer, and a client has been seen sitting "connected" through the
+/// relay after a server restart until the user reconnected by hand. The
+/// heartbeat is answered
+/// by the server's per-client session itself, so it fails whenever that session
+/// is gone, however the transport behaves. Three missed intervals: a single
+/// late reply on a lossy path never trips it.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval at which the server re-publishes its candidate iroh underlay
 /// addresses to each connected client (on the data stream).
