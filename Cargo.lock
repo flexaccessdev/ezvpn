@@ -1541,7 +1541,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.2.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.2.0#f98f7afe2e54fe2f64f78d6c06762530853a48d1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-batch-datagrams-1.2.0#c2511f22e74a8d22a8b07981286fb62beb05235f"
 dependencies = [
  "backon",
  "blake3",
@@ -1590,7 +1590,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.2.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.2.0#f98f7afe2e54fe2f64f78d6c06762530853a48d1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-batch-datagrams-1.2.0#c2511f22e74a8d22a8b07981286fb62beb05235f"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1608,7 +1608,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.3.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.2.0#f98f7afe2e54fe2f64f78d6c06762530853a48d1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-batch-datagrams-1.2.0#c2511f22e74a8d22a8b07981286fb62beb05235f"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1657,7 +1657,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.2.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.2.0#f98f7afe2e54fe2f64f78d6c06762530853a48d1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-batch-datagrams-1.2.0#c2511f22e74a8d22a8b07981286fb62beb05235f"
 dependencies = [
  "blake3",
  "bytes",
@@ -2173,8 +2173,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39da9cad5f23aa43401f09497d3b280e51b5feba115d9ffbf38ca35d6ff95e96"
+source = "git+https://github.com/flexaccessdev/net-tools.git?branch=ezvpn-bufforce-0.19.3#a216ebfb9bbabdf66e92058f5980e2b1d6341eff"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2223,8 +2222,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b78be567e796cfa74bb9bdc4117790af2d505eb887019cf8803244353eb09d89"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.3.0#a3ce5d86bd1a35b092ceac844ab33dadf413c2c8"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2245,8 +2243,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c1e5b6fe668491eca022f745a0a9402585626c73a7b839b3424ace15d6a9c8f"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.3.0#a3ce5d86bd1a35b092ceac844ab33dadf413c2c8"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2273,8 +2270,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dc50afea61aff926e150a36c31f06094608848e114a3fe667d76ec233163b1c"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.3.0#a3ce5d86bd1a35b092ceac844ab33dadf413c2c8"
 dependencies = [
  "cfg_aliases",
  "libc",

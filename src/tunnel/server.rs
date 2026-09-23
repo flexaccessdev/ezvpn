@@ -8,7 +8,8 @@
 use crate::net::buffer::uninitialized_vec;
 use crate::config::{Ip6Strategy, VPN_MTU, VpnServerConfig, validate_ip6_strategy};
 use crate::tunnel::stream::{
-    FRAME_ARENA_CHUNK, encode_server_addrs_frame, prepare_ip_datagrams, write_frames,
+    DATAGRAM_READ_BATCH, DatagramSendOutcome, FRAME_ARENA_CHUNK, encode_server_addrs_frame,
+    prepare_ip_datagrams, send_datagram_batch, write_frames,
 };
 use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
 use crate::control::{ClientEntry, ServerStatsView, ServerStatus, StatusSnapshot};
@@ -1261,38 +1262,34 @@ impl VpnServer {
         let datagram_conn = connection.clone();
         let datagram_stats = self.stats.clone();
         let datagram_writer_handle = tokio::spawn(async move {
-            // Drain the queue in batches to amortize channel wakeups; each
-            // datagram still goes through the send-buffer-aware fast path so
-            // QUIC backpressure applies per datagram.
+            // Drain the queue in batches to amortize channel wakeups, and queue
+            // each batch on the connection in as few locked calls as fit the
+            // send buffer, so QUIC backpressure still applies.
             let mut batch: Vec<Bytes> = Vec::with_capacity(WRITE_BATCH_SIZE);
-            'writer: loop {
+            loop {
                 let count = datagram_rx.recv_many(&mut batch, WRITE_BATCH_SIZE).await;
                 if count == 0 {
                     break;
                 }
-                for datagram in batch.drain(..) {
-                    match crate::tunnel::stream::send_one_datagram(&datagram_conn, datagram).await
-                    {
-                        Ok(()) => {
-                            datagram_stats
-                                .packets_to_clients
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(iroh::endpoint::SendDatagramError::TooLarge) => {
-                            datagram_stats
-                                .packets_dropped_too_large
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            // Connection lost or datagrams disabled/unsupported:
-                            // terminal for this client's datagram path, not queue
-                            // pressure (`packets_dropped_full` counts only the
-                            // bounded per-client queue overflowing). Connection
-                            // cleanup accounts for the client.
-                            log::debug!("client datagram writer stopping: {e}");
-                            break 'writer;
-                        }
-                    }
+                let mut outcome = DatagramSendOutcome::default();
+                let result = send_datagram_batch(&datagram_conn, &batch, &mut outcome).await;
+                batch.clear();
+                datagram_stats
+                    .packets_to_clients
+                    .fetch_add(outcome.sent, Ordering::Relaxed);
+                if outcome.dropped_too_large > 0 {
+                    datagram_stats
+                        .packets_dropped_too_large
+                        .fetch_add(outcome.dropped_too_large, Ordering::Relaxed);
+                }
+                if let Err(e) = result {
+                    // Connection lost or datagrams disabled/unsupported: terminal
+                    // for this client's datagram path, not queue pressure
+                    // (`packets_dropped_full` counts only the bounded per-client
+                    // queue overflowing). Connection cleanup accounts for the
+                    // client.
+                    log::debug!("client datagram writer stopping: {e}");
+                    break;
                 }
             }
         });
@@ -1579,62 +1576,40 @@ impl VpnServer {
         let client_id_outer = client_id.clone(); // For use in select! block
 
         // Spawn inbound task (client datagrams -> TUN via channel). Each datagram
-        // body is a raw IP packet with no offload metadata.
+        // body is a raw IP packet with no offload metadata; they are drained in
+        // batches, one connection lock per burst.
         let mut inbound_handle = tokio::spawn(async move {
-            loop {
-                let packet = match connection.read_datagram().await {
-                    Ok(p) => p,
+            let mut datagrams = vec![Bytes::new(); DATAGRAM_READ_BATCH];
+            'inbound: loop {
+                let count = match connection.read_many_datagrams(&mut datagrams).await {
+                    Ok(count) => count,
                     Err(e) => {
                         log::debug!("Client {} datagram read ended: {}", client_id, e);
                         break;
                     }
                 };
-
-                if packet_has_local_iroh_udp_port(&packet, &local_iroh_udp_ports) {
-                    log::debug!(
-                        "Dropped self-encapsulated iroh UDP packet from client {}",
-                        client_id
-                    );
-                    continue;
-                }
-
-                // Validate source IP to prevent inter-client IP spoofing. This is
-                // mandatory (the analog of WireGuard's cryptokey routing): packets
-                // are rejected only when the source IP belongs to another client,
-                // so clients can still use their own public IPs (dual-stack).
-                let source_valid = match extract_source_ip(&packet) {
-                    Some(PacketIp::V4(src_ip)) => {
-                        // Check if this IP belongs to another client
-                        match ctx.ip_to_endpoint.get(&src_ip) {
-                            Some(ref owner) if *owner.value() == ctx.client_key => true, // Our own assigned IP
-                            Some(_) => {
-                                // IP belongs to another client - actual spoofing
-                                log::warn!(
-                                    "IPv4 inter-client spoofing from client {}: source {} belongs to another client",
-                                    client_id,
-                                    src_ip
-                                );
-                                false
-                            }
-                            None => true, // Not a VPN-assigned IP - allow (e.g., client's public IP)
-                        }
+                for packet in datagrams[..count].iter_mut().map(std::mem::take) {
+                    if packet_has_local_iroh_udp_port(&packet, &local_iroh_udp_ports) {
+                        log::debug!(
+                            "Dropped self-encapsulated iroh UDP packet from client {}",
+                            client_id
+                        );
+                        continue;
                     }
-                    Some(PacketIp::V6(src_ip)) => {
-                        // Silently drop link-local packets (fe80::/10) - these are normal
-                        // OS traffic (neighbor discovery, etc.) that shouldn't be forwarded
-                        let src_bytes = src_ip.octets();
-                        let is_link_local = src_bytes[0] == 0xfe && (src_bytes[1] & 0xc0) == 0x80;
-                        if is_link_local {
-                            // Link-local IPv6 packets are dropped (can't route across VPN)
-                            false
-                        } else {
+
+                    // Validate source IP to prevent inter-client IP spoofing. This is
+                    // mandatory (the analog of WireGuard's cryptokey routing): packets
+                    // are rejected only when the source IP belongs to another client,
+                    // so clients can still use their own public IPs (dual-stack).
+                    let source_valid = match extract_source_ip(&packet) {
+                        Some(PacketIp::V4(src_ip)) => {
                             // Check if this IP belongs to another client
-                            match ctx.ip6_to_endpoint.get(&src_ip) {
+                            match ctx.ip_to_endpoint.get(&src_ip) {
                                 Some(ref owner) if *owner.value() == ctx.client_key => true, // Our own assigned IP
                                 Some(_) => {
                                     // IP belongs to another client - actual spoofing
                                     log::warn!(
-                                        "IPv6 inter-client spoofing from client {}: source {} belongs to another client",
+                                        "IPv4 inter-client spoofing from client {}: source {} belongs to another client",
                                         client_id,
                                         src_ip
                                     );
@@ -1643,49 +1618,74 @@ impl VpnServer {
                                 None => true, // Not a VPN-assigned IP - allow (e.g., client's public IP)
                             }
                         }
+                        Some(PacketIp::V6(src_ip)) => {
+                            // Silently drop link-local packets (fe80::/10) - these are normal
+                            // OS traffic (neighbor discovery, etc.) that shouldn't be forwarded
+                            let src_bytes = src_ip.octets();
+                            let is_link_local = src_bytes[0] == 0xfe && (src_bytes[1] & 0xc0) == 0x80;
+                            if is_link_local {
+                                // Link-local IPv6 packets are dropped (can't route across VPN)
+                                false
+                            } else {
+                                // Check if this IP belongs to another client
+                                match ctx.ip6_to_endpoint.get(&src_ip) {
+                                    Some(ref owner) if *owner.value() == ctx.client_key => true, // Our own assigned IP
+                                    Some(_) => {
+                                        // IP belongs to another client - actual spoofing
+                                        log::warn!(
+                                            "IPv6 inter-client spoofing from client {}: source {} belongs to another client",
+                                            client_id,
+                                            src_ip
+                                        );
+                                        false
+                                    }
+                                    None => true, // Not a VPN-assigned IP - allow (e.g., client's public IP)
+                                }
+                            }
+                        }
+                        None => {
+                            log::warn!(
+                                "Failed to parse source IP from packet from client {}",
+                                client_id
+                            );
+                            false
+                        }
+                    };
+
+                    if !source_valid {
+                        // Drop spoofed packet
+                        stats.packets_spoofed.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                    None => {
-                        log::warn!(
-                            "Failed to parse source IP from packet from client {}",
-                            client_id
-                        );
-                        false
+
+                    // Mandatory client isolation: never let one VPN client reach
+                    // another. Only client-assigned IPs live in these maps (the
+                    // server/gateway IP does not), so a hit means the destination is
+                    // another client (or self) - drop instead of writing to the TUN
+                    // and having the kernel forward it back out. This is independent
+                    // of the spoofing check (that gates the source; this gates the
+                    // destination) and needs no firewall or ip_forward.
+                    let to_vpn_client = match extract_dest_ip(&packet) {
+                        Some(PacketIp::V4(dst)) => ctx.ip_to_endpoint.contains_key(&dst),
+                        Some(PacketIp::V6(dst)) => ctx.ip6_to_endpoint.contains_key(&dst),
+                        None => false,
+                    };
+                    if to_vpn_client {
+                        stats
+                            .packets_inter_client_blocked
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                };
 
-                if !source_valid {
-                    // Drop spoofed packet
-                    stats.packets_spoofed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                // Mandatory client isolation: never let one VPN client reach
-                // another. Only client-assigned IPs live in these maps (the
-                // server/gateway IP does not), so a hit means the destination is
-                // another client (or self) - drop instead of writing to the TUN
-                // and having the kernel forward it back out. This is independent
-                // of the spoofing check (that gates the source; this gates the
-                // destination) and needs no firewall or ip_forward.
-                let to_vpn_client = match extract_dest_ip(&packet) {
-                    Some(PacketIp::V4(dst)) => ctx.ip_to_endpoint.contains_key(&dst),
-                    Some(PacketIp::V6(dst)) => ctx.ip6_to_endpoint.contains_key(&dst),
-                    None => false,
-                };
-                if to_vpn_client {
-                    stats
-                        .packets_inter_client_blocked
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                // Datagrams carry a raw IP packet with no offload metadata; move
-                // the owned Bytes straight into the TUN write request (no copy).
-                let req = TunWriteRequest {
-                    packet,
-                    offload: None,
-                };
-                if !Self::enqueue_tun_write(&tun_write_tx, req, &stats).await {
-                    break;
+                    // Datagrams carry a raw IP packet with no offload metadata; move
+                    // the owned Bytes straight into the TUN write request (no copy).
+                    let req = TunWriteRequest {
+                        packet,
+                        offload: None,
+                    };
+                    if !Self::enqueue_tun_write(&tun_write_tx, req, &stats).await {
+                        break 'inbound;
+                    }
                 }
             }
         });

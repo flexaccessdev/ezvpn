@@ -3,21 +3,23 @@
 //! (loopback only: relays and discovery disabled).
 //!
 //! The unit tests in `tunnel::stream` cover encode/decode in memory; this
-//! exercises the actual iroh I/O: `send_ip_datagrams` / `read_datagram` for the
-//! data path (including the oversized-packet drop), and `read_frame` /
+//! exercises the actual iroh I/O: `send_ip_datagrams` / `send_datagram_batch` /
+//! `read_datagram` / `read_many_datagrams` for the data path (including the
+//! oversized-packet drop and send backpressure), and `read_frame` /
 //! `write_frames` for `ServerAddrs` control frames on the stream.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use ezvpn::config::VPN_MTU;
 use ezvpn::transport::{QUIC_DATAGRAM_SEND_BUFFER_SIZE, build_quic_transport_config};
 use ezvpn::tunnel::signaling::ServerAddrsMsg;
 use ezvpn::tunnel::stream::{
-    Frame, MAX_FRAME_BODY, classify, encode_server_addrs_frame, read_frame, send_ip_datagrams,
-    write_frames,
+    DatagramSendOutcome, Frame, MAX_FRAME_BODY, classify, encode_server_addrs_frame, read_frame,
+    send_datagram_batch, send_ip_datagrams, write_frames,
 };
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 const TEST_ALPN: &[u8] = b"ezvpn-datagram-test/0";
 
@@ -149,24 +151,7 @@ async fn datagram_backpressure_preserves_queued_packets() {
     let client = bind_endpoint().await;
     let server_addr = server.addr();
 
-    let accept_task = tokio::spawn(async move {
-        let incoming = server.accept().await.expect("incoming connection");
-        let conn = incoming.await.expect("accept connection");
-        let mut received = Vec::with_capacity(PACKET_COUNT as usize);
-        // Drain until every packet arrives or the flow goes idle. A lost
-        // datagram must not wedge us on a `read_datagram` that never returns, so
-        // stop on an idle gap (or connection close) instead of a fixed count.
-        while received.len() < PACKET_COUNT as usize {
-            match tokio::time::timeout(Duration::from_secs(3), conn.read_datagram()).await {
-                Ok(Ok(datagram)) => received.push(u32::from_be_bytes(
-                    datagram[1..5].try_into().expect("sequence bytes"),
-                )),
-                // Idle gap or closed connection: the sender is done, stop.
-                Ok(Err(_)) | Err(_) => break,
-            }
-        }
-        received
-    });
+    let accept_task = spawn_sequence_receiver(server, PACKET_COUNT);
 
     let conn = client
         .connect(server_addr, TEST_ALPN)
@@ -200,6 +185,95 @@ async fn datagram_backpressure_preserves_queued_packets() {
     .await
     .expect("sender completed before timeout");
 
+    check_sequences_flowed(accept_task, PACKET_COUNT, PACKET_SIZE).await;
+
+    conn.close(0u32.into(), b"done");
+    client.close().await;
+}
+
+/// A batch far larger than the bounded send buffer is queued in runs that fit,
+/// waiting for room between them, without evicting a single datagram — the
+/// multi-datagram form of the guarantee above (a GSO super-frame's segments,
+/// or a drained server queue). The receiver drains with `read_many_datagrams`.
+#[tokio::test]
+async fn datagram_batch_waits_instead_of_evicting() {
+    const PACKET_COUNT: u32 = 1024;
+    const PACKET_SIZE: usize = 900;
+
+    let server = bind_endpoint().await;
+    let client = bind_endpoint().await;
+    let server_addr = server.addr();
+    let accept_task = spawn_sequence_receiver(server, PACKET_COUNT);
+
+    let conn = client
+        .connect(server_addr, TEST_ALPN)
+        .await
+        .expect("connect to server");
+    let batch: Vec<Bytes> = (0..PACKET_COUNT)
+        .map(|sequence| {
+            let mut packet = vec![0u8; PACKET_SIZE];
+            packet[0] = 0x45;
+            packet[1..5].copy_from_slice(&sequence.to_be_bytes());
+            Bytes::from(packet)
+        })
+        .collect();
+    assert!(
+        PACKET_COUNT as usize * PACKET_SIZE > 2 * QUIC_DATAGRAM_SEND_BUFFER_SIZE,
+        "the batch must overflow the send buffer to exercise the wait"
+    );
+
+    // Bounded for the same reason as the per-packet test: the batch send awaits
+    // queue capacity.
+    let mut outcome = DatagramSendOutcome::default();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        send_datagram_batch(&conn, &batch, &mut outcome),
+    )
+    .await
+    .expect("sender completed before timeout")
+    .expect("no terminal send error");
+    assert_eq!(outcome.sent, u64::from(PACKET_COUNT), "every datagram queued");
+    assert_eq!(outcome.dropped_other, 0, "none evicted");
+    assert_eq!(outcome.dropped_too_large, 0);
+
+    check_sequences_flowed(accept_task, PACKET_COUNT, PACKET_SIZE).await;
+
+    conn.close(0u32.into(), b"done");
+    client.close().await;
+}
+
+/// Accept one connection on `server` and collect the sequence number (bytes
+/// 1..5) of each datagram, draining with `read_many_datagrams`, until
+/// `expected` arrive or the flow goes idle. A lost datagram must not wedge the
+/// receiver on a read that never returns, so it stops on an idle gap (or
+/// connection close) instead of a fixed count.
+fn spawn_sequence_receiver(server: Endpoint, expected: u32) -> JoinHandle<Vec<u32>> {
+    tokio::spawn(async move {
+        let incoming = server.accept().await.expect("incoming connection");
+        let conn = incoming.await.expect("accept connection");
+        let mut received = Vec::with_capacity(expected as usize);
+        let mut datagrams = vec![Bytes::new(); 64];
+        while received.len() < expected as usize {
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                conn.read_many_datagrams(&mut datagrams),
+            )
+            .await
+            {
+                Ok(Ok(count)) => received.extend(datagrams[..count].iter().map(|datagram| {
+                    u32::from_be_bytes(datagram[1..5].try_into().expect("sequence bytes"))
+                })),
+                // Idle gap or closed connection: the sender is done, stop.
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        received
+    })
+}
+
+/// Check what [`spawn_sequence_receiver`] collected from a sender that queued
+/// `sent` datagrams of `packet_size` bytes.
+async fn check_sequences_flowed(accept_task: JoinHandle<Vec<u32>>, sent: u32, packet_size: usize) {
     let mut received = tokio::time::timeout(Duration::from_secs(30), accept_task)
         .await
         .expect("receiver completed before timeout")
@@ -213,7 +287,7 @@ async fn datagram_backpressure_preserves_queued_packets() {
     received.dedup();
     assert_eq!(received.len(), distinct, "no datagram delivered twice");
     assert!(
-        received.iter().all(|&sequence| sequence < PACKET_COUNT),
+        received.iter().all(|&sequence| sequence < sent),
         "every delivered datagram is one we sent"
     );
 
@@ -222,15 +296,12 @@ async fn datagram_backpressure_preserves_queued_packets() {
     // rather than the queue silently absorbing or evicting the overflow. This
     // stays clear of the exact-delivery assertion that made the test flaky while
     // still proving the queued packets flowed end-to-end.
-    let send_buffer_capacity = QUIC_DATAGRAM_SEND_BUFFER_SIZE / PACKET_SIZE;
+    let send_buffer_capacity = QUIC_DATAGRAM_SEND_BUFFER_SIZE / packet_size;
     assert!(
         received.len() > send_buffer_capacity,
         "expected more than the send buffer's {send_buffer_capacity} datagrams to arrive, got {}",
         received.len()
     );
-
-    conn.close(0u32.into(), b"done");
-    client.close().await;
 }
 
 /// A `ServerAddrs` control frame round-trips over the reliable stream.

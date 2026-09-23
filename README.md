@@ -687,10 +687,14 @@ The chosen settings are logged at startup whenever they differ from the defaults
 
 The datagram sender uses a small bounded queue and waits for QUIC's pacer during
 congestion. This prevents the non-blocking iroh API from silently replacing old
-inner packets with new ones and keeps bursts independent of platform socket
-buffer defaults. No Linux `net.core.rmem_max` or `net.core.wmem_max` tuning is
-required. iroh still uses UDP GSO/GRO or batched socket I/O where the platform
-supports it.
+inner packets with new ones. iroh still uses UDP GSO/GRO or batched socket I/O
+where the platform supports it.
+
+No Linux `net.core.rmem_max` or `net.core.wmem_max` tuning is required. iroh
+asks for 7 MiB UDP socket buffers, which Linux would otherwise cap at those
+sysctls (about 208 KiB by default), overflowing the receive queue under load.
+Because the VPN runs as root, ezvpn's transport stack sets the buffers with
+`SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`, which are not subject to the cap.
 
 ## Reconnect Behavior
 
