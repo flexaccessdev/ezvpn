@@ -79,8 +79,14 @@ shapes in [`ios/ezvpn.h`](../ios/ezvpn.h)):
    connect, handshake. Returns an opaque handle and writes the assigned network
    config (IPv4 and/or IPv6 addresses, gateway, MTU, and the computed
    `excluded_routes`/`excluded_routes6`) as JSON.
-2. `ezvpn_run(handle, utun_fd)` — start the data-stream loop on the OS-provided
-   `utun` fd (obtained after the extension applies the network settings).
+2. `ezvpn_run(handle, utun_fd, on_event, ctx)` — start the data-stream loop on
+   the OS-provided `utun` fd (obtained after the extension applies the network
+   settings). A lost session (server restart, heartbeat or idle timeout) is
+   reconnected in place with backoff; `on_event` reports `RECONNECTING` /
+   `RECONNECTED` (the extension toggles `reasserting`), `ENDED` (the extension
+   cancels the tunnel with the reason), or `RECONFIGURE` (the server handed
+   back different network settings: the extension stops the handle, connects
+   afresh and re-applies them).
 3. `ezvpn_stop(handle)` — tear down and free the handle.
 
 Plus one optional debug readout: `ezvpn_conn_path(handle, out_buf, out_len)` —

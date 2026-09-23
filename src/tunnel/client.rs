@@ -19,9 +19,10 @@ use crate::auth::ClientKey;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use crate::config::VpnClientConfig;
 use crate::tunnel::stream::{
-    DATAGRAM_READ_BATCH, FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify, read_frame,
-    send_ip_datagrams,
+    DATAGRAM_READ_BATCH, FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify, encode_heartbeat_frame,
+    read_frame, send_ip_datagrams, write_frames,
 };
+use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::net::device::{
     BypassRouteGuard, Route6Guard, RouteGuard, TunConfig, TunDevice, UnderlayGateway,
     add_bypass_route, add_routes, add_routes6_with_src, query_default_gateway,
@@ -38,7 +39,7 @@ use crate::tunnel::dns_proxy::{self, DnsProxyConfig};
 use crate::transport::paths::watch_connection_paths;
 use crate::config::VPN_MTU;
 use crate::tunnel::signaling::{
-    ClientAuthPayload, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
+    ClientAuthPayload, DataMessageType, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
     read_message, write_message,
 };
 use crate::transport::endpoint::{connect_with_timeout, RelayConfig};
@@ -889,8 +890,10 @@ pub(crate) async fn perform_handshake(
 /// [`crate::tunnel::stream`]); the handshake bi-stream (`data_send`/`data_recv`)
 /// stays open only as the control channel for server-address publications. This
 /// function shovels packets between the TUN device and datagrams, and drains
-/// control frames off the stream. Peer liveness is detected by
-/// `Connection::closed()` (QUIC keep-alive + idle timeout) — no app heartbeat.
+/// control frames off the stream. Peer liveness is detected by the application
+/// heartbeat (a `Ping` every [`HEARTBEAT_INTERVAL`], ended after
+/// [`HEARTBEAT_TIMEOUT`] without a `Pong`) and by `Connection::closed()` (QUIC
+/// keep-alive + idle timeout).
 ///
 /// `dns_proxy` enables the Android in-tunnel split-DNS forwarder
 /// ([`crate::tunnel::dns_proxy`]): packets to its proxy address are diverted
@@ -917,10 +920,10 @@ pub(crate) async fn run_tunnel(
     debug_assert_eq!(local_gso_enabled, tun_writer.offload_status().enabled);
     let buffer_size = tun_reader.buffer_size();
 
-    // The client never writes on the stream now: IP packets ride datagrams and
-    // the only stream traffic is the server -> client ServerAddrs control
-    // frames. Hold the send half so the bi-stream stays established.
-    let _data_send = data_send;
+    // IP packets ride datagrams; the client writes only heartbeat `Ping`s on
+    // the stream (heartbeat task below), and the control task hands it each
+    // `Pong` the server echoes.
+    let (pong_tx, pong_rx) = mpsc::channel::<u64>(4);
 
     // Create channel for inbound packets to decouple frame receipt from TUN
     // write syscalls. The TUN writer task owns the TunWriter.
@@ -1123,9 +1126,10 @@ pub(crate) async fn run_tunnel(
     });
 
     // Spawn control task (reliable stream -> bypass-route manager). The stream
-    // now carries only the server's periodic candidate-address publications;
-    // hand each set to the bypass-route manager (add-only, filtered to
-    // VPN-covered IPs there). Returns a disconnect reason when the stream ends.
+    // carries the server's periodic candidate-address publications, handed to
+    // the bypass-route manager (add-only, filtered to VPN-covered IPs there),
+    // and heartbeat `Pong`s, handed to the heartbeat. Returns a disconnect
+    // reason when the stream ends.
     let mut data_recv = data_recv;
     let mut control_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
         // Sink for server-published candidate addresses; `None` when no bypass
@@ -1147,6 +1151,12 @@ pub(crate) async fn run_tunnel(
             };
 
             match classify(&frame_buf[..body_len]) {
+                Ok(Frame::Pong(seq)) => {
+                    // A full channel means pongs are already pending, which
+                    // proves liveness just as well.
+                    let _ = pong_tx.try_send(seq);
+                }
+                Ok(Frame::Ping(_)) => log::trace!("Ignoring unexpected Ping from server"),
                 Ok(Frame::ServerAddrs(body)) => {
                     // `try_send` so the loop never blocks — a dropped update is
                     // recovered by the next periodic publish.
@@ -1171,14 +1181,21 @@ pub(crate) async fn run_tunnel(
         }
     });
 
-    // Spawn liveness task. There is no application heartbeat: QUIC keep-alive
-    // + idle timeout drive `Connection::closed()`, which resolves when the
-    // peer goes away (the stream tasks also notice via read/write errors).
+    // Spawn liveness task: QUIC keep-alive + idle timeout drive
+    // `Connection::closed()`, and the application heartbeat ends the session
+    // when the server's session stops answering, whatever the transport does.
     let conn_close = connection.clone();
     let mut liveness_handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
-        let reason = conn_close.closed().await;
-        log::info!("QUIC connection closed: {}", reason);
-        Some(format!("connection closed: {}", reason))
+        tokio::select! {
+            reason = conn_close.closed() => {
+                log::info!("QUIC connection closed: {}", reason);
+                Some(format!("connection closed: {}", reason))
+            }
+            reason = run_heartbeat(data_send, pong_rx) => {
+                log::warn!("{}", reason);
+                Some(reason)
+            }
+        }
     });
 
     // Wait for any task to complete (or error), then clean up all tasks
@@ -1257,6 +1274,41 @@ pub(crate) async fn run_tunnel(
 
     // Any task ending means connection is lost
     Err(VpnError::ConnectionLost(reason))
+}
+
+/// Send a `Ping` every [`HEARTBEAT_INTERVAL`] and return the disconnect reason
+/// once no `Pong` has arrived for [`HEARTBEAT_TIMEOUT`] (or the stream fails).
+/// Any `Pong` counts: the stream is reliable and ordered, so a late reply still
+/// proves the server's session is alive.
+async fn run_heartbeat(mut send: SendStream, mut pong_rx: mpsc::Receiver<u64>) -> String {
+    let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let deadline = tokio::time::sleep(HEARTBEAT_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut seq: u64 = 0;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                seq += 1;
+                let mut frame = vec![encode_heartbeat_frame(DataMessageType::Ping, seq)];
+                if let Err(e) = write_frames(&mut send, &mut frame).await {
+                    return format!("heartbeat send failed: {e}");
+                }
+            }
+            // A closed channel disables this arm: the control task ended, which
+            // ends the tunnel anyway.
+            Some(pong_seq) = pong_rx.recv() => {
+                log::trace!("Heartbeat pong {pong_seq}");
+                deadline.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_TIMEOUT);
+            }
+            _ = &mut deadline => {
+                return format!(
+                    "heartbeat timed out: no reply from the server in {}s",
+                    HEARTBEAT_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
@@ -1785,9 +1837,8 @@ async fn resolve_relay_url(
 /// client already holds, so an outage of any length is cheap to sit through
 /// while still noticing the server's return within a minute — a wait of
 /// several minutes saves little and reads as a hang to anyone watching. The
-/// mobile apps are unaffected: they run their own reconnect policy around the
-/// fd-based session and never enter this loop. Jitter keeps the retry herd
-/// spread out.
+/// Apple fd-based session's in-place reconnect (`MobileSession::run`) uses the
+/// same schedule. Jitter keeps the retry herd spread out.
 const BACKOFF_BASE_MS: u64 = 1000; // 1 second
 const BACKOFF_MAX_MS: u64 = 60_000; // 60 seconds
 const BACKOFF_JITTER_MS: u64 = 500;
@@ -1797,7 +1848,7 @@ const BACKOFF_JITTER_MS: u64 = 500;
 /// Uses exponential backoff: `base * 2^(attempt-1)`, capped at max.
 /// Adds random jitter (0-500ms) to prevent thundering herd.
 /// The cap is applied after adding jitter to ensure the total never exceeds MAX_MS.
-fn calculate_backoff(attempt: u32) -> Duration {
+pub(crate) fn calculate_backoff(attempt: u32) -> Duration {
     calculate_backoff_with_rng(attempt, &mut rand::rng())
 }
 

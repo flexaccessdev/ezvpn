@@ -40,11 +40,20 @@
 //! 2. read [`MobileSession::network_config`], apply it as
 //!    `NEPacketTunnelNetworkSettings` / `VpnService.Builder`, obtain the fd.
 //! 3. [`MobileSession::run`] — drive the tunnel over that fd until it ends.
+//!
+//! When the caller passes [`SessionEvents`] to `run` (the Apple extension
+//! does; Android does not yet), a lost session is reconnected in place, like
+//! the desktop client's reconnect loop: same endpoint, same device id, same tun
+//! fd, retried with the desktop backoff until it succeeds or the caller stops
+//! the handle. If the server hands back different network parameters (a
+//! restarted server re-allocates addresses), the fd's interface settings no
+//! longer match, so `run` ends with [`VpnError::ServerConfigChanged`] and the
+//! extension re-applies them through a fresh connect.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::RawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -58,9 +67,24 @@ use crate::net::device::TunDevice;
 use crate::transport::endpoint::{RelayConfig, connect_with_timeout, create_client_endpoint};
 use crate::tunnel::dns_proxy::DnsProxyConfig;
 use crate::tunnel::client::{
-    ServerInfo, collect_local_iroh_udp_ports, collect_relay_ips, overlapping_underlay_excludes,
-    perform_handshake, run_tunnel,
+    ServerInfo, calculate_backoff, collect_local_iroh_udp_ports, collect_relay_ips,
+    overlapping_underlay_excludes, perform_handshake, run_tunnel,
 };
+
+/// Progress of the in-place reconnect loop in [`MobileSession::run`].
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    /// The session was lost, or a reconnect attempt failed; the loop is
+    /// retrying. Carries the reason.
+    Reconnecting(String),
+    /// A new session is up with unchanged network parameters; the tunnel
+    /// carries traffic again.
+    Reconnected,
+}
+
+/// Receiver of [`SessionEvent`]s, called from the runtime. Passing one to
+/// [`MobileSession::run`] enables the reconnect loop.
+pub type SessionEvents = Arc<dyn Fn(SessionEvent) + Send + Sync>;
 
 /// Connection parameters supplied by the mobile app (built from the FFI JSON).
 #[derive(Debug)]
@@ -88,7 +112,7 @@ pub struct MobileConfig {
 ///
 /// Each family is optional, mirroring the server's assignment: IPv4-only,
 /// IPv6-only, or dual-stack.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MobileNetworkConfig {
     /// Assigned client VPN IPv4 address.
     pub assigned_ip: Option<Ipv4Addr>,
@@ -114,9 +138,8 @@ pub struct MobileNetworkConfig {
     pub excluded_routes6: Vec<String>,
 }
 
-/// A connected, handshaked-but-not-yet-running mobile tunnel session.
-pub struct MobileSession {
-    endpoint: Endpoint,
+/// One connected, handshaked server session: what a reconnect replaces.
+struct Link {
     connection: Connection,
     /// Send half of the data stream (the handshake bi-stream, kept open).
     data_send: SendStream,
@@ -124,10 +147,44 @@ pub struct MobileSession {
     data_recv: RecvStream,
     server_info: ServerInfo,
     /// IPv4 underlay `/32`s (relay + server addresses) overlapping a routed
-    /// prefix (computed at connect, see [`Self::connect`]).
+    /// prefix (computed at connect, see [`MobileSession::connect`]).
     excluded_routes: Vec<String>,
     /// IPv6 underlay `/128`s overlapping a routed prefix.
     excluded_routes6: Vec<String>,
+}
+
+impl Link {
+    fn network_config(&self) -> MobileNetworkConfig {
+        let info = &self.server_info;
+        MobileNetworkConfig {
+            assigned_ip: info.assigned_ip,
+            netmask: info.network.map(|n| n.netmask()),
+            gateway: info.server_ip,
+            assigned_ip6: info.assigned_ip6,
+            prefix_len6: info.network6.map(|n| n.prefix_len()),
+            gateway6: info.server_ip6,
+            mtu: VPN_MTU,
+            excluded_routes: self.excluded_routes.clone(),
+            excluded_routes6: self.excluded_routes6.clone(),
+        }
+    }
+}
+
+/// A connected, handshaked-but-not-yet-running mobile tunnel session.
+pub struct MobileSession {
+    endpoint: Endpoint,
+    /// Server address dialed on connect and on every reconnect.
+    server_addr: EndpointAddr,
+    client_key: ClientKey,
+    relay_config: RelayConfig,
+    routes: Vec<Ipv4Net>,
+    routes6: Vec<Ipv6Net>,
+    /// Random per-session id, kept across reconnects like the desktop client's.
+    device_id: u64,
+    link: Link,
+    /// The live connection, replaced on every reconnect, for on-demand path
+    /// snapshots (`ezvpn_conn_path`) while [`Self::run`] owns the session.
+    current_connection: Arc<Mutex<Connection>>,
     /// Forwarder configuration handed to `run_tunnel` by [`Self::run`].
     dns_proxy: Option<DnsProxyConfig>,
 }
@@ -152,77 +209,39 @@ impl MobileSession {
             addr = addr.with_relay_url(url.clone());
         }
 
-        let connection = connect_with_timeout(&endpoint, addr).await?;
-
         // Random per-session id, like the desktop client. The server keys IP
         // allocation by (endpoint id, device id).
         let device_id: u64 = rand::rng().random();
-        let (server_info, data_send, data_recv) =
-            perform_handshake(&connection, device_id, &cfg.client_key, endpoint.id()).await?;
-
-        // `perform_handshake` already guarantees at least one family was
-        // assigned, so IPv4-only, IPv6-only, and dual-stack all pass here.
-
-        // Compute the underlay bypass set, mirroring the desktop bootstrap
-        // (`add_iroh_bypass_routes`): every relay IP the endpoint may use plus
-        // the server's candidate underlay addresses, filtered to the
-        // global-scope ones a routed prefix would capture and would therefore
-        // self-capture the transport (private-scope addresses are never
-        // bypassed — see `overlapping_underlay_excludes`). The filter includes
-        // the server's advertised host prefixes, which the extension always
-        // routes even with no configured prefixes. Applied by the extension as
-        // `excludedRoutes` (see module docs).
-        let mut candidates: Vec<IpAddr> = collect_relay_ips(&endpoint, &cfg.relay_config)
-            .await
-            .into_iter()
-            .collect();
-        candidates.extend(server_info.server_addrs.iter().copied());
-        candidates.sort();
-        candidates.dedup();
-
-        let mut routed4 = cfg.routes.clone();
-        routed4.extend(server_info.network);
-        let mut routed6 = cfg.routes6.clone();
-        routed6.extend(server_info.network6);
-
-        let (excluded_routes, excluded_routes6) =
-            overlapping_underlay_excludes(&candidates, &routed4, &routed6);
-        if !excluded_routes.is_empty() || !excluded_routes6.is_empty() {
-            log::info!(
-                "Bypassing overlapping underlay addresses (reachable only off-tunnel; \
-                 reach the server through the tunnel via its VPN gateway IP): v4={:?} v6={:?}",
-                excluded_routes,
-                excluded_routes6
-            );
-        }
-
-        log::info!(
-            "mobile handshake OK: ip={:?} net={:?} gw={:?} ip6={:?} net6={:?} gw6={:?} mtu={}",
-            server_info.assigned_ip,
-            server_info.network,
-            server_info.server_ip,
-            server_info.assigned_ip6,
-            server_info.network6,
-            server_info.server_ip6,
-            VPN_MTU
-        );
+        let link = establish(
+            &endpoint,
+            addr.clone(),
+            device_id,
+            &cfg.client_key,
+            &cfg.relay_config,
+            &cfg.routes,
+            &cfg.routes6,
+        )
+        .await?;
 
         Ok(Self {
+            current_connection: Arc::new(Mutex::new(link.connection.clone())),
             endpoint,
-            connection,
-            data_send,
-            data_recv,
-            server_info,
-            excluded_routes,
-            excluded_routes6,
+            server_addr: addr,
+            client_key: cfg.client_key,
+            relay_config: cfg.relay_config,
+            routes: cfg.routes,
+            routes6: cfg.routes6,
+            device_id,
+            link,
             dns_proxy: cfg.dns_proxy,
         })
     }
 
-    /// A clone of the live iroh connection, for on-demand path snapshots
-    /// (`ezvpn_conn_path`) after [`Self::run`] has consumed the session.
-    pub fn connection(&self) -> Connection {
-        self.connection.clone()
+    /// The live iroh connection, kept current across reconnects, for
+    /// on-demand path snapshots (`ezvpn_conn_path`) after [`Self::run`] has
+    /// consumed the session.
+    pub fn connection_cell(&self) -> Arc<Mutex<Connection>> {
+        self.current_connection.clone()
     }
 
     /// A clone of the endpoint, used for live custom-relay health snapshots.
@@ -233,45 +252,100 @@ impl MobileSession {
     /// The network parameters for the extension's tunnel settings, for whichever
     /// families the server assigned (IPv4, IPv6, or both).
     pub fn network_config(&self) -> VpnResult<MobileNetworkConfig> {
-        let info = &self.server_info;
-        Ok(MobileNetworkConfig {
-            assigned_ip: info.assigned_ip,
-            netmask: info.network.map(|n| n.netmask()),
-            gateway: info.server_ip,
-            assigned_ip6: info.assigned_ip6,
-            prefix_len6: info.network6.map(|n| n.prefix_len()),
-            gateway6: info.server_ip6,
-            mtu: VPN_MTU,
-            excluded_routes: self.excluded_routes.clone(),
-            excluded_routes6: self.excluded_routes6.clone(),
-        })
+        Ok(self.link.network_config())
     }
 
     /// Drive the tunnel over the OS-provided tun fd until it ends
-    /// (peer close, idle timeout, or a fatal I/O error). Consumes the session.
+    /// (peer close, heartbeat or idle timeout, or a fatal I/O error). Consumes
+    /// the session.
+    ///
+    /// With `events`, a recoverable loss is reconnected in place instead (see
+    /// the module docs), reporting progress through `events`; `run` then ends
+    /// only on a non-recoverable error — including
+    /// [`VpnError::ServerConfigChanged`] when the new session's network
+    /// parameters differ from the ones applied to the fd. The Android DNS
+    /// forwarder cannot be restarted, so a session using it never reconnects.
     ///
     /// The two `run_tunnel` bypass hooks are `None`: the dynamic in-data-path
     /// bypass-route manager and server-address publisher channel are not used.
     /// Overlapping server underlay addresses are instead excluded statically, up
     /// front, by the extension's `NEPacketTunnelNetworkSettings` (computed in
     /// [`Self::connect`], see module docs).
-    pub async fn run(self, tun_fd: RawFd) -> VpnResult<()> {
-        let tun = TunDevice::from_raw_fd(tun_fd, VPN_MTU)?;
-
+    pub async fn run(self, tun_fd: RawFd, events: Option<SessionEvents>) -> VpnResult<()> {
+        let events = events.filter(|_| self.dns_proxy.is_none());
+        let applied = self.link.network_config();
         let local_iroh_udp_ports: Arc<HashSet<u16>> =
             Arc::new(collect_local_iroh_udp_ports(&self.endpoint));
+        let mut dns_proxy = self.dns_proxy;
+        let mut link = self.link;
+        loop {
+            // `run_tunnel` consumes the device; wrap a fresh dup of the same fd
+            // for each session.
+            let tun = TunDevice::from_raw_fd(tun_fd, VPN_MTU)?;
+            let lost = match run_tunnel(
+                tun,
+                link.connection,
+                link.data_send,
+                link.data_recv,
+                None,
+                None,
+                local_iroh_udp_ports.clone(),
+                dns_proxy.take(),
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            let Some(events) = &events else {
+                return Err(lost);
+            };
+            if !lost.is_recoverable() {
+                return Err(lost);
+            }
+            log::warn!("Session lost: {lost}; reconnecting");
+            events(SessionEvent::Reconnecting(lost.to_string()));
 
-        run_tunnel(
-            tun,
-            self.connection,
-            self.data_send,
-            self.data_recv,
-            None,
-            None,
-            local_iroh_udp_ports,
-            self.dns_proxy,
-        )
-        .await
+            let mut failures = 0u32;
+            link = loop {
+                failures = failures.saturating_add(1);
+                let delay = calculate_backoff(failures);
+                tokio::time::sleep(delay).await;
+                match establish(
+                    &self.endpoint,
+                    self.server_addr.clone(),
+                    self.device_id,
+                    &self.client_key,
+                    &self.relay_config,
+                    &self.routes,
+                    &self.routes6,
+                )
+                .await
+                {
+                    Ok(link) => break link,
+                    Err(e) if e.is_recoverable() => {
+                        log::warn!("Reconnect attempt {failures} failed: {e}");
+                        events(SessionEvent::Reconnecting(e.to_string()));
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+
+            let params = link.network_config();
+            if params != applied {
+                // The interface was configured for the old parameters. Release
+                // the new session's lease now; the caller reconnects afresh.
+                link.connection.close(0u32.into(), b"client reconfiguring");
+                return Err(VpnError::ServerConfigChanged(format!(
+                    "network parameters changed on reconnect (was {applied:?}, now {params:?})"
+                )));
+            }
+            if let Ok(mut current) = self.current_connection.lock() {
+                *current = link.connection.clone();
+            }
+            log::info!("Session reconnected");
+            events(SessionEvent::Reconnected);
+        }
     }
 
     /// Close the iroh endpoint, tearing down the connection. Used when the app
@@ -279,4 +353,75 @@ impl MobileSession {
     pub async fn close(self) {
         self.endpoint.close().await;
     }
+}
+
+/// Dial the server and handshake: one [`Link`], with its underlay bypass set.
+async fn establish(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    device_id: u64,
+    client_key: &ClientKey,
+    relay_config: &RelayConfig,
+    routes: &[Ipv4Net],
+    routes6: &[Ipv6Net],
+) -> VpnResult<Link> {
+    let connection = connect_with_timeout(endpoint, addr).await?;
+    let (server_info, data_send, data_recv) =
+        perform_handshake(&connection, device_id, client_key, endpoint.id()).await?;
+
+    // `perform_handshake` already guarantees at least one family was
+    // assigned, so IPv4-only, IPv6-only, and dual-stack all pass here.
+
+    // Compute the underlay bypass set, mirroring the desktop bootstrap
+    // (`add_iroh_bypass_routes`): every relay IP the endpoint may use plus
+    // the server's candidate underlay addresses, filtered to the
+    // global-scope ones a routed prefix would capture and would therefore
+    // self-capture the transport (private-scope addresses are never
+    // bypassed — see `overlapping_underlay_excludes`). The filter includes
+    // the server's advertised host prefixes, which the extension always
+    // routes even with no configured prefixes. Applied by the extension as
+    // `excludedRoutes` (see module docs).
+    let mut candidates: Vec<IpAddr> = collect_relay_ips(endpoint, relay_config)
+        .await
+        .into_iter()
+        .collect();
+    candidates.extend(server_info.server_addrs.iter().copied());
+    candidates.sort();
+    candidates.dedup();
+
+    let mut routed4 = routes.to_vec();
+    routed4.extend(server_info.network);
+    let mut routed6 = routes6.to_vec();
+    routed6.extend(server_info.network6);
+
+    let (excluded_routes, excluded_routes6) =
+        overlapping_underlay_excludes(&candidates, &routed4, &routed6);
+    if !excluded_routes.is_empty() || !excluded_routes6.is_empty() {
+        log::info!(
+            "Bypassing overlapping underlay addresses (reachable only off-tunnel; \
+             reach the server through the tunnel via its VPN gateway IP): v4={:?} v6={:?}",
+            excluded_routes,
+            excluded_routes6
+        );
+    }
+
+    log::info!(
+        "mobile handshake OK: ip={:?} net={:?} gw={:?} ip6={:?} net6={:?} gw6={:?} mtu={}",
+        server_info.assigned_ip,
+        server_info.network,
+        server_info.server_ip,
+        server_info.assigned_ip6,
+        server_info.network6,
+        server_info.server_ip6,
+        VPN_MTU
+    );
+
+    Ok(Link {
+        connection,
+        data_send,
+        data_recv,
+        server_info,
+        excluded_routes,
+        excluded_routes6,
+    })
 }

@@ -356,6 +356,7 @@ async fn server_addrs_frame_roundtrips_over_stream() {
         Frame::ServerAddrs(body) => {
             assert_eq!(ServerAddrsMsg::decode(body).expect("decode addrs"), addrs_msg);
         }
+        other => panic!("unexpected frame {other:?}"),
     }
 
     conn.close(0u32.into(), b"done");

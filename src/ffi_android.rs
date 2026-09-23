@@ -173,12 +173,15 @@ pub extern "system" fn Java_dev_flexaccess_ezvpn_EzvpnNative_run<'local>(
         log::error!("ezvpn run: EzvpnNative.init was not called");
         return -1;
     }
-    let hook = Box::new(move |result: Result<(), String>| {
+    // No reconnect events: the Kotlin service tears down on exit and runs its
+    // own policy, so the in-place reconnect loop stays off here.
+    let hook = Box::new(move |result: &crate::error::VpnResult<()>| {
         if let Some((vm, class_ref)) = JVM.get() {
+            let result = result.as_ref().map(|_| ()).map_err(|e| e.to_string());
             notify_tunnel_exit(vm, class_ref, handle, result);
         }
     });
-    match handle_ref.run(tun_fd as c_int, Some(hook)) {
+    match handle_ref.run(tun_fd as c_int, Some(hook), None) {
         Ok(()) => 0,
         Err(e) => {
             log::error!("ezvpn run: {e}");

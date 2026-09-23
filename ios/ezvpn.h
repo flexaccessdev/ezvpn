@@ -10,8 +10,10 @@
  *        On success `buf` holds the network-config JSON; use it to build
  *        NEPacketTunnelNetworkSettings, then setTunnelNetworkSettings.
  *        On error `buf` holds the error message.
- *   2. ezvpn_run(handle, utunFd)            -> 0 on success, -1 on error
+ *   2. ezvpn_run(handle, utunFd, onEvent, ctx) -> 0 on success, -1 on error
  *        Pass the utun file descriptor obtained after the settings apply.
+ *        A lost session is reconnected in place; onEvent reports progress
+ *        (reasserting) and the final end or a needed reconfigure.
  *   3. ezvpn_stop(handle)                   (in stopTunnel / on teardown)
  *
  * All functions are NULL-safe and never unwind into Swift.
@@ -107,12 +109,45 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
 EzvpnHandle *ezvpn_connect(const char *config_json, char *out_buf, size_t out_len);
 
 /*
+ * Events reported by ezvpn_run's callback. RECONNECTING and RECONNECTED may
+ * repeat; ENDED and RECONFIGURE are final (the loop is over, but the handle
+ * must still be passed to ezvpn_stop).
+ *
+ *   RECONNECTING  the session was lost (server restart, heartbeat or idle
+ *                 timeout) or a reconnect attempt failed; retrying with
+ *                 backoff. message = reason.
+ *   RECONNECTED   a new session is up with unchanged network settings; the
+ *                 tunnel carries traffic again. message = NULL.
+ *   ENDED         the tunnel ended for good (e.g. authentication rejected).
+ *                 message = reason, or NULL for a clean end.
+ *   RECONFIGURE   the server handed back different network settings (e.g. a
+ *                 restarted server re-allocated the address): the applied
+ *                 settings are stale; ezvpn_stop and connect afresh.
+ *                 message = the change.
+ */
+#define EZVPN_EVENT_RECONNECTING 1
+#define EZVPN_EVENT_RECONNECTED  2
+#define EZVPN_EVENT_ENDED        3
+#define EZVPN_EVENT_RECONFIGURE  4
+
+/*
+ * Called on a library thread for each ezvpn_run event. `ctx` is the pointer
+ * given to ezvpn_run; `message` is valid only during the call, or NULL. Never
+ * called after ezvpn_stop.
+ */
+typedef void (*ezvpn_event_cb)(void *ctx, int event, const char *message);
+
+/*
  * Start the tunnel data loop on the given utun fd. The library dups the fd
  * synchronously before returning, so the caller may close its own copy as soon
  * as this returns. Returns 0 on success, -1 on error (NULL handle, no pending
  * session, fd dup failure, or already running).
+ *
+ * A lost session is reconnected in place on the same fd for as long as the
+ * handle runs. on_event may be NULL. When set, `ctx` must stay valid until
+ * ezvpn_stop is called on this handle.
  */
-int ezvpn_run(EzvpnHandle *handle, int tun_fd);
+int ezvpn_run(EzvpnHandle *handle, int tun_fd, ezvpn_event_cb on_event, void *ctx);
 
 /*
  * Snapshot the live connection's iroh path(s) as JSON into out_buf, mirroring

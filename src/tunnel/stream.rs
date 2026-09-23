@@ -15,10 +15,14 @@
 //! forwarded on the wire.
 //!
 //! The reliable bidirectional stream opened for the handshake stays open as the
-//! **control channel**, carrying only `ServerAddrs` (0x01) publications framed as
+//! **control channel**, carrying `ServerAddrs` (0x01) publications framed as
 //! `[len: u32 BE] [type: 0x01] [json]` (see [`encode_server_addrs_frame`] /
-//! [`read_frame`]). Reliability matters there (add-only bypass routes), and the
-//! open stream keeps QUIC keep-alive/liveness working.
+//! [`read_frame`]) and the application heartbeat: the client sends a `Ping`
+//! (0x02) every `HEARTBEAT_INTERVAL` and the server echoes it as a `Pong` (0x03),
+//! each `[len: u32 BE] [type] [seq: u64 BE]` ([`encode_heartbeat_frame`]).
+//! Reliability matters there (add-only bypass routes), and the heartbeat proves
+//! the peer's *session* is alive end to end, which QUIC keep-alive alone does
+//! not (see `HEARTBEAT_TIMEOUT`).
 
 use crate::error::{VpnError, VpnResult};
 use crate::tunnel::offload::{VIRTIO_NET_HDR_LEN, VirtioNetHdr, materialize_offload_into};
@@ -55,7 +59,14 @@ pub enum Frame<'a> {
     /// Server-published candidate-address message body (everything after the
     /// type byte): pass to [`ServerAddrsMsg::decode`]. Server → client only.
     ServerAddrs(&'a [u8]),
+    /// Heartbeat request with its sequence number. Client → server only.
+    Ping(u64),
+    /// Heartbeat reply echoing the request's sequence number. Server → client only.
+    Pong(u64),
 }
+
+/// Body length of a heartbeat frame: type byte + `u64` sequence number.
+const HEARTBEAT_BODY_LEN: usize = 1 + 8;
 
 /// Outcome of mapping an IP packet to one or more unreliable QUIC datagrams.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +273,16 @@ pub fn classify(body: &[u8]) -> VpnResult<Frame<'_>> {
     };
     match DataMessageType::from_byte(type_byte) {
         Some(DataMessageType::ServerAddrs) => Ok(Frame::ServerAddrs(rest)),
+        Some(kind @ (DataMessageType::Ping | DataMessageType::Pong)) => {
+            let seq = <[u8; 8]>::try_from(rest).map(u64::from_be_bytes).map_err(|_| {
+                VpnError::Signaling(format!("Heartbeat frame body of {} bytes", body.len()))
+            })?;
+            Ok(if kind == DataMessageType::Ping {
+                Frame::Ping(seq)
+            } else {
+                Frame::Pong(seq)
+            })
+        }
         None => Err(VpnError::Signaling(format!(
             "Unknown frame message type: 0x{:02x}",
             type_byte
@@ -287,6 +308,17 @@ pub fn encode_server_addrs_frame(buf: &mut BytesMut, msg: &ServerAddrsMsg) -> Vp
     buf.put_u8(DataMessageType::ServerAddrs.as_byte());
     buf.put_slice(&body);
     Ok(total)
+}
+
+/// Encode a heartbeat frame (`kind` is [`DataMessageType::Ping`] or
+/// [`DataMessageType::Pong`]). Layout: `[len: u32 BE] [type] [seq: u64 BE]`.
+pub fn encode_heartbeat_frame(kind: DataMessageType, seq: u64) -> Bytes {
+    debug_assert!(matches!(kind, DataMessageType::Ping | DataMessageType::Pong));
+    let mut buf = BytesMut::with_capacity(FRAME_LEN_PREFIX + HEARTBEAT_BODY_LEN);
+    buf.put_u32(HEARTBEAT_BODY_LEN as u32);
+    buf.put_u8(kind.as_byte());
+    buf.put_u64(seq);
+    buf.freeze()
 }
 
 /// Copy a packet out of a (reused) receive buffer into a long-lived arena and
@@ -386,7 +418,26 @@ mod tests {
                 let decoded = ServerAddrsMsg::decode(payload).expect("decode body");
                 assert_eq!(decoded, msg);
             }
+            other => panic!("unexpected frame {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_heartbeat_frame_roundtrip() {
+        let ping = encode_heartbeat_frame(DataMessageType::Ping, 7);
+        let (len, body) = split_frame(&ping);
+        assert_eq!(len, HEARTBEAT_BODY_LEN);
+        assert!(matches!(classify(body).expect("classify ping"), Frame::Ping(7)));
+
+        let pong = encode_heartbeat_frame(DataMessageType::Pong, u64::MAX);
+        let (_, body) = split_frame(&pong);
+        assert!(matches!(classify(body).expect("classify pong"), Frame::Pong(u64::MAX)));
+    }
+
+    #[test]
+    fn test_heartbeat_frame_wrong_length_rejected() {
+        assert!(classify(&[DataMessageType::Ping.as_byte()]).is_err());
+        assert!(classify(&[DataMessageType::Pong.as_byte(), 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
     }
 
     // The prefix is what `send_datagram_batch` hands to the evicting batch send,
