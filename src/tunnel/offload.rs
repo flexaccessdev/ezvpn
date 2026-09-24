@@ -523,38 +523,38 @@ where
         _ => return Err(format!("unsupported IP version {}", version)),
     }
 
-    let header_len = usize::from(offload.hdr_len);
-    if header_len == 0 || header_len > ip_packet.len() {
+    // The kernel's `hdr_len` is not trusted: it is `skb_headlen()`, which for
+    // a GRO'd packet on the FORWARD path (a LAN host behind the server sending
+    // to a client) covers payload too — up to the whole first segment. Using
+    // it as the header length duplicated payload into every segment. Derive
+    // the header length from the TCP header instead, as wireguard-go does.
+    let tcp_offset = if offload.needs_checksum() {
+        usize::from(offload.csum_start)
+    } else {
+        ip_header_len_for_tcp(ip_packet, version)?
+    };
+    if tcp_offset + 20 > ip_packet.len() {
         return Err(format!(
-            "invalid offload hdr_len {} for packet length {}",
-            header_len,
+            "invalid TCP offset {} for packet length {}",
+            tcp_offset,
             ip_packet.len()
         ));
     }
 
-    let tcp_offset = usize::from(offload.csum_start);
-    if tcp_offset + 20 > header_len {
-        return Err(format!(
-            "invalid csum_start {} for header_len {}",
-            tcp_offset, header_len
-        ));
-    }
-
     let tcp_header_len = usize::from(ip_packet[tcp_offset + 12] >> 4) * 4;
-    if tcp_header_len < 20 || tcp_offset + tcp_header_len > header_len {
+    let header_len = tcp_offset + tcp_header_len;
+    if tcp_header_len < 20 || header_len > ip_packet.len() {
         return Err(format!(
-            "invalid TCP header length {} (offset {}, header_len {})",
-            tcp_header_len, tcp_offset, header_len
+            "invalid TCP header length {} (offset {}, packet length {})",
+            tcp_header_len,
+            tcp_offset,
+            ip_packet.len()
         ));
     }
 
-    let checksum_index = tcp_offset + usize::from(offload.csum_offset);
-    if checksum_index + 2 > header_len {
-        return Err(format!(
-            "invalid csum_offset {} (checksum index {} beyond header_len {})",
-            offload.csum_offset, checksum_index, header_len
-        ));
-    }
+    // The TCP checksum field sits at a fixed offset; `csum_offset` is only
+    // meaningful with NEEDS_CSUM.
+    let checksum_index = tcp_offset + 16;
 
     let payload = &ip_packet[header_len..];
     let gso_size = usize::from(offload.gso_size);
@@ -625,6 +625,28 @@ where
     }
 
     Ok(())
+}
+
+/// Offset of the TCP header in a GSO packet that carries no `csum_start`
+/// (no NEEDS_CSUM). IPv6 extension headers are not walked: the kernel always
+/// marks those GSO packets NEEDS_CSUM, so `csum_start` covers them.
+fn ip_header_len_for_tcp(ip_packet: &[u8], version: u8) -> Result<usize, String> {
+    match version {
+        4 => {
+            let ihl = usize::from(ip_packet[0] & 0x0f) * 4;
+            if ihl < 20 || ip_packet.len() < ihl || ip_packet[9] != 6 {
+                return Err("IPv4 GSO packet is not plain TCP".to_string());
+            }
+            Ok(ihl)
+        }
+        6 => {
+            if ip_packet.len() < 40 || ip_packet[6] != 6 {
+                return Err("IPv6 GSO packet is not plain TCP".to_string());
+            }
+            Ok(40)
+        }
+        _ => Err(format!("unsupported IP version {}", version)),
+    }
 }
 
 /// Software fallback: segment a TCP GSO packet into plain TCP packets.
@@ -1137,6 +1159,66 @@ mod tests {
             assert_tcp_checksum_valid(&segment);
             assert_eq!(segment[0] >> 4, 6);
         }
+    }
+
+    /// Segments must be the original packet cut at `gso_size`: header + the
+    /// right payload slice, contiguous sequence numbers, valid checksums.
+    fn assert_segments_reassemble(segments: &[Vec<u8>], packet: &[u8], gso_size: usize) {
+        let header_len = 40;
+        let mut payload = Vec::new();
+        for segment in segments {
+            assert_tcp_checksum_valid(segment);
+            assert!(segment.len() <= header_len + gso_size, "segment exceeds MSS");
+            let seq = u32::from_be_bytes(segment[24..28].try_into().unwrap());
+            assert_eq!(seq, 10_000 + payload.len() as u32, "sequence gap");
+            payload.extend_from_slice(&segment[header_len..]);
+        }
+        assert_eq!(payload, packet[header_len..], "payload not preserved");
+    }
+
+    #[test]
+    fn test_segment_tcp_gso_ignores_forwarded_hdr_len() {
+        // On the FORWARD path the kernel reports `hdr_len = skb_headlen()`,
+        // which for a GRO'd packet spans the whole first segment. Trusting it
+        // duplicated payload into every segment (oversized, corrupt TCP), so
+        // traffic from LAN hosts behind the server to a client stalled.
+        let gso_size = 1200;
+        let packet = build_ipv4_tcp_packet(3500);
+        let partial = make_ipv4_tcp_partial_checksum(&packet);
+        let offload = VirtioNetHdr {
+            flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+            gso_type: VIRTIO_NET_HDR_GSO_TCPV4,
+            hdr_len: 40 + gso_size as u16,
+            gso_size: gso_size as u16,
+            csum_start: 20,
+            csum_offset: 16,
+            num_buffers: 0,
+        };
+
+        let segments = segment_tcp_gso_packet(&offload, &partial).expect("segment");
+        assert_eq!(segments.len(), 3);
+        assert_segments_reassemble(&segments, &packet, gso_size);
+    }
+
+    #[test]
+    fn test_segment_tcp_gso_without_csum_metadata() {
+        // A GSO packet without NEEDS_CSUM carries no csum_start/csum_offset;
+        // the TCP header is located from the IP header instead.
+        let gso_size = 1000;
+        let packet = build_ipv4_tcp_packet(2600);
+        let offload = VirtioNetHdr {
+            flags: VIRTIO_NET_HDR_F_DATA_VALID,
+            gso_type: VIRTIO_NET_HDR_GSO_TCPV4,
+            hdr_len: 0,
+            gso_size: gso_size as u16,
+            csum_start: 0,
+            csum_offset: 0,
+            num_buffers: 0,
+        };
+
+        let segments = segment_tcp_gso_packet(&offload, &packet).expect("segment");
+        assert_eq!(segments.len(), 3);
+        assert_segments_reassemble(&segments, &packet, gso_size);
     }
 
     #[test]
