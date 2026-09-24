@@ -77,7 +77,8 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
  *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"]}
  *   auth_key is the client's ed25519 secret key; its public half must be on
  *   the server's authorized_keys file. It and server_node_id are required;
- *   relay_urls, relay_auth_token, routes, and routes6 are optional.
+ *   relay_urls, relay_auth_token, routes, routes6, and exclude_direct_paths
+ *   are optional.
  *   An optional "dns_proxy" object is accepted only by the Android build (the
  *   in-tunnel split-DNS forwarder, see docs/Android-App.md); Apple callers
  *   must not send it.
@@ -91,6 +92,9 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
  *   routed prefix overlaps the local network, so they are unreachable
  *   off-tunnel anyway, and excluding them would blackhole tunnel destinations
  *   that share the server's LAN address, e.g. a DNS server on the VPN host).
+ *   exclude_direct_paths lists networks (CIDR strings, e.g. "100.64.0.0/10")
+ *   whose server addresses must never carry the tunnel as a direct path, to
+ *   keep it from riding another VPN; the relay and other direct paths remain.
  * out_buf/out_len : caller buffer. On success receives the network-config JSON
  *   (per-family fields are null when that family was not assigned):
  *   {"assigned_ip":"10.0.0.2","netmask":"255.255.255.255","gateway":"10.0.0.1",

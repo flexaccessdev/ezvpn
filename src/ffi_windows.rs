@@ -73,7 +73,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 use tokio::sync::Notify;
 
@@ -115,6 +115,10 @@ struct FfiWinConfig {
     routes: Vec<String>,
     #[serde(default)]
     routes6: Vec<String>,
+    /// Networks (CIDR strings) whose server addresses must never carry the
+    /// tunnel as a direct path, e.g. another VPN's range.
+    #[serde(default)]
+    exclude_direct_paths: Vec<String>,
     #[serde(default = "default_instance")]
     instance: String,
     #[serde(default = "default_true")]
@@ -286,6 +290,8 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
     };
 
+    let exclude_direct_paths =
+        parse_routes::<IpNet>(&cfg.exclude_direct_paths, "excluded direct-path network")?;
     let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
         .map_err(|e| format!("{e:#}"))?;
     let instance = cfg.instance;
@@ -321,7 +327,7 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
             };
 
             runtime.block_on(async move {
-                let endpoint = match create_client_endpoint(&relay_config).await {
+                let endpoint = match create_client_endpoint(&relay_config, &exclude_direct_paths).await {
                     Ok(e) => e,
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create iroh endpoint: {e}")));

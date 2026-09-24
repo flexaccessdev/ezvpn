@@ -142,3 +142,17 @@ server_node_id = "changeme"
 # URLs above are what reach the server. It is NOT real/VPN DNS. See "Relay and
 # Address Lookup" in README.md and https://github.com/flexaccessdev/iroh-common-architecture
 # for the full design.
+
+# ============================================================================
+# Excluded Direct Paths (optional)
+# ============================================================================
+# The server advertises every local address it has as a direct-path candidate,
+# including the address of another VPN it runs. When this client is on that VPN
+# too, ezvpn can end up carried inside it (e.g. over Tailscale). List the
+# networks whose server addresses must never carry the tunnel as a direct
+# path; other direct paths and the relay are unaffected (with no other direct
+# path, the relay carries it). Empty by default, since running over another
+# private network is sometimes exactly what is wanted. CLI --exclude-direct-path
+# replaces this list.
+# Tailscale:
+# exclude_direct_paths = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]

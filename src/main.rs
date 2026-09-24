@@ -215,6 +215,13 @@ enum ClientAction {
         #[arg(long = "route6")]
         routes6: Vec<String>,
 
+        /// Never carry the tunnel over a direct path to a server address in
+        /// this network (CIDR, repeatable), e.g. another VPN's range:
+        /// --exclude-direct-path 100.64.0.0/10. Replaces the configured
+        /// [iroh].exclude_direct_paths.
+        #[arg(long = "exclude-direct-path")]
+        exclude_direct_paths: Vec<String>,
+
         /// Enable auto-reconnect (override config's auto_reconnect = false)
         #[arg(long, conflicts_with = "no_auto_reconnect")]
         auto_reconnect: bool,
@@ -358,6 +365,7 @@ fn main() -> Result<()> {
                     auth_key_file,
                     routes,
                     routes6,
+                    exclude_direct_paths,
                     auto_reconnect,
                     no_auto_reconnect,
                     max_reconnect_attempts,
@@ -377,6 +385,7 @@ fn main() -> Result<()> {
                 auth_key_file,
                 routes,
                 routes6,
+                exclude_direct_paths,
                 auto_reconnect,
                 no_auto_reconnect,
                 max_reconnect_attempts,
@@ -503,6 +512,7 @@ fn prepare_client_start(
     auth_key_file: Option<PathBuf>,
     routes: Vec<String>,
     routes6: Vec<String>,
+    exclude_direct_paths: Vec<String>,
     auto_reconnect: bool,
     no_auto_reconnect: bool,
     max_reconnect_attempts: Option<NonZeroU32>,
@@ -544,6 +554,7 @@ fn prepare_client_start(
             routes6,
             relay_urls,
             relay_auth_token,
+            exclude_direct_paths,
             auto_reconnect_opt,
             max_reconnect_attempts,
         )
@@ -1039,7 +1050,10 @@ async fn run_vpn_client(
 
     // Create iroh endpoint for signaling (ephemeral identity - no persistent
     // secret key).
-    let endpoint = create_client_endpoint(&resolved.relay_config)
+    for net in &resolved.exclude_direct_paths {
+        log::info!("Excluding direct paths to {net}");
+    }
+    let endpoint = create_client_endpoint(&resolved.relay_config, &resolved.exclude_direct_paths)
         .await
         .context("Failed to create iroh endpoint")?;
 

@@ -6,9 +6,11 @@
 
 use crate::error::{VpnError, VpnResult};
 use crate::transport::build_quic_transport_config;
+use crate::transport::path_selector::ExcludingPathSelector;
 use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use ipnet::IpNet;
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
 };
@@ -17,6 +19,7 @@ use iroh::{
     endpoint::{Builder as EndpointBuilder, Connection},
 };
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use flexaccess_iroh::relay::RelayConfig;
@@ -125,8 +128,20 @@ pub async fn create_server_endpoint(
 /// Same relay probe and online wait as the server. A relay that failed the
 /// probe stays out for the client's lifetime: it lives one session and runs
 /// no failover.
-pub async fn create_client_endpoint(relay_config: &RelayConfig) -> Result<Endpoint> {
-    let CreatedEndpoint { endpoint, .. } =
-        create_endpoint(relay_config, base_builder(relay_config, false)?).await?;
+///
+/// A non-empty `exclude_direct_paths` installs [`ExcludingPathSelector`], so no
+/// direct path to a server address in those networks carries the tunnel;
+/// empty keeps iroh's default selector.
+pub async fn create_client_endpoint(
+    relay_config: &RelayConfig,
+    exclude_direct_paths: &[IpNet],
+) -> Result<Endpoint> {
+    let mut builder = base_builder(relay_config, false)?;
+    if !exclude_direct_paths.is_empty() {
+        builder = builder.path_selector(Arc::new(ExcludingPathSelector::new(
+            exclude_direct_paths.to_vec(),
+        )));
+    }
+    let CreatedEndpoint { endpoint, .. } = create_endpoint(relay_config, builder).await?;
     Ok(endpoint)
 }

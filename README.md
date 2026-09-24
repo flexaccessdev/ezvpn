@@ -349,6 +349,7 @@ machine-readable output.
 | `--route <CIDR>` | Additional IPv4 route through the VPN; repeatable |
 | `--route6 <CIDR>` | Additional IPv6 route through the VPN; repeatable |
 | `--relay-url <URL>` | Custom relay URL; repeatable |
+| `--exclude-direct-path <CIDR>` | Never carry the tunnel over a direct path to a server address in this network, e.g. another VPN's range; repeatable; replaces `[iroh].exclude_direct_paths` (see [Excluding Direct Paths](#excluding-direct-paths)) |
 | `--auto-reconnect` | Force-enable reconnect |
 | `--no-auto-reconnect` | Exit on the first failed connection attempt or drop instead of retrying |
 | `--max-reconnect-attempts <N>` | Cap consecutive retries before giving up (unlimited if unset) |
@@ -790,6 +791,26 @@ the tunnel, set OS-level conditional forwarding — see
 
 See the relay comments in `vpn_server.toml.example` and
 `vpn_client.toml.example` for exact TOML syntax.
+
+### Excluding Direct Paths
+
+The server advertises every local address it has as a direct-path candidate,
+including the address of another VPN it runs. When the client is on that VPN
+too, the overlay path is usually the fastest, and ezvpn ends up carried inside
+the other VPN (e.g. over Tailscale's `100.x` addresses). That is sometimes the
+point — reaching a private network through another private network — so it is
+not blocked by default: an overlay cannot be told apart from a LAN by address.
+To keep the tunnel off it, list the overlay's networks on the client:
+
+```toml
+[iroh]
+exclude_direct_paths = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]  # Tailscale
+```
+
+or pass `--exclude-direct-path` (repeatable). Direct paths to those server
+addresses never carry the tunnel; any other direct path is used, and with none
+the relay carries it. iroh still sends its small path probes to the excluded
+addresses.
 
 ## Running as a Service
 

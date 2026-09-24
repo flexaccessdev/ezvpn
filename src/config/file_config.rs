@@ -87,6 +87,10 @@ pub struct VpnClientIrohConfig {
     /// Optional shared bearer token sent to the custom relays as
     /// `Authorization: Bearer <token>`. Only valid together with `relay_urls`.
     pub relay_auth_token: Option<String>,
+    /// Networks (CIDRs) whose server addresses must never carry the tunnel as
+    /// a direct path, e.g. another VPN's range such as Tailscale's
+    /// `100.64.0.0/10`. Other direct paths and the relay are unaffected.
+    pub exclude_direct_paths: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -402,6 +406,7 @@ pub struct ResolvedVpnClientConfig {
     pub routes: Vec<String>,
     pub routes6: Vec<String>,
     pub relay_config: RelayConfig,
+    pub exclude_direct_paths: Vec<ipnet::IpNet>,
     pub auto_reconnect: bool,
     pub max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -415,6 +420,7 @@ pub struct VpnClientConfigBuilder {
     routes6: Option<Vec<String>>,
     relay_urls: Option<Vec<String>>,
     relay_auth_token: Option<String>,
+    exclude_direct_paths: Option<Vec<String>>,
     auto_reconnect: Option<bool>,
     max_reconnect_attempts: Option<NonZeroU32>,
 }
@@ -442,6 +448,9 @@ impl VpnClientConfigBuilder {
                 }
                 if iroh.relay_auth_token.is_some() {
                     self.relay_auth_token = iroh.relay_auth_token.clone();
+                }
+                if iroh.exclude_direct_paths.is_some() {
+                    self.exclude_direct_paths = iroh.exclude_direct_paths.clone();
                 }
             }
             if cfg.auth.auth_key_file.is_some() {
@@ -473,6 +482,7 @@ impl VpnClientConfigBuilder {
         routes6: Vec<String>,
         relay_urls: Vec<String>,
         relay_auth_token: Option<String>,
+        exclude_direct_paths: Vec<String>,
         auto_reconnect: Option<bool>,
         max_reconnect_attempts: Option<NonZeroU32>,
     ) -> Self {
@@ -497,6 +507,9 @@ impl VpnClientConfigBuilder {
         }
         if relay_auth_token.is_some() {
             self.relay_auth_token = relay_auth_token;
+        }
+        if !exclude_direct_paths.is_empty() {
+            self.exclude_direct_paths = Some(exclude_direct_paths);
         }
         if auto_reconnect.is_some() {
             self.auto_reconnect = auto_reconnect;
@@ -525,6 +538,19 @@ impl VpnClientConfigBuilder {
             validate_ipv6_cidr(route6).with_context(|| route6_context(route6, Some("config")))?;
         }
 
+        let exclude_direct_paths = self
+            .exclude_direct_paths
+            .unwrap_or_default()
+            .iter()
+            .map(|net| {
+                net.parse::<ipnet::IpNet>().with_context(|| {
+                    format!(
+                        "Invalid exclude_direct_paths CIDR '{net}' (e.g., 100.64.0.0/10 or fd7a:115c:a1e0::/48)"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         if self.auth_key.is_some() && self.auth_key_file.is_some() {
             anyhow::bail!(
                 "Cannot specify both auth_key and auth_key_file. Use one source for auth."
@@ -541,6 +567,7 @@ impl VpnClientConfigBuilder {
                 self.relay_urls.as_deref().unwrap_or_default(),
                 self.relay_auth_token,
             )?,
+            exclude_direct_paths,
             auto_reconnect: self.auto_reconnect.unwrap_or(true),
             max_reconnect_attempts: self.max_reconnect_attempts,
         })
@@ -696,6 +723,78 @@ relay_auth_token = "shared-secret"
         assert_eq!(
             resolved.relay_config.relay_auth_token(),
             Some("shared-secret")
+        );
+    }
+
+    #[test]
+    fn test_client_exclude_direct_paths_config_and_cli_override() {
+        let config: VpnClientConfig = toml::from_str(
+            r#"
+role = "vpnclient"
+
+[iroh]
+server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+exclude_direct_paths = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+"#,
+        )
+        .unwrap();
+        let resolved = VpnClientConfigBuilder::new()
+            .apply_defaults()
+            .apply_config(Some(&config))
+            .build()
+            .unwrap();
+        assert_eq!(
+            resolved.exclude_direct_paths,
+            vec![
+                "100.64.0.0/10".parse::<ipnet::IpNet>().unwrap(),
+                "fd7a:115c:a1e0::/48".parse().unwrap(),
+            ]
+        );
+
+        // The CLI list replaces the configured one.
+        let resolved = VpnClientConfigBuilder::new()
+            .apply_defaults()
+            .apply_config(Some(&config))
+            .apply_cli(
+                None,
+                None,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                vec!["10.9.0.0/16".to_string()],
+                None,
+                None,
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            resolved.exclude_direct_paths,
+            vec!["10.9.0.0/16".parse::<ipnet::IpNet>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn test_client_exclude_direct_paths_invalid_rejected() {
+        let config: VpnClientConfig = toml::from_str(
+            r#"
+role = "vpnclient"
+
+[iroh]
+server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+exclude_direct_paths = ["100.64.0.0"]
+"#,
+        )
+        .unwrap();
+        let err = VpnClientConfigBuilder::new()
+            .apply_defaults()
+            .apply_config(Some(&config))
+            .build()
+            .expect_err("a bare address is not a CIDR");
+        assert!(
+            err.to_string().contains("exclude_direct_paths"),
+            "unexpected error: {err}"
         );
     }
 
