@@ -13,9 +13,13 @@
 //!    `VpnClient`, and spawn its reconnecting run loop on a background thread.
 //!    Returns an opaque handle. The tunnel keeps running until [`ezvpn_stop`].
 //! 2. [`ezvpn_status`] — snapshot the live client status (assigned IPs, routes,
-//!    connection path, bypass addresses) as JSON — the same [`StatusSnapshot`]
-//!    the desktop control endpoint serves, read in-process (no named pipe).
-//! 3. [`ezvpn_stop`] — signal the loop to stop, wait for the routes/TUN teardown
+//!    bypass addresses) as JSON — the desktop control endpoint's
+//!    [`StatusSnapshot`], read in-process (no named pipe), minus the connection
+//!    path and custom-relay health so it is cheap to poll.
+//! 3. [`ezvpn_conn_path`] — on demand (the GUI's "Connection path…" dialog, as
+//!    on Apple and Android): every iroh path plus custom-relay health. Never
+//!    polled, since it makes a `/healthz` request per custom relay.
+//! 4. [`ezvpn_stop`] — signal the loop to stop, wait for the routes/TUN teardown
 //!    to complete (the run future's `Drop` removes routes and closes wintun),
 //!    then free the handle.
 //!
@@ -32,7 +36,8 @@
 //! `auth_key` (the client's `ed25519-sec:...` secret key, whose public half must
 //! be on the server's authorized-keys file) and `server_node_id` are required;
 //! `max_reconnect_attempts` may be null. `relay_urls`, `relay_auth_token`,
-//! `routes`, `routes6`, `instance`, and `auto_reconnect` are all optional (with
+//! `routes`, `routes6`, `exclude_direct_paths`, `instance`, and
+//! `auto_reconnect` are all optional (with
 //! the defaults shown). `relay_auth_token` is the shared bearer token for the
 //! custom relays (sent as `Authorization: Bearer <token>`); it is only valid
 //! together with `relay_urls` and is rejected with the default relays.
@@ -56,9 +61,8 @@
 //! The serialized [`StatusSnapshot::Client`](crate::control::StatusSnapshot),
 //! e.g. `{"role":"client","instance":"default","state":"connected",
 //! "assigned_ip":"10.0.0.2","gateway":"10.0.0.1","routes":["10.0.0.1/32"],
-//! "connection":"Direct 1.2.3.4:52186 (rtt 1ms)",
-//! "custom_relays":[{"url":"https://relay.example/","working":true,"error":null}],
-//! ...}`. `state` is
+//! "connection":null,"custom_relays":[],...}` — `connection` and
+//! `custom_relays` are always empty here (see [`ezvpn_conn_path`]). `state` is
 //! `"disconnected"` while connecting/reconnecting and `"connected"` once the
 //! handshake succeeds. While down, `failed_attempts` (consecutive failures in
 //! the current outage), `last_error`, and `next_attempt_secs` (seconds until
