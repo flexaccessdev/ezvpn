@@ -503,6 +503,33 @@ onboarding arrive over the control stream.
 The message is its own frame *type*: a client that installs no capturing routes
 simply ignores `0x01` frames.
 
+### Direct-Path Exclusion (Client)
+
+iroh offers every server address as a direct-path candidate, the addresses of
+other VPNs on the server included, so a client on the same overlay (e.g.
+Tailscale, `100.64.0.0/10`) can end up tunnelled inside it. That is a valid
+deployment as often as a mistake, and an overlay is not recognizable by address
+(it shares ranges with CGNAT and ordinary LANs) or visible at path selection
+(iroh knows the socket address, not the interface), so the client never blocks
+it on its own. Instead `exclude_direct_paths` (`[iroh]` in the TOML,
+`--exclude-direct-path`, `exclude_direct_paths` in the FFI config JSON) lists
+networks to keep off.
+
+A non-empty list installs `ExcludingPathSelector`
+(`src/transport/path_selector.rs`) through iroh's `path_selector` hook, which
+iroh publishes only under its `unstable-custom-transports` feature (the feature
+makes the selector types public; the selection machinery is the same one every
+endpoint runs). iroh's default selector is not public, so ours reproduces its
+rules — direct paths before the relay, lowest RTT with a 3 ms IPv6 advantage,
+and a 5 ms margin before a same-tier switch — and skips any direct path whose
+remote IP (IPv4-mapped addresses canonicalized) is in an excluded network. An
+excluded current path is left as soon as any allowed path (the relay included)
+has stats; with none, the selector returns no selection, which iroh treats as
+"keep the current path", so an excluded path can keep carrying the tunnel
+until an allowed one appears. Before iroh's first selection the connection
+runs on whatever path it was dialed over. iroh keeps probing the excluded
+addresses. An empty list keeps iroh's default selector.
+
 ### Security Model
 
 The security model is private-resource access, not anonymity. Server identity,

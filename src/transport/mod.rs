@@ -13,6 +13,7 @@
 //! match across the tunnel.
 
 pub mod endpoint;
+pub mod path_selector;
 pub mod paths;
 
 use anyhow::{Context, Result};

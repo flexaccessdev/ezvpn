@@ -56,7 +56,7 @@ GUI reads status **in-process** rather than over the named-pipe control endpoint
 Key source in this repo:
 
 - `src/ffi_windows.rs` — the C entry points (`ezvpn_start`, `ezvpn_status`,
-  `ezvpn_stop`, `ezvpn_init_logging`).
+  `ezvpn_conn_path`, `ezvpn_stop`, `ezvpn_init_logging`).
 - `src/tunnel/client.rs` — the `VpnClient` the FFI drives (`VpnClient::new`,
   `run_with_reconnect`, `status_handle`).
 - `src/control.rs` — the `StatusSnapshot` / `ClientStatus` the FFI serializes.
@@ -67,7 +67,7 @@ Key source in this repo:
 
 ## C interface
 
-The app drives the tunnel with three calls (full signatures and JSON shapes in
+The app drives the tunnel with these calls (full signatures and JSON shapes in
 [`windows/ezvpn.h`](../windows/ezvpn.h)):
 
 1. `ezvpn_start(config_json, out_buf, out_len)` — parse the config, create an
@@ -75,16 +75,23 @@ The app drives the tunnel with three calls (full signatures and JSON shapes in
    background thread. Returns an opaque handle once *started* (not yet
    *connected*).
 2. `ezvpn_status(handle, out_buf, out_len)` — snapshot the live client status
-   (state, assigned IPs, gateway, routes, connection path, bypass addresses) as
-   JSON. Poll it for the `"connected"` state.
-3. `ezvpn_stop(handle)` — signal the loop to stop, wait for the route/adapter
+   (state, assigned IPs, gateway, routes, bypass addresses) as JSON. Cheap
+   enough to poll for the `"connected"` state: it leaves out the connection
+   path and custom-relay health.
+3. `ezvpn_conn_path(handle, out_buf, out_len)` — on demand (the app's
+   "Connection path…" button, as on Apple and Android): every iroh path with
+   the selected one marked, plus each custom relay's `/healthz` result. Same
+   JSON as the Apple/Android `ezvpn_conn_path`; not for polling, since it makes
+   the relay health requests.
+4. `ezvpn_stop(handle)` — signal the loop to stop, wait for the route/adapter
    teardown to finish, and free the handle.
 
 ```
 Ezvpn.App (WinUI 3, elevated)
   create/edit profiles ──▶ ezvpn_start(json) ──▶ ezvpn.dll
   poll status         ──▶ ezvpn_status()          (iroh connect + handshake
-  disconnect          ──▶ ezvpn_stop()              + wintun + routes + reconnect)
+  "Connection path…"  ──▶ ezvpn_conn_path()         + wintun + routes + reconnect)
+  disconnect          ──▶ ezvpn_stop()
 ```
 
 The whole tunnel runs **in-process** in the elevated GUI — there is no Windows

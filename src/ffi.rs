@@ -72,12 +72,12 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 use crate::error::{VpnError, VpnResult};
 use crate::transport::endpoint::RelayConfig;
-use crate::transport::paths::{ConnPathKind, connection_snapshot};
+use crate::transport::paths::connection_snapshot;
 use crate::tunnel::dns_proxy::DnsProxyConfig;
 use crate::tunnel::mobile::{MobileConfig, MobileSession, SessionEvent, SessionEvents};
 
@@ -140,6 +140,10 @@ struct FfiConfig {
     /// IPv6 routed prefixes (CIDR strings).
     #[serde(default)]
     routes6: Vec<String>,
+    /// Networks (CIDR strings) whose server addresses path selection skips as
+    /// direct paths, e.g. another VPN's range (see `transport::path_selector`).
+    #[serde(default)]
+    exclude_direct_paths: Vec<String>,
     /// Android only: the in-tunnel split-DNS forwarder. Absent (or null) on
     /// every other platform, which get conditional forwarding from the OS.
     #[serde(default)]
@@ -416,6 +420,7 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
         relay_config: relay_config.clone(),
         routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route")?,
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
+        exclude_direct_paths: parse_routes::<IpNet>(&cfg.exclude_direct_paths, "excluded direct-path network")?,
         dns_proxy: cfg.dns_proxy.map(parse_dns_proxy).transpose()?,
     };
 
@@ -519,19 +524,7 @@ impl EzvpnHandle {
         let snapshot = self
             .runtime
             .block_on(connection_snapshot(&connection, &self.relay_config));
-        let paths: Vec<_> = snapshot
-            .paths
-            .into_iter()
-            .map(|p| {
-                let kind = match p.kind {
-                    ConnPathKind::Direct => "direct",
-                    ConnPathKind::Relay => "relay",
-                    ConnPathKind::Other => "other",
-                };
-                serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
-            })
-            .collect();
-        serde_json::json!({ "paths": paths, "custom_relays": snapshot.custom_relays }).to_string()
+        crate::ffi_common::conn_path_json(Some(snapshot))
     }
 
     /// The shared body of [`ezvpn_run`]: `dup` the tun fd synchronously, then

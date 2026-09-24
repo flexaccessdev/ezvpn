@@ -55,7 +55,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use rand::RngExt;
@@ -102,6 +102,9 @@ pub struct MobileConfig {
     pub routes: Vec<Ipv4Net>,
     /// IPv6 prefixes routed through the tunnel.
     pub routes6: Vec<Ipv6Net>,
+    /// Server addresses whose direct paths must never carry the tunnel (see
+    /// [`crate::transport::path_selector`]).
+    pub exclude_direct_paths: Vec<IpNet>,
     /// Android only: the in-tunnel split-DNS forwarder (see
     /// [`crate::tunnel::dns_proxy`]). `None` everywhere else.
     pub dns_proxy: Option<DnsProxyConfig>,
@@ -195,7 +198,7 @@ impl MobileSession {
     /// so the server may assign a different IP on each connect — acceptable for
     /// the MVP.
     pub async fn connect(cfg: MobileConfig) -> VpnResult<Self> {
-        let endpoint = create_client_endpoint(&cfg.relay_config)
+        let endpoint = create_client_endpoint(&cfg.relay_config, &cfg.exclude_direct_paths)
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to create iroh endpoint: {e}")))?;
 
