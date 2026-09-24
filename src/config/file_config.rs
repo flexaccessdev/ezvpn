@@ -87,9 +87,10 @@ pub struct VpnClientIrohConfig {
     /// Optional shared bearer token sent to the custom relays as
     /// `Authorization: Bearer <token>`. Only valid together with `relay_urls`.
     pub relay_auth_token: Option<String>,
-    /// Networks (CIDRs) whose server addresses must never carry the tunnel as
-    /// a direct path, e.g. another VPN's range such as Tailscale's
-    /// `100.64.0.0/10`. Other direct paths and the relay are unaffected.
+    /// Networks (CIDRs) whose server addresses path selection skips as direct
+    /// paths, e.g. another VPN's range such as Tailscale's `100.64.0.0/10`.
+    /// A preference, not a block: with no other path available (not even the
+    /// relay), the current path is kept (see `transport::path_selector`).
     pub exclude_direct_paths: Option<Vec<String>>,
 }
 

@@ -346,15 +346,45 @@ impl ClientStatusHandle {
 
     /// Build the current snapshot wrapped for the control protocol.
     pub async fn snapshot(&self) -> StatusSnapshot {
-        StatusSnapshot::Client(self.client_status().await)
+        let (mut status, probe) = self.client_status();
+        if let Some(probe) = probe {
+            let connection = probe().await;
+            status.connection = Some(connection.description);
+            status.custom_relays = connection.custom_relays;
+        }
+        StatusSnapshot::Client(status)
     }
 
-    /// Build the current serializable client status.
-    async fn client_status(&self) -> ClientStatus {
+    /// Like [`Self::snapshot`] but without the connection path and custom-relay
+    /// health (`connection` is `None`, `custom_relays` empty): no relay
+    /// `/healthz` request, so it is cheap enough for a GUI to poll. The GUI
+    /// fetches those on demand through [`Self::connection_snapshot`].
+    pub fn snapshot_without_connection(&self) -> StatusSnapshot {
+        StatusSnapshot::Client(self.client_status().0)
+    }
+
+    /// The live connection's paths and custom-relay health, or `None` while
+    /// disconnected.
+    pub async fn connection_snapshot(&self) -> Option<ConnectionSnapshot> {
+        let probe = self
+            .inner
+            .read()
+            .expect("client status lock poisoned")
+            .connection_probe
+            .clone();
+        match probe {
+            Some(probe) => Some(probe().await),
+            None => None,
+        }
+    }
+
+    /// Build the current serializable client status, minus the connection
+    /// fields, plus the probe that fills them in.
+    fn client_status(&self) -> (ClientStatus, Option<ConnectionProbe>) {
         // Copy out everything needed under the lock and clone the probe, then
-        // drop the guard before awaiting the probe. The (std, non-async) lock
-        // must not be held across the probe's `.await` — the probe performs
-        // on-demand HTTP and would otherwise stall
+        // drop the guard; the caller awaits the probe. The (std, non-async)
+        // lock must not be held across the probe's `.await` — the probe
+        // performs on-demand HTTP and would otherwise stall
         // `set_connected`/`set_disconnected`.
         let (
             instance,
@@ -392,11 +422,7 @@ impl ClientStatusHandle {
         } else {
             "ipv4"
         };
-        let connection = match probe {
-            Some(probe) => Some(probe().await),
-            None => None,
-        };
-        ClientStatus {
+        let status = ClientStatus {
             instance,
             state: if connected {
                 "connected".into()
@@ -421,11 +447,12 @@ impl ClientStatusHandle {
             mtu: connected.then_some(info.mtu),
             routes: info.routes,
             routes6: info.routes6,
-            connection: connection.as_ref().map(|snapshot| snapshot.description.clone()),
-            custom_relays: connection.map(|snapshot| snapshot.custom_relays).unwrap_or_default(),
+            connection: None,
+            custom_relays: Vec::new(),
             bypass_addrs: bypass_probe.map(|p| p()).unwrap_or_default(),
             log_file,
-        }
+        };
+        (status, probe)
     }
 }
 
@@ -971,10 +998,17 @@ mod tests {
         }
     }
 
+    async fn full_status(handle: &ClientStatusHandle) -> ClientStatus {
+        match handle.snapshot().await {
+            StatusSnapshot::Client(status) => status,
+            _ => panic!("expected client snapshot"),
+        }
+    }
+
     #[tokio::test]
     async fn client_handle_tracks_connection_state() {
         let handle = ClientStatusHandle::new("default".into(), "server-node".into(), 0xdead_beef);
-        let snap = handle.client_status().await;
+        let snap = full_status(&handle).await;
         assert_eq!(snap.instance, "default");
         assert_eq!(snap.state, "disconnected");
         assert_eq!(snap.device_id, "00000000deadbeef");
@@ -1006,7 +1040,7 @@ mod tests {
             }),
             Some(Arc::new(|| vec!["198.51.100.7".to_string()])),
         );
-        let snap = handle.client_status().await;
+        let snap = full_status(&handle).await;
         assert_eq!(snap.state, "connected");
         assert_eq!(snap.mode, "ipv4");
         assert_eq!(snap.assigned_ip.as_deref(), Some("10.0.0.2"));
@@ -1016,8 +1050,22 @@ mod tests {
         assert_eq!(snap.custom_relays[0].working, Some(true));
         assert_eq!(snap.bypass_addrs, vec!["198.51.100.7".to_string()]);
 
+        // The pollable snapshot leaves out exactly the probed fields, which
+        // come on demand from `connection_snapshot`.
+        let StatusSnapshot::Client(light) = handle.snapshot_without_connection() else {
+            panic!("expected client snapshot");
+        };
+        assert_eq!(light.state, "connected");
+        assert_eq!(light.bypass_addrs, vec!["198.51.100.7".to_string()]);
+        assert!(light.connection.is_none());
+        assert!(light.custom_relays.is_empty());
+        let conn = handle.connection_snapshot().await.expect("connected");
+        assert_eq!(conn.description, "relay https://relay.example");
+        assert_eq!(conn.custom_relays[0].working, Some(true));
+
         handle.set_disconnected();
-        let snap = handle.client_status().await;
+        assert!(handle.connection_snapshot().await.is_none());
+        let snap = full_status(&handle).await;
         assert_eq!(snap.state, "disconnected");
         assert!(snap.connection.is_none());
         assert!(snap.custom_relays.is_empty());
@@ -1029,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn client_handle_reports_reconnect_progress() {
         let handle = ClientStatusHandle::new("default".into(), "server-node".into(), 1);
-        let snap = handle.client_status().await;
+        let snap = full_status(&handle).await;
         assert_eq!(snap.failed_attempts, 0);
         assert!(snap.next_attempt_secs.is_none());
         assert!(snap.last_error.is_none());
@@ -1040,7 +1088,7 @@ mod tests {
             "server not up yet".into(),
             std::time::Instant::now() + std::time::Duration::from_secs(300),
         );
-        let snap = handle.client_status().await;
+        let snap = full_status(&handle).await;
         assert_eq!(snap.state, "disconnected");
         assert_eq!(snap.failed_attempts, 3);
         assert!(matches!(snap.next_attempt_secs, Some(secs) if (295..=300).contains(&secs)));
@@ -1048,7 +1096,7 @@ mod tests {
 
         // An attempt in progress: the due time is already in the past.
         handle.set_reconnecting(4, "still down".into(), std::time::Instant::now());
-        let snap = handle.client_status().await;
+        let snap = full_status(&handle).await;
         assert_eq!(snap.failed_attempts, 4);
         assert_eq!(snap.next_attempt_secs, Some(0));
 
@@ -1065,7 +1113,7 @@ mod tests {
             }),
             None,
         );
-        let snap = handle.client_status().await;
+        let snap = full_status(&handle).await;
         assert_eq!(snap.state, "connected");
         assert_eq!(snap.failed_attempts, 0, "a connection clears the outage");
         assert!(snap.next_attempt_secs.is_none());

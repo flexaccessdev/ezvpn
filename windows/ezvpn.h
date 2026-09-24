@@ -18,6 +18,7 @@
  *        on error `buf` holds the error message). Returns once the client has
  *        STARTED, not once it has CONNECTED — poll ezvpn_status for that.
  *   3. ezvpn_status(handle, buf, len)             (poll for the status JSON)
+ *      ezvpn_conn_path(handle, buf, len)          (on demand: paths + relay health)
  *   4. ezvpn_stop(handle)                          (stops the tunnel, waits for
  *        route/adapter teardown, frees the handle)
  *
@@ -84,12 +85,17 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
  *   auth_key is the client's ed25519 secret key; its public half must be on
  *   the server's authorized_keys file. It and server_node_id are required;
  *   max_reconnect_attempts may be null. relay_urls, relay_auth_token, routes,
- *   routes6, instance, and auto_reconnect are optional.
+ *   routes6, exclude_direct_paths, instance, and auto_reconnect are optional.
  *   relay_auth_token is the shared bearer token sent to the custom relays as
  *   "Authorization: Bearer <token>"; it is valid ONLY together with relay_urls
  *   and is rejected with the default relays.
  *   routes/routes6 are the split-tunnel prefixes routed through the tunnel; the
  *   server's advertised gateway host prefix is always routed in addition.
+ *   exclude_direct_paths lists networks (CIDR strings, e.g. "100.64.0.0/10")
+ *   whose server addresses path selection skips as direct paths, to keep
+ *   the tunnel off another VPN; it moves to another direct path or the relay.
+ *   A preference, not a block: with no allowed path at all, the current one
+ *   is kept.
  * out_buf/out_len : caller buffer. On failure receives the error message
  *   (always NUL-terminated; may be truncated to fit). Untouched contents on
  *   success are irrelevant — read status via ezvpn_status.
@@ -111,9 +117,7 @@ EzvpnHandle *ezvpn_start(const char *config_json, char *out_buf, size_t out_len)
  *    "gateway":"10.0.0.1","assigned_ip6":"fd00::2","network6":"fd00::1/128",
  *    "gateway6":"fd00::1","mtu":1280,"gso_negotiated":false,
  *    "routes":["10.0.0.1/32"],"routes6":["fd00::1/128"],
- *    "connection":"Direct 1.2.3.4:52186 (rtt 1ms)",
- *    "custom_relays":[{"url":"https://relay.example/","working":true,
- *                      "error":null}],"bypass_addrs":[]}
+ *    "connection":null,"custom_relays":[],"bypass_addrs":[]}
  * `state` is "disconnected" while connecting/reconnecting and "connected" once
  * the handshake succeeds. Per-family fields are null when unassigned. While
  * down, failed_attempts (consecutive failures in the current outage),
@@ -122,12 +126,9 @@ EzvpnHandle *ezvpn_start(const char *config_json, char *out_buf, size_t out_len)
  * far the retry loop has got — a backoff step can be up to 60s once a long
  * outage has pushed it to the cap.
  *
- * custom_relays reports each configured custom relay's health from an on-demand
- * GET of its /healthz endpoint (checked in parallel, only when this snapshot is
- * requested). working is true on a 2xx, false when unreachable/timed-out/non-2xx,
- * and null if the check could not run; error carries the failure detail. The
- * array is empty with the default relays. /healthz is unauthenticated: it
- * confirms the relay is up, not that a relay_auth_token is accepted.
+ * Cheap enough to poll: connection is always null and custom_relays always
+ * empty here, because the relay health check is an HTTP request. Fetch the
+ * paths and relay health on demand with ezvpn_conn_path.
  *
  * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
  * is truncated; retry larger), and -1 for a NULL handle. out_buf is always
@@ -135,6 +136,33 @@ EzvpnHandle *ezvpn_start(const char *config_json, char *out_buf, size_t out_len)
  * writes an empty string.
  */
 int ezvpn_status(const EzvpnHandle *handle, char *out_buf, size_t out_len);
+
+/*
+ * Snapshot how the running tunnel reaches the server, as JSON into out_buf —
+ * the same document as the Apple/Android ezvpn_conn_path, for an on-demand
+ * "connection path" view:
+ *   {"paths":[
+ *      {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
+ *      {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}],
+ *    "custom_relays":[{"url":"https://relay.example/","working":true,"error":null}]}
+ * paths lists every discovered path; kind is "direct", "relay", or "other"
+ * (forward-compatible catch-all), and selected marks the one iroh routes over
+ * right now. Both arrays are empty while the tunnel is down.
+ *
+ * custom_relays reports each configured custom relay's health from a GET of its
+ * /healthz endpoint, made (in parallel) by this call. working is true on a 2xx,
+ * false when unreachable/timed-out/non-2xx, and null if the check could not
+ * run; error carries the failure detail. The array is empty with the default
+ * relays. /healthz is unauthenticated: it confirms the relay is up, not that a
+ * relay_auth_token is accepted. Because of these requests, call this on user
+ * demand, not on a polling timer.
+ *
+ * Returns 1 on success (full JSON written), 0 if out_buf was too small (the JSON
+ * is truncated; retry larger), and -1 for a NULL handle. out_buf is always
+ * NUL-terminated when usable (non-NULL, out_len > 0); the NULL-handle return
+ * writes an empty string.
+ */
+int ezvpn_conn_path(const EzvpnHandle *handle, char *out_buf, size_t out_len);
 
 /*
  * Stop the tunnel and free the handle. Signals the run loop to stop and WAITS

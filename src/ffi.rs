@@ -77,7 +77,7 @@ use serde::Deserialize;
 
 use crate::error::{VpnError, VpnResult};
 use crate::transport::endpoint::RelayConfig;
-use crate::transport::paths::{ConnPathKind, connection_snapshot};
+use crate::transport::paths::connection_snapshot;
 use crate::tunnel::dns_proxy::DnsProxyConfig;
 use crate::tunnel::mobile::{MobileConfig, MobileSession, SessionEvent, SessionEvents};
 
@@ -140,8 +140,8 @@ struct FfiConfig {
     /// IPv6 routed prefixes (CIDR strings).
     #[serde(default)]
     routes6: Vec<String>,
-    /// Networks (CIDR strings) whose server addresses must never carry the
-    /// tunnel as a direct path, e.g. another VPN's range.
+    /// Networks (CIDR strings) whose server addresses path selection skips as
+    /// direct paths, e.g. another VPN's range (see `transport::path_selector`).
     #[serde(default)]
     exclude_direct_paths: Vec<String>,
     /// Android only: the in-tunnel split-DNS forwarder. Absent (or null) on
@@ -524,19 +524,7 @@ impl EzvpnHandle {
         let snapshot = self
             .runtime
             .block_on(connection_snapshot(&connection, &self.relay_config));
-        let paths: Vec<_> = snapshot
-            .paths
-            .into_iter()
-            .map(|p| {
-                let kind = match p.kind {
-                    ConnPathKind::Direct => "direct",
-                    ConnPathKind::Relay => "relay",
-                    ConnPathKind::Other => "other",
-                };
-                serde_json::json!({ "kind": kind, "display": p.display, "selected": p.selected })
-            })
-            .collect();
-        serde_json::json!({ "paths": paths, "custom_relays": snapshot.custom_relays }).to_string()
+        crate::ffi_common::conn_path_json(Some(snapshot))
     }
 
     /// The shared body of [`ezvpn_run`]: `dup` the tun fd synchronously, then

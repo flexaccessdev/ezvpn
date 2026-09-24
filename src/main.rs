@@ -215,7 +215,7 @@ enum ClientAction {
         #[arg(long = "route6")]
         routes6: Vec<String>,
 
-        /// Never carry the tunnel over a direct path to a server address in
+        /// Keep the tunnel off direct paths to server addresses in
         /// this network (CIDR, repeatable), e.g. another VPN's range:
         /// --exclude-direct-path 100.64.0.0/10. Replaces the configured
         /// [iroh].exclude_direct_paths.

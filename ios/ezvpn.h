@@ -93,8 +93,10 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
  *   off-tunnel anyway, and excluding them would blackhole tunnel destinations
  *   that share the server's LAN address, e.g. a DNS server on the VPN host).
  *   exclude_direct_paths lists networks (CIDR strings, e.g. "100.64.0.0/10")
- *   whose server addresses must never carry the tunnel as a direct path, to
- *   keep it from riding another VPN; the relay and other direct paths remain.
+ *   whose server addresses path selection skips as direct paths, to keep
+ *   the tunnel off another VPN; it moves to another direct path or the relay.
+ *   A preference, not a block: with no allowed path at all, the current one
+ *   is kept.
  * out_buf/out_len : caller buffer. On success receives the network-config JSON
  *   (per-family fields are null when that family was not assigned):
  *   {"assigned_ip":"10.0.0.2","netmask":"255.255.255.255","gateway":"10.0.0.1",

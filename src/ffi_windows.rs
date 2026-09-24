@@ -115,8 +115,8 @@ struct FfiWinConfig {
     routes: Vec<String>,
     #[serde(default)]
     routes6: Vec<String>,
-    /// Networks (CIDR strings) whose server addresses must never carry the
-    /// tunnel as a direct path, e.g. another VPN's range.
+    /// Networks (CIDR strings) whose server addresses path selection skips as
+    /// direct paths, e.g. another VPN's range (see `transport::path_selector`).
     #[serde(default)]
     exclude_direct_paths: Vec<String>,
     #[serde(default = "default_instance")]
@@ -408,6 +408,11 @@ async fn run_client(
 
 /// Snapshot the live client status as JSON into `out_buf`.
 ///
+/// Cheap enough to poll: the connection path (`connection`) and custom-relay
+/// health (`custom_relays`) are left out — `connection` is `null` and
+/// `custom_relays` empty — because the relay health check is an HTTP request.
+/// Fetch those on demand with [`ezvpn_conn_path`].
+///
 /// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
 /// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
 /// handle. `out_buf` is always NUL-terminated when usable (non-null,
@@ -428,28 +433,65 @@ pub unsafe extern "C" fn ezvpn_status(
         return -1;
     }
     let handle = unsafe { &*handle };
-    // The snapshot is async (custom-relay `/healthz` is checked on demand). The
-    // worker thread's runtime is busy driving the tunnel and can't be reused
-    // from here, so spin up a short-lived runtime to drive this one snapshot.
-    // `ezvpn_status` is called on demand from the .NET side, never on a runtime
-    // worker, so this does not block the tunnel.
-    let snapshot = {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let json = format!("{{\"error\":\"failed to build status runtime: {e}\"}}");
-                return if write_cstr(out_buf, out_len, &json) { 1 } else { 0 };
-            }
-        };
-        rt.block_on(handle.status.snapshot())
-    };
-    let json = match serde_json::to_string(&snapshot) {
+    let json = match serde_json::to_string(&handle.status.snapshot_without_connection()) {
         Ok(j) => j,
         Err(e) => format!("{{\"error\":\"failed to serialize status: {e}\"}}"),
     };
+    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+}
+
+/// Snapshot the live connection's iroh path(s) and custom-relay health as JSON
+/// into `out_buf` — the same document as the Apple/Android `ezvpn_conn_path`:
+///
+/// ```json
+/// { "paths": [
+///     {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},
+///     {"kind":"relay","display":"Relay https://relay.example/ (rtt 42ms)","selected":false}
+/// ], "custom_relays": [
+///     {"url":"https://relay.example/","working":true,"error":null}
+/// ] }
+/// ```
+///
+/// A point-in-time snapshot for an on-demand "connection path" view, showing
+/// every discovered path; `selected` marks the one iroh routes over. Both
+/// arrays are empty while the tunnel is down. Probes each custom relay's
+/// `/healthz`, so call it on demand, not on a polling timer.
+///
+/// Returns `1` on success (full JSON written), `0` if `out_buf` was too small
+/// (the JSON is truncated; retry with a larger buffer), and `-1` for a null
+/// handle. `out_buf` is always NUL-terminated when usable (non-null,
+/// `out_len > 0`); the null-handle return writes an empty string.
+///
+/// # Safety
+/// `handle` must be a valid pointer returned by [`ezvpn_start`] and not yet
+/// passed to [`ezvpn_stop`]. `out_buf` must point to at least `out_len` writable
+/// bytes (may be null only if `out_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ezvpn_conn_path(
+    handle: *const EzvpnHandle,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if handle.is_null() {
+        write_cstr(out_buf, out_len, "");
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    // The relay health check is async HTTP. The worker thread's runtime is
+    // busy driving the tunnel and can't be reused from here, so spin up a
+    // short-lived runtime for this one snapshot. Called on demand from the
+    // .NET side, never on a runtime worker, so this does not block the tunnel.
+    let snapshot = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(handle.status.connection_snapshot()),
+        Err(e) => {
+            let json = format!("{{\"error\":\"failed to build runtime: {e}\"}}");
+            return if write_cstr(out_buf, out_len, &json) { 1 } else { 0 };
+        }
+    };
+    let json = crate::ffi_common::conn_path_json(snapshot);
     if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
 }
 

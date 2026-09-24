@@ -12,8 +12,10 @@
 //! (not public) — direct paths beat the relay, lowest RTT wins with IPv6
 //! [`IPV6_RTT_ADVANTAGE`] ahead, and a same-tier switch needs
 //! [`RTT_SWITCHING_MIN`] of improvement — and only drops the excluded direct
-//! paths from the candidates. iroh still probes those addresses; they just
-//! never carry traffic. With nothing else direct, the relay carries it.
+//! paths from the candidates, leaving an excluded current path for any allowed
+//! one (the relay included). With no allowed candidate the selection is empty,
+//! which iroh treats as "keep the current path", even an excluded one. iroh
+//! still probes the excluded addresses.
 
 use ipnet::IpNet;
 use iroh::endpoint::transports::{

@@ -349,7 +349,7 @@ machine-readable output.
 | `--route <CIDR>` | Additional IPv4 route through the VPN; repeatable |
 | `--route6 <CIDR>` | Additional IPv6 route through the VPN; repeatable |
 | `--relay-url <URL>` | Custom relay URL; repeatable |
-| `--exclude-direct-path <CIDR>` | Never carry the tunnel over a direct path to a server address in this network, e.g. another VPN's range; repeatable; replaces `[iroh].exclude_direct_paths` (see [Excluding Direct Paths](#excluding-direct-paths)) |
+| `--exclude-direct-path <CIDR>` | Keep the tunnel off direct paths to server addresses in this network whenever another path (another direct one or the relay) is available, e.g. another VPN's range; repeatable; replaces `[iroh].exclude_direct_paths` (see [Excluding Direct Paths](#excluding-direct-paths)) |
 | `--auto-reconnect` | Force-enable reconnect |
 | `--no-auto-reconnect` | Exit on the first failed connection attempt or drop instead of retrying |
 | `--max-reconnect-attempts <N>` | Cap consecutive retries before giving up (unlimited if unset) |
@@ -807,10 +807,14 @@ To keep the tunnel off it, list the overlay's networks on the client:
 exclude_direct_paths = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]  # Tailscale
 ```
 
-or pass `--exclude-direct-path` (repeatable). Direct paths to those server
-addresses never carry the tunnel; any other direct path is used, and with none
-the relay carries it. iroh still sends its small path probes to the excluded
-addresses.
+or pass `--exclude-direct-path` (repeatable). Path selection skips direct
+paths to those server addresses and moves the tunnel off one it is on, to
+another direct path or else the relay. This is a selection preference, not a
+block: if no allowed path is available at all (not even the relay), the
+current path is kept rather than dropping the connection, even an excluded
+one, and a connection that was dialed over an excluded address uses it until
+the first path selection. iroh still sends its small path probes to the
+excluded addresses.
 
 ## Running as a Service
 

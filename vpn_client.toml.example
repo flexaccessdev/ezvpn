@@ -149,9 +149,11 @@ server_node_id = "changeme"
 # The server advertises every local address it has as a direct-path candidate,
 # including the address of another VPN it runs. When this client is on that VPN
 # too, ezvpn can end up carried inside it (e.g. over Tailscale). List the
-# networks whose server addresses must never carry the tunnel as a direct
-# path; other direct paths and the relay are unaffected (with no other direct
-# path, the relay carries it). Empty by default, since running over another
+# networks whose server addresses path selection should skip as direct paths;
+# the tunnel moves off one to another direct path or else the relay. It is a
+# preference, not a block: with no allowed path available at all (not even
+# the relay), the current path is kept, even an excluded one, rather than
+# dropping the connection. Empty by default, since running over another
 # private network is sometimes exactly what is wanted. CLI --exclude-direct-path
 # replaces this list.
 # Tailscale:

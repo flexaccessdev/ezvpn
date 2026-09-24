@@ -523,9 +523,12 @@ endpoint runs). iroh's default selector is not public, so ours reproduces its
 rules — direct paths before the relay, lowest RTT with a 3 ms IPv6 advantage,
 and a 5 ms margin before a same-tier switch — and skips any direct path whose
 remote IP (IPv4-mapped addresses canonicalized) is in an excluded network. An
-excluded current path is always left. iroh keeps probing the excluded
-addresses; they only never carry traffic. An empty list keeps iroh's default
-selector.
+excluded current path is left as soon as any allowed path (the relay included)
+has stats; with none, the selector returns no selection, which iroh treats as
+"keep the current path", so an excluded path can keep carrying the tunnel
+until an allowed one appears. Before iroh's first selection the connection
+runs on whatever path it was dialed over. iroh keeps probing the excluded
+addresses. An empty list keeps iroh's default selector.
 
 ### Security Model
 
