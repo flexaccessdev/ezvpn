@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.53"
+version = "0.0.54"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -18,13 +18,13 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
-dirs = "6"
+dirs = "7"
 env_logger = "0.11"
-etherparse = "0.20"
+etherparse = "0.21"
 # Shared FlexAccess auth key format (`ed25519-sec:` / `ed25519-pub:` tokens,
 # key files, authorized-keys parsing). Key generation is the standalone
 # `flexaccess-keys` CLI; this library only parses, signs, and verifies.
@@ -34,12 +34,12 @@ ipnet = { version = "2", features = ["serde"] }
 # Shared iroh transport layer (RelayConfig + per-relay probe, endpoint
 # build/rebuild, home-relay watchdog, endpoint-bound auth transcript). No
 # `mdns` feature: ezvpn runs no local-network discovery.
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.9" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.10" }
 # Redirected to the fork below via `[patch.crates-io]`, which also covers the
 # shared crate's own `iroh` dependency so the graph holds a single `iroh`.
 # `unstable-custom-transports` only makes the path-selector API public, for the
 # client's `exclude_direct_paths` selector (src/transport/path_selector.rs).
-iroh = { version = "1.2.0", features = ["unstable-custom-transports"] }
+iroh = { version = "1.3.0", features = ["unstable-custom-transports"] }
 noq-proto = "1.3.0"
 n0-watcher = "1.0.0"
 log = "0.4"
@@ -116,11 +116,10 @@ panic = "abort"
 # resolves to the same package (see flexaccess-iroh's README, "Consumers on a
 # fork of iroh"). Cargo.lock pins each tested branch commit.
 [patch.crates-io]
-# Forked from iroh v1.2.0. Preserves established-path transport backpressure so
+# Forked from iroh v1.3.0. Preserves established-path transport backpressure so
 # noq retains and retries the transmit instead of treating a local discard as
-# successful, and exposes noq's batch datagram send/receive on `Connection`
-# (one connection-lock acquisition per burst instead of per packet).
-iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-batch-datagrams-1.2.0" }
+# successful.
+iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send-backpressure-1.3.0" }
 # Forked from noq v1.3.0. Stamps each received batch as it is read rather than
 # once per endpoint-driver poll, and makes BBRv3 skip a non-positive RTT
 # sample: a stale receive timestamp read as a zero RTT, which the 10 s min-RTT
