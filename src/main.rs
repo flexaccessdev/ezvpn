@@ -7,6 +7,12 @@
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 compile_error!("the ezvpn CLI only supports Linux, macOS, and Windows");
 
+// jemalloc on Linux (see the Cargo.toml note); macOS and Windows keep the
+// system allocator.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // The desktop CLI consumes the `ezvpn` library crate (see src/lib.rs). Bring the
 // modules it references by bare path into scope so the existing `auth::`,
 // `runtime::`, `control::`, `secret::` call sites keep resolving unchanged.

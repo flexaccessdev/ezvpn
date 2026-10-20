@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.54"
+version = "0.0.55"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -68,6 +68,12 @@ url = "2"
 # maintained drop-in fork of the unmaintained `daemonize` crate.
 [target.'cfg(unix)'.dependencies]
 daemonix = "0.1"
+
+# Linux-only: jemalloc as the CLI's global allocator (set in src/main.rs), in
+# place of glibc malloc. `target_os = "linux"` excludes Android, whose `.so`
+# keeps the platform allocator.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.7"
 
 # Windows-only: resolve %ProgramData% via the Known Folders API
 # (SHGetKnownFolderPath) so the runtime/log dirs follow the real install drive
