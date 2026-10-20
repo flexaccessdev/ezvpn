@@ -982,7 +982,9 @@ pub(crate) async fn run_tunnel(
             // trickle arriving just inside each budget must not hold the batch
             // open for 64 budgets: TUN_DRAIN_BATCH_MAX caps the batch's age.
             let batch_start = std::time::Instant::now();
+            let mut reads = 0usize;
             loop {
+                reads += 1;
                 window_bytes += packet_buf.filled().len() as u64;
                 match tun_reader.split_frame(packet_buf.filled()) {
                     Ok((offload, packet)) => {
@@ -1009,7 +1011,11 @@ pub(crate) async fn run_tunnel(
                     }
                     Err(e) => log::warn!("Failed to parse TUN frame: {}", e),
                 }
-                if pending.len() >= DATAGRAM_SEND_BATCH {
+                // Bound on reads, not on `pending`: filtered, intercepted,
+                // malformed and oversized packets add nothing to it, and a
+                // TUN that stays readable must not keep this task from
+                // yielding.
+                if reads >= DATAGRAM_SEND_BATCH {
                     break;
                 }
                 packet_buf.clear();

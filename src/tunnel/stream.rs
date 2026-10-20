@@ -1,7 +1,7 @@
 //! Data path (unreliable QUIC datagrams) and control framing (reliable stream).
 //!
 //! Each IP packet maps **directly to one unreliable, unordered QUIC datagram**
-//! ([`send_ip_datagrams`] / [`Connection::read_datagram`]): the datagram body is
+//! ([`prepare_ip_datagrams`] + [`send_datagram_batch`] / [`Connection::read_datagram`]): the datagram body is
 //! the raw IP packet, with no length prefix, type byte, or offload metadata —
 //! QUIC preserves datagram boundaries, and the only other traffic (server
 //! address publications) rides a separate reliable stream. This is a
