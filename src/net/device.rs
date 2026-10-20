@@ -54,6 +54,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 use std::io;
+use std::time::Duration;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use std::os::fd::AsRawFd;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
@@ -589,6 +590,7 @@ impl DarwinTunHalves {
     /// `tun`-crate device's fd; iOS passes the Network Extension's fd).
     fn from_raw_fd(fd: RawFd) -> VpnResult<Self> {
         let fd = duplicate_fd(fd)?;
+        set_utun_socket_buffers(&fd);
         let fd = Arc::new(
             AsyncFd::new(fd)
                 .map_err(|e| VpnError::tun_device_with_source("Failed to register utun fd", e))?,
@@ -597,6 +599,50 @@ impl DarwinTunHalves {
             reader: DarwinTunReader { fd: fd.clone() },
             writer: DarwinTunWriter { fd },
         })
+    }
+}
+
+/// Size requested for the utun kernel-control socket's receive and send
+/// buffers.
+///
+/// A utun is a kernel-control socket: packets the stack routes into it queue
+/// in the socket's receive buffer until we `read` them, and `write`s queue in
+/// its send buffer. The default is 512 KiB each, about 250 full-size packets.
+/// A TCP sender's burst overflows that, and XNU answers the overflow with
+/// `ENOBUFS`, which the TCP stack treats as congestion: it collapses its window
+/// and trickles packets out one at a time, so the reader finds the queue empty
+/// after every read and the flow crawls at a fraction of what the utun can
+/// carry. 4 MiB absorbs a window's worth of burst (the kernel caps requests at
+/// `kern.ipc.maxsockbuf`, 8 MiB by default), so bursts queue and the reader
+/// drains them in batches.
+#[cfg(target_vendor = "apple")]
+const UTUN_SOCKET_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
+
+/// Raise the utun socket's receive and send buffers to
+/// [`UTUN_SOCKET_BUFFER_SIZE`]; a failure only logs, leaving the defaults.
+#[cfg(target_vendor = "apple")]
+fn set_utun_socket_buffers(fd: &OwnedFd) {
+    for (name, option) in [("SO_RCVBUF", libc::SO_RCVBUF), ("SO_SNDBUF", libc::SO_SNDBUF)] {
+        let size = UTUN_SOCKET_BUFFER_SIZE;
+        // SAFETY: `fd` is open for the call's duration and `size` is a live
+        // c_int whose exact length is passed.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            log::debug!(
+                "Could not set utun {} to {} bytes: {}",
+                name,
+                size,
+                io::Error::last_os_error()
+            );
+        }
     }
 }
 
@@ -626,6 +672,33 @@ impl DarwinTunReader {
             })
             .await
             .map_err(VpnError::Network)
+    }
+
+    /// Read the next packet, polling the fd directly for up to `budget`
+    /// before reporting that there is none.
+    ///
+    /// Bypasses tokio's readiness tracking: a raw nonblocking `read` costs a
+    /// couple of microseconds, whereas parking on the reactor and being woken
+    /// for the next packet costs tens of microseconds per packet in thread
+    /// wakeups (more in a VM), and the kernel's utun output path serializes
+    /// against the reader on the socket lock, so a reader that sleeps between
+    /// packets caps the whole flow. Packets consumed here leave their kqueue
+    /// events queued, which only costs the next `read_buf` a spurious wakeup.
+    fn spin_read_buf(&mut self, buf: &mut ReadBuf<'_>, budget: Duration) -> Option<VpnResult<()>> {
+        let fd = self.fd.get_ref().as_raw_fd();
+        let start = std::time::Instant::now();
+        loop {
+            match read_utun_frame_into(fd, buf) {
+                Ok(()) => return Some(Ok(())),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= budget {
+                        return None;
+                    }
+                    std::hint::spin_loop();
+                }
+                Err(e) => return Some(Err(VpnError::Network(e))),
+            }
+        }
     }
 }
 
@@ -818,6 +891,31 @@ impl TunReader {
     /// caller drain everything currently queued and flush when the TUN drains.
     pub fn try_read_buf(&mut self, buf: &mut ReadBuf<'_>) -> Option<VpnResult<()>> {
         self.read_buf(buf).now_or_never()
+    }
+
+    /// [`try_read_buf`](Self::try_read_buf) that, on a utun, keeps polling for
+    /// up to `budget` before giving up (see `DarwinTunReader::spin_read_buf`).
+    /// Elsewhere the budget is ignored.
+    pub fn try_read_buf_within(
+        &mut self,
+        buf: &mut ReadBuf<'_>,
+        budget: Duration,
+    ) -> Option<VpnResult<()>> {
+        #[cfg(target_vendor = "apple")]
+        {
+            match self.try_read_buf(buf) {
+                None => {
+                    let TunReaderInner::Darwin(reader) = &mut self.inner;
+                    reader.spin_read_buf(buf, budget)
+                }
+                some => some,
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = budget;
+            self.try_read_buf(buf)
+        }
     }
 }
 

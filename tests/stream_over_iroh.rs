@@ -3,7 +3,7 @@
 //! (loopback only: relays and discovery disabled).
 //!
 //! The unit tests in `tunnel::stream` cover encode/decode in memory; this
-//! exercises the actual iroh I/O: `send_ip_datagrams` / `send_datagram_batch` /
+//! exercises the actual iroh I/O: `prepare_ip_datagrams` / `send_datagram_batch` /
 //! `read_datagram` / `read_many_datagrams` for the data path (including the
 //! oversized-packet drop and send backpressure), and `read_frame` /
 //! `write_frames` for `ServerAddrs` control frames on the stream.
@@ -14,7 +14,7 @@ use ezvpn::transport::{QUIC_DATAGRAM_SEND_BUFFER_SIZE, build_quic_transport_conf
 use ezvpn::tunnel::signaling::ServerAddrsMsg;
 use ezvpn::tunnel::stream::{
     DatagramSendOutcome, Frame, MAX_FRAME_BODY, classify, encode_server_addrs_frame, read_frame,
-    send_datagram_batch, send_ip_datagrams, write_frames,
+    prepare_ip_datagrams, send_datagram_batch, write_frames,
 };
 use iroh::{Endpoint, RelayMode, endpoint::presets};
 use std::sync::Arc;
@@ -22,6 +22,31 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 const TEST_ALPN: &[u8] = b"ezvpn-datagram-test/0";
+
+/// Map one plain IP packet to datagrams and send them, as the client's TUN
+/// reader does for each batch of packets.
+async fn send_ip_packet(
+    conn: &iroh::endpoint::Connection,
+    arena: &mut BytesMut,
+    seg_scratch: &mut Vec<u8>,
+    pending: &mut Vec<Bytes>,
+    packet: &[u8],
+) -> DatagramSendOutcome {
+    let mut outcome = DatagramSendOutcome::default();
+    pending.clear();
+    prepare_ip_datagrams(
+        conn.max_datagram_size(),
+        arena,
+        seg_scratch,
+        pending,
+        None,
+        packet,
+        &mut outcome,
+    );
+    let _ = send_datagram_batch(conn, pending, &mut outcome).await;
+    pending.clear();
+    outcome
+}
 
 async fn bind_endpoint() -> Endpoint {
     Endpoint::builder(presets::Empty)
@@ -71,15 +96,7 @@ async fn ip_packets_roundtrip_as_datagrams() {
     // A full-MTU packet must not be dropped while path discovery warms up.
     let mut full_mtu = vec![0u8; VPN_MTU as usize];
     full_mtu[0] = 0x45;
-    let outcome = send_ip_datagrams(
-        &conn,
-        &mut arena,
-        &mut seg_scratch,
-        &mut pending,
-        None,
-        &full_mtu,
-    )
-    .await;
+    let outcome = send_ip_packet(&conn, &mut arena, &mut seg_scratch, &mut pending, &full_mtu).await;
     assert_eq!(outcome.sent, 1, "full-MTU packet is sent immediately");
     assert_eq!(outcome.dropped_too_large, 0);
     let echoed = conn.read_datagram().await.expect("read full-MTU echo");
@@ -91,15 +108,7 @@ async fn ip_packets_roundtrip_as_datagrams() {
         p[0] = 0x45;
         p
     };
-    let outcome = send_ip_datagrams(
-        &conn,
-        &mut arena,
-        &mut seg_scratch,
-        &mut pending,
-        None,
-        &small,
-    )
-    .await;
+    let outcome = send_ip_packet(&conn, &mut arena, &mut seg_scratch, &mut pending, &small).await;
     assert_eq!(outcome.sent, 1, "small packet is sent as one datagram");
     assert_eq!(outcome.dropped_too_large, 0);
 
@@ -112,15 +121,7 @@ async fn ip_packets_roundtrip_as_datagrams() {
         p[0] = 0x45;
         p
     };
-    let outcome = send_ip_datagrams(
-        &conn,
-        &mut arena,
-        &mut seg_scratch,
-        &mut pending,
-        None,
-        &big,
-    )
-    .await;
+    let outcome = send_ip_packet(&conn, &mut arena, &mut seg_scratch, &mut pending, &big).await;
     assert_eq!(outcome.sent, 0, "oversized packet is never sent");
     assert_eq!(
         outcome.dropped_too_large, 1,
@@ -136,7 +137,7 @@ async fn ip_packets_roundtrip_as_datagrams() {
 /// instead of silently evicting older datagrams.
 ///
 /// The guarantee under test is a send-side property: every packet the caller
-/// hands to [`send_ip_datagrams`] is queued (`sent == 1`) and none is evicted
+/// hands to [`send_datagram_batch`] is queued (`sent == 1`) and none is evicted
 /// (`dropped_other == 0`), even though the batch is far larger than the send
 /// buffer. That is asserted deterministically per packet below. Delivery itself
 /// rides unreliable QUIC datagrams, so the receiver tolerates the occasional
@@ -161,7 +162,7 @@ async fn datagram_backpressure_preserves_queued_packets() {
     let mut seg_scratch = Vec::new();
     let mut pending = Vec::new();
 
-    // Bound the whole send loop: `send_ip_datagrams` awaits queue capacity, so a
+    // Bound the whole send loop: `send_datagram_batch` awaits queue capacity, so a
     // receiver that stopped draining would otherwise wedge it here indefinitely
     // rather than surfacing as a test failure.
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -169,15 +170,7 @@ async fn datagram_backpressure_preserves_queued_packets() {
             let mut packet = vec![0u8; PACKET_SIZE];
             packet[0] = 0x45;
             packet[1..5].copy_from_slice(&sequence.to_be_bytes());
-            let outcome = send_ip_datagrams(
-                &conn,
-                &mut arena,
-                &mut seg_scratch,
-                &mut pending,
-                None,
-                &packet,
-            )
-            .await;
+            let outcome = send_ip_packet(&conn, &mut arena, &mut seg_scratch, &mut pending, &packet).await;
             assert_eq!(outcome.sent, 1, "packet {sequence} queued");
             assert_eq!(outcome.dropped_other, 0, "packet {sequence} not evicted");
         }

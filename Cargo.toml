@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.55"
+version = "0.0.56"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -130,8 +130,9 @@ iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send
 # once per endpoint-driver poll, and makes BBRv3 skip a non-positive RTT
 # sample: a stale receive timestamp read as a zero RTT, which the 10 s min-RTT
 # filter held, zeroing the BDP and leaving the congestion window erratic on
-# sub-millisecond paths. All three crates come from the fork so the graph holds
-# a single `noq-udp`.
+# sub-millisecond paths. Also adds `UdpSocketState::send_connected` for the
+# netwatch fork's connected peer sockets on Apple platforms. All three crates
+# come from the fork so the graph holds a single `noq-udp`.
 noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
 noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
 noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
@@ -140,5 +141,9 @@ noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rt
 # CAP_NET_ADMIN (the VPN runs as root), so Linux's default
 # net.core.rmem_max/wmem_max (~208 KiB) no longer caps the 7 MiB request and
 # overflows the receive queue under load. Unprivileged, the capped options
-# apply as before.
+# apply as before. On Apple platforms it also opens a connected socket per
+# busy peer beside the unconnected main socket, sharing its port with
+# SO_REUSEPORT: XNU charges every send that names a destination 25-40 µs of
+# PCB connect/disconnect, which a connected socket skips (see
+# docs/Architecture.md, "Throughput Design").
 netwatch = { git = "https://github.com/flexaccessdev/net-tools.git", branch = "ezvpn-bufforce-0.19.3" }

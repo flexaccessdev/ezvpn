@@ -1526,8 +1526,10 @@ impl VpnServer {
         stats: &Arc<VpnServerStats>,
     ) {
         let mut outcome = Default::default();
+        // Takes the connection lock; once per TUN packet, not per segment.
+        let max_size = conn.max_datagram_size();
         prepare_ip_datagrams(
-            conn,
+            max_size,
             arena,
             seg_scratch,
             pending,
