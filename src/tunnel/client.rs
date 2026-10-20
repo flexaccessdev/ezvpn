@@ -978,6 +978,10 @@ pub(crate) async fn run_tunnel(
             // Takes the connection lock: once per batch, not per packet.
             let max_size = conn_out.max_datagram_size();
             let mut outcome = DatagramSendOutcome::default();
+            // Polling between packets is what keeps the reader awake, but a
+            // trickle arriving just inside each budget must not hold the batch
+            // open for 64 budgets: TUN_DRAIN_BATCH_MAX caps the batch's age.
+            let batch_start = std::time::Instant::now();
             loop {
                 window_bytes += packet_buf.filled().len() as u64;
                 match tun_reader.split_frame(packet_buf.filled()) {
@@ -1009,7 +1013,8 @@ pub(crate) async fn run_tunnel(
                     break;
                 }
                 packet_buf.clear();
-                match tun_reader.try_read_buf_within(&mut packet_buf, spin) {
+                let budget = spin.min(TUN_DRAIN_BATCH_MAX.saturating_sub(batch_start.elapsed()));
+                match tun_reader.try_read_buf_within(&mut packet_buf, budget) {
                     // The TUN is drained: send what we have.
                     None => break,
                     Some(Ok(())) if packet_buf.filled().is_empty() => break,
@@ -1974,6 +1979,13 @@ pub(crate) fn overlapping_underlay_excludes(
 /// a download's ACK stream, which is many packets but few bytes, from
 /// triggering it and taking CPU from the receive path.
 const TUN_DRAIN_SPIN: Duration = Duration::from_micros(100);
+
+/// Longest a batch stays open collecting packets before it is sent. Polling
+/// is per packet gap (one shared budget per batch ends it after a few packets
+/// of a dense flow and brings the park-and-wake back, measured 435 → 345
+/// Mbit/s), so this caps the latency a trickle arriving just inside each
+/// budget could otherwise add: 64 gaps of up to [`TUN_DRAIN_SPIN`].
+const TUN_DRAIN_BATCH_MAX: Duration = Duration::from_millis(1);
 
 /// Outbound TUN byte rate (bytes/s) above which the reader polls between
 /// batches (see [`TUN_DRAIN_SPIN`]): 10 MB/s, about 80 Mbit/s. An ACK stream
