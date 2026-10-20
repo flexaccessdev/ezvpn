@@ -20,7 +20,8 @@ use crate::auth::ClientKey;
 use crate::config::VpnClientConfig;
 use crate::tunnel::stream::{
     DATAGRAM_READ_BATCH, FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify, encode_heartbeat_frame,
-    read_frame, send_ip_datagrams, write_frames,
+    read_frame, write_frames, DATAGRAM_SEND_BATCH, DatagramSendOutcome, prepare_ip_datagrams,
+    send_datagram_batch,
 };
 use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::net::device::{
@@ -959,65 +960,100 @@ pub(crate) async fn run_tunnel(
         // Persistent ReadBuf: tracks the initialized region across iterations so
         // the TUN reader only zeroes the buffer once instead of on every read.
         let mut packet_buf = ReadBuf::uninit(&mut read_storage);
+        // Byte-rate gate for polling between batches (see TUN_DRAIN_SPIN).
+        let mut window_start = std::time::Instant::now();
+        let mut window_bytes: u64 = 0;
+        let mut spin = Duration::ZERO;
         loop {
+            // Block for one packet, then drain what the TUN already has queued
+            // (up to DATAGRAM_SEND_BATCH datagrams) and send it all as one
+            // batch. See DATAGRAM_SEND_BATCH for why one lock per batch matters.
             packet_buf.clear();
-            match tun_reader.read_buf(&mut packet_buf).await {
-                Ok(()) if !packet_buf.filled().is_empty() => {
-                    let raw_packet = packet_buf.filled();
-                    let (offload, packet) = match tun_reader.split_frame(raw_packet) {
-                        Ok(parts) => parts,
-                        Err(e) => {
-                            log::warn!("Failed to parse TUN frame: {}", e);
-                            continue;
-                        }
-                    };
-
-                    if packet_has_local_iroh_udp_port(packet, &local_iroh_udp_ports_out) {
-                        log::debug!(
-                            "Dropped self-encapsulated iroh UDP packet from TUN ({} bytes)",
-                            raw_packet.len()
-                        );
-                        continue;
-                    }
-
-                    if let Some(intercept) = &dns_intercept
-                        && intercept.wants(packet)
-                    {
-                        intercept.capture(packet);
-                        continue;
-                    }
-
-                    let outcome = send_ip_datagrams(
-                        &conn_out,
-                        &mut arena,
-                        &mut seg_scratch,
-                        &mut pending,
-                        offload.as_ref(),
-                        packet,
-                    )
-                    .await;
-                    if outcome.dropped_too_large > 0 {
-                        dropped_too_large += outcome.dropped_too_large;
-                        if !warned_too_large {
-                            warned_too_large = true;
-                            log::warn!(
-                                "Dropping packet(s) exceeding the current QUIC datagram size \
-                                 (the discovered path MTU is too small); the inner flow \
-                                 adapts. Further such drops are counted silently."
+            if let Err(e) = tun_reader.read_buf(&mut packet_buf).await {
+                return Some(tun_read_failed(&e, dropped_too_large));
+            }
+            if packet_buf.filled().is_empty() {
+                continue;
+            }
+            // Takes the connection lock: once per batch, not per packet.
+            let max_size = conn_out.max_datagram_size();
+            let mut outcome = DatagramSendOutcome::default();
+            // Polling between packets is what keeps the reader awake, but a
+            // trickle arriving just inside each budget must not hold the batch
+            // open for 64 budgets: TUN_DRAIN_BATCH_MAX caps the batch's age.
+            let batch_start = std::time::Instant::now();
+            let mut reads = 0usize;
+            loop {
+                reads += 1;
+                window_bytes += packet_buf.filled().len() as u64;
+                match tun_reader.split_frame(packet_buf.filled()) {
+                    Ok((offload, packet)) => {
+                        if packet_has_local_iroh_udp_port(packet, &local_iroh_udp_ports_out) {
+                            log::debug!(
+                                "Dropped self-encapsulated iroh UDP packet from TUN ({} bytes)",
+                                packet_buf.filled().len()
+                            );
+                        } else if let Some(intercept) = &dns_intercept
+                            && intercept.wants(packet)
+                        {
+                            intercept.capture(packet);
+                        } else {
+                            prepare_ip_datagrams(
+                                max_size,
+                                &mut arena,
+                                &mut seg_scratch,
+                                &mut pending,
+                                offload.as_ref(),
+                                packet,
+                                &mut outcome,
                             );
                         }
                     }
+                    Err(e) => log::warn!("Failed to parse TUN frame: {}", e),
                 }
-                Ok(()) => {}
-                Err(e) => {
-                    log::error!("TUN read error: {}", e);
-                    if dropped_too_large > 0 {
-                        log::debug!(
-                            "Outbound task dropped {} oversized packet(s) this session",
-                            dropped_too_large
-                        );
-                    }
-                    return Some(format!("TUN read error: {}", e));
+                // Bound on reads, not on `pending`: filtered, intercepted,
+                // malformed and oversized packets add nothing to it, and a
+                // TUN that stays readable must not keep this task from
+                // yielding.
+                if reads >= DATAGRAM_SEND_BATCH {
+                    break;
+                }
+                packet_buf.clear();
+                let budget = spin.min(TUN_DRAIN_BATCH_MAX.saturating_sub(batch_start.elapsed()));
+                match tun_reader.try_read_buf_within(&mut packet_buf, budget) {
+                    // The TUN is drained: send what we have.
+                    None => break,
+                    Some(Ok(())) if packet_buf.filled().is_empty() => break,
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return Some(tun_read_failed(&e, dropped_too_large)),
+                }
+            }
+            if !pending.is_empty() {
+                // A terminal error is already counted in `outcome`; the
+                // connection's liveness is watched elsewhere.
+                let _ = send_datagram_batch(&conn_out, &pending, &mut outcome).await;
+                pending.clear();
+            }
+            let elapsed = window_start.elapsed();
+            if elapsed >= TUN_SPIN_RATE_WINDOW {
+                let rate = window_bytes * 1000 / (elapsed.as_millis() as u64).max(1);
+                spin = if rate >= TUN_SPIN_MIN_RATE {
+                    TUN_DRAIN_SPIN
+                } else {
+                    Duration::ZERO
+                };
+                window_start = std::time::Instant::now();
+                window_bytes = 0;
+            }
+            if outcome.dropped_too_large > 0 {
+                dropped_too_large += outcome.dropped_too_large;
+                if !warned_too_large {
+                    warned_too_large = true;
+                    log::warn!(
+                        "Dropping packet(s) exceeding the current QUIC datagram size \
+                         (the discovered path MTU is too small); the inner flow \
+                         adapts. Further such drops are counted silently."
+                    );
                 }
             }
         }
@@ -1934,6 +1970,47 @@ pub(crate) fn overlapping_underlay_excludes(
         }
     }
     (v4, v6)
+}
+
+/// How long the TUN reader keeps polling for the next packet before it parks
+/// between batches, on platforms whose reader supports it (macOS utun), while
+/// the TUN is delivering at least [`TUN_SPIN_MIN_RATE`].
+///
+/// Parking on the reactor and being woken per packet costs tens of
+/// microseconds per packet, and the kernel's utun output path serializes
+/// against the reader, so a reader that sleeps between packets caps an upload
+/// at a fraction of what the utun can carry (measured: 230 Mbit/s parked,
+/// 500 Mbit/s polling, on the same Mac). Polling occupies a worker thread,
+/// though, so it is only worth it for a bulk flow; the byte-rate gate keeps
+/// a download's ACK stream, which is many packets but few bytes, from
+/// triggering it and taking CPU from the receive path.
+const TUN_DRAIN_SPIN: Duration = Duration::from_micros(100);
+
+/// Longest a batch stays open collecting packets before it is sent. Polling
+/// is per packet gap (one shared budget per batch ends it after a few packets
+/// of a dense flow and brings the park-and-wake back, measured 435 → 345
+/// Mbit/s), so this caps the latency a trickle arriving just inside each
+/// budget could otherwise add: 64 gaps of up to [`TUN_DRAIN_SPIN`].
+const TUN_DRAIN_BATCH_MAX: Duration = Duration::from_millis(1);
+
+/// Outbound TUN byte rate (bytes/s) above which the reader polls between
+/// batches (see [`TUN_DRAIN_SPIN`]): 10 MB/s, about 80 Mbit/s. An ACK stream
+/// for a 1 Gbit/s download is under 3 MB/s.
+const TUN_SPIN_MIN_RATE: u64 = 10 * 1024 * 1024;
+
+/// Window over which the outbound TUN byte rate is measured for the gate.
+const TUN_SPIN_RATE_WINDOW: Duration = Duration::from_millis(20);
+
+/// Log a fatal TUN read error and build the outbound task's disconnect reason.
+fn tun_read_failed(e: &VpnError, dropped_too_large: u64) -> String {
+    log::error!("TUN read error: {}", e);
+    if dropped_too_large > 0 {
+        log::debug!(
+            "Outbound task dropped {} oversized packet(s) this session",
+            dropped_too_large
+        );
+    }
+    format!("TUN read error: {}", e)
 }
 
 /// Return true if packet is UDP and either source/destination port matches a blocked port.

@@ -1,7 +1,7 @@
 //! Data path (unreliable QUIC datagrams) and control framing (reliable stream).
 //!
 //! Each IP packet maps **directly to one unreliable, unordered QUIC datagram**
-//! ([`send_ip_datagrams`] / [`Connection::read_datagram`]): the datagram body is
+//! ([`prepare_ip_datagrams`] + [`send_datagram_batch`] / [`Connection::read_datagram`]): the datagram body is
 //! the raw IP packet, with no length prefix, type byte, or offload metadata —
 //! QUIC preserves datagram boundaries, and the only other traffic (server
 //! address publications) rides a separate reliable stream. This is a
@@ -40,6 +40,15 @@ pub const FRAME_ARENA_CHUNK: usize = 64 * 1024;
 /// `read_many_datagrams` call on the receive paths, amortizing the connection
 /// lock (shared with its driver) over a burst instead of taking it per packet.
 pub const DATAGRAM_READ_BATCH: usize = 64;
+
+/// Maximum number of datagrams the client's TUN reader drains from the TUN
+/// before sending them as one batch. The batch takes the connection lock
+/// (shared with the driver, which holds it across every encrypt + send) once,
+/// where a per-packet send takes it three times per packet and, on a TUN with
+/// no offload (macOS utun, Windows, Android: one packet per read), serializes
+/// the reader against the driver's every send. A Linux GSO super-frame already
+/// segments into about this many datagrams, so one read fills a batch there.
+pub const DATAGRAM_SEND_BATCH: usize = 64;
 
 /// Size of the `u32` big-endian control-frame length prefix.
 pub const FRAME_LEN_PREFIX: usize = 4;
@@ -90,42 +99,6 @@ impl DatagramSendOutcome {
         self.dropped_too_large += other.dropped_too_large;
         self.dropped_other += other.dropped_other;
     }
-}
-
-/// Map one IP packet (optionally offload-tagged) to unreliable QUIC datagrams
-/// and send them on `conn`, one datagram per (segmented) packet.
-///
-/// A GSO super-frame cannot fit in a single datagram, so an offload-tagged
-/// packet is software-segmented into per-MSS plain packets first, each sent as
-/// its own datagram. The datagram body is the raw IP packet — no framing.
-///
-/// Sending waits for room in the bounded QUIC datagram queue. This lets QUIC's
-/// pacer and congestion controller regulate the TUN reader instead of silently
-/// evicting old datagrams under load. `arena` amortizes the per-datagram `Bytes`
-/// allocation.
-pub async fn send_ip_datagrams(
-    conn: &Connection,
-    arena: &mut BytesMut,
-    seg_scratch: &mut Vec<u8>,
-    pending: &mut Vec<Bytes>,
-    offload: Option<&VirtioNetHdr>,
-    packet: &[u8],
-) -> DatagramSendOutcome {
-    let mut outcome = DatagramSendOutcome::default();
-    prepare_ip_datagrams(
-        conn,
-        arena,
-        seg_scratch,
-        pending,
-        offload,
-        packet,
-        &mut outcome,
-    );
-    // A terminal error is already counted in `outcome`; the connection's
-    // liveness is watched elsewhere.
-    let _ = send_datagram_batch(conn, pending, &mut outcome).await;
-    pending.clear();
-    outcome
 }
 
 /// Queue prepared datagrams on `conn` without evicting any, taking the
@@ -207,12 +180,19 @@ fn fitting_prefix_len(datagrams: &[Bytes], space: usize) -> usize {
         .count()
 }
 
-/// Materialize a TUN packet into plain datagrams without sending them.
+/// Materialize a TUN packet into plain datagrams appended to `pending`, without
+/// sending them. A GSO super-frame cannot fit in a single datagram, so an
+/// offload-tagged packet is software-segmented into per-MSS plain packets
+/// first, each its own datagram. The datagram body is the raw IP packet, no
+/// framing.
 ///
-/// The server uses this to feed a bounded per-client queue, preserving client
-/// isolation while each client's writer awaits its own QUIC send capacity.
-pub(crate) fn prepare_ip_datagrams(
-    conn: &Connection,
+/// `max_size` is the connection's `max_datagram_size()`, read by the caller
+/// once per batch of packets: it takes the connection lock. The client sends
+/// `pending` with [`send_datagram_batch`]; the server feeds it to a bounded
+/// per-client queue, preserving client isolation while each client's writer
+/// awaits its own QUIC send capacity.
+pub fn prepare_ip_datagrams(
+    max_size: Option<usize>,
     arena: &mut BytesMut,
     seg_scratch: &mut Vec<u8>,
     pending: &mut Vec<Bytes>,
@@ -220,9 +200,6 @@ pub(crate) fn prepare_ip_datagrams(
     packet: &[u8],
     outcome: &mut DatagramSendOutcome,
 ) {
-    pending.clear();
-    // One lookup per TUN packet, not per segment: it takes the connection lock.
-    let max_size = conn.max_datagram_size();
     match offload {
         Some(meta) => {
             let segmented = materialize_offload_into(meta, packet, seg_scratch, |seg| {
