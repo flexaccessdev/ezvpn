@@ -69,6 +69,12 @@ url = "2"
 [target.'cfg(unix)'.dependencies]
 daemonix = "0.1"
 
+# Linux-only: jemalloc as the CLI's global allocator (set in src/main.rs), in
+# place of glibc malloc. `target_os = "linux"` excludes Android, whose `.so`
+# keeps the platform allocator.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.7"
+
 # Windows-only: resolve %ProgramData% via the Known Folders API
 # (SHGetKnownFolderPath) so the runtime/log dirs follow the real install drive
 # instead of assuming C:\ when the env var is missing.
