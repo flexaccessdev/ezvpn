@@ -866,7 +866,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -976,8 +976,8 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "flexaccess-iroh"
-version = "0.0.12"
-source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.12#df8f55b9dd0f717ffdfd98e4d9186abbf6c4038e"
+version = "0.0.13"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.13#5e7b920dcd6f1c4ccd2c15ef537a2a515a18f7b6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1570,8 +1570,8 @@ dependencies = [
 
 [[package]]
 name = "iroh"
-version = "1.4.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.0#14b865c542027b4d4ee6602dec70c63463a65467"
+version = "1.4.1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.1#b6a211372ff2d0f00ce210786278e7fabc5138ef"
 dependencies = [
  "backon",
  "blake3",
@@ -1619,8 +1619,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.4.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.0#14b865c542027b4d4ee6602dec70c63463a65467"
+version = "1.4.1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.1#b6a211372ff2d0f00ce210786278e7fabc5138ef"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1637,8 +1637,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.4.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.0#14b865c542027b4d4ee6602dec70c63463a65467"
+version = "1.4.1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.1#b6a211372ff2d0f00ce210786278e7fabc5138ef"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1686,8 +1686,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.4.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.0#14b865c542027b4d4ee6602dec70c63463a65467"
+version = "1.4.1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.1#b6a211372ff2d0f00ce210786278e7fabc5138ef"
 dependencies = [
  "blake3",
  "bytes",
@@ -1879,9 +1879,9 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
@@ -2116,8 +2116,7 @@ dependencies = [
 [[package]]
 name = "netdev"
 version = "0.46.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3c52c2584961c68f5a6e3356797344061f818c93b8acc9cd6d7e284795e563e"
+source = "git+https://github.com/flexaccessdev/netdev.git?branch=ezvpn-in6-ifreq-0.46.3#a7aea3487bb0cc2d84379439a10083267eea4f37"
 dependencies = [
  "block2",
  "dispatch2",
@@ -2219,7 +2218,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.3"
-source = "git+https://github.com/flexaccessdev/net-tools.git?branch=ezvpn-bufforce-0.19.3#96143525bf51046a4cd2b8e65b4d6a9a0faf3a84"
+source = "git+https://github.com/flexaccessdev/net-tools.git?branch=ezvpn-bufforce-0.19.3#53a5d67a55c9f4fed0ca7d94f9ab6dad5dd7bb05"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2930,7 +2929,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2988,7 +2987,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3421,7 +3420,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4051,7 +4050,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

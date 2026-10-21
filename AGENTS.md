@@ -29,8 +29,9 @@ consumed by git tag). Fix it there, tag a release, and bump the tag here; never
 re-implement or fork a copy of it in this repo. Only ezvpn-specific pieces (the
 VPN ALPN, QUIC transport tuning, the auth context, the bounded connect, key
 files) belong in `src/transport/` and `src/auth.rs`. ezvpn depends on forks of
-iroh, noq (noq, noq-proto, noq-udp) and netwatch, all under the `flexaccessdev`
-org (clones in `../iroh`, `../noq`, `../net-tools`), one `ezvpn-*` branch each
+iroh, noq (noq, noq-proto, noq-udp), netwatch and netdev, all under the
+`flexaccessdev` org (clones in `../iroh`, `../noq`, `../net-tools`, `../netdev`),
+one `ezvpn-*` branch each
 on top of the upstream release. They are applied through `[patch.crates-io]` in
 `Cargo.toml` rather than as git dependencies, so that every crate in the graph,
 the shared crate's `iroh` included, resolves to them. Fix transport-stack bugs

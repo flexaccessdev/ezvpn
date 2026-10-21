@@ -34,20 +34,16 @@ ipnet = { version = "2", features = ["serde"] }
 # Shared iroh transport layer (RelayConfig + per-relay probe, endpoint
 # build/rebuild, home-relay watchdog, endpoint-bound auth transcript). No
 # `mdns` feature: ezvpn runs no local-network discovery.
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.12" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.13" }
 # Redirected to the fork below via `[patch.crates-io]`, which also covers the
 # shared crate's own `iroh` dependency so the graph holds a single `iroh`.
 # `unstable-custom-transports` only makes the path-selector API public, for the
 # client's `exclude_direct_paths` selector (src/transport/path_selector.rs).
-iroh = { version = "1.4.0", features = ["unstable-custom-transports"] }
+iroh = { version = "1.4.1", features = ["unstable-custom-transports"] }
 noq-proto = "1.4.0"
 n0-watcher = "1.0.1"
 log = "0.4"
-# Capped below 0.2.190, which limits `in6_ifreq` to macOS: netdev (via iroh's
-# netwatch) still uses it on every Apple target, so the iOS slice of the
-# xcframework fails to compile against a newer libc. Lift the cap once netdev
-# ships shellrow/netdev#192 (defines the struct locally) and iroh picks it up.
-libc = ">=0.2, <0.2.190"
+libc = "0.2"
 rand = "0.10"
 # Custom-relay `/healthz` checks (see `transport::paths`). `rustls-no-provider`
 # matches the exact reqwest feature iroh already enables, so this adds no new TLS
@@ -126,10 +122,10 @@ panic = "abort"
 # resolves to the same package (see flexaccess-iroh's README, "Consumers on a
 # fork of iroh"). Cargo.lock pins each tested branch commit.
 [patch.crates-io]
-# Forked from iroh v1.4.0. Preserves established-path transport backpressure so
+# Forked from iroh v1.4.1. Preserves established-path transport backpressure so
 # noq retains and retries the transmit instead of treating a local discard as
 # successful, and wraps the noq fork's `try_send_many_datagrams`.
-iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send-backpressure-1.4.0" }
+iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send-backpressure-1.4.1" }
 # Forked from noq v1.4.0. Stamps each received batch as it is read rather than
 # once per endpoint-driver poll, and makes BBRv3 skip a non-positive RTT
 # sample: a stale receive timestamp read as a zero RTT, which the 10 s min-RTT
@@ -152,5 +148,13 @@ noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rt
 # busy peer beside the unconnected main socket, sharing its port with
 # SO_REUSEPORT: XNU charges every send that names a destination 25-40 µs of
 # PCB connect/disconnect, which a connected socket skips (see
-# docs/Architecture.md, "Throughput Design").
+# docs/Architecture.md, "Throughput Design"). It also defines the routing
+# socket constants (RTM_*, RTAX_*, ...) itself, which libc 0.2.190 limits to
+# macOS although iOS has the same routing socket.
 netwatch = { git = "https://github.com/flexaccessdev/net-tools.git", branch = "ezvpn-bufforce-0.19.3" }
+# Forked from netdev v0.46.3 with shellrow/netdev#192, which defines
+# `in6_ifreq` locally: libc 0.2.190 limits it to macOS, so netdev (via
+# netwatch) fails to compile for iOS against a newer libc. Drop it once netdev
+# releases the fix. Only the 0.46 line netwatch uses off Windows is replaced;
+# Windows stays on crates.io netdev 0.45.
+netdev = { git = "https://github.com/flexaccessdev/netdev.git", branch = "ezvpn-in6-ifreq-0.46.3" }
