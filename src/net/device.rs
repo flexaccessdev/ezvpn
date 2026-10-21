@@ -11,10 +11,10 @@
 // neither creates a utun nor configures routes (the NEPacketTunnelProvider
 // does), so it only reuses the shared fd I/O.
 //
-// On iOS and Android the device is built from an OS-provided fd
+// On iOS the device is built from an OS-provided fd
 // (`TunDevice::from_raw_fd`), so the `tun`-crate creation imports are unused
 // there; silence the noise.
-#![cfg_attr(any(target_os = "ios", target_os = "android"), allow(unused_imports, dead_code))]
+#![cfg_attr(target_os = "ios", allow(unused_imports, dead_code))]
 
 use crate::error::{VpnError, VpnResult};
 #[cfg(not(target_vendor = "apple"))]
@@ -52,15 +52,13 @@ use std::os::windows::process::CommandExt as _;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[cfg(any(target_vendor = "apple", target_os = "android"))]
+#[cfg(target_vendor = "apple")]
 use std::io;
 use std::time::Duration;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use std::os::fd::AsRawFd;
-#[cfg(any(target_vendor = "apple", target_os = "android"))]
+#[cfg(target_vendor = "apple")]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-#[cfg(target_os = "android")]
-use std::os::fd::IntoRawFd;
 #[cfg(target_vendor = "apple")]
 use std::sync::Arc;
 #[cfg(target_vendor = "apple")]
@@ -242,10 +240,9 @@ pub struct TunDevice {
 impl TunDevice {
     /// Create a new TUN device with the given configuration.
     ///
-    /// Desktop-only: iOS and Android receive an already-created tun fd from
-    /// the Network Extension / `VpnService` and must use [`Self::from_raw_fd`]
-    /// instead.
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    /// Desktop-only: iOS receives an already-created tun fd from the Network
+    /// Extension and must use [`Self::from_raw_fd`] instead.
+    #[cfg(not(target_os = "ios"))]
     pub fn create(config: TunConfig) -> VpnResult<Self> {
         let mut tun_config = Configuration::default();
 
@@ -347,40 +344,6 @@ impl TunDevice {
             mtu,
             vnet_hdr_enabled: false,
             offload_status: TunOffloadStatus::disabled("Apple utun has no kernel offload"),
-        })
-    }
-
-    /// Wrap the tun file descriptor an Android `VpnService` established.
-    ///
-    /// `VpnService.Builder.establish()` returns a plain Linux TUN fd opened
-    /// with `IFF_NO_PI` and no vnet header: frames are bare IP packets, which
-    /// is exactly the `tun`-crate Standard reader/writer path with both
-    /// `packet_information` and `vnet_hdr` off. The service owns addresses,
-    /// routes, and MTU (`VpnService.Builder`); this constructor takes a private
-    /// `dup` of the fd, so the caller may close its copy once it returns.
-    ///
-    /// No offload: the app sandbox cannot issue `TUNSETOFFLOAD` on the fd the
-    /// system handed over, so the data path uses software segmentation.
-    #[cfg(target_os = "android")]
-    pub fn from_raw_fd(fd: RawFd, mtu: u16) -> VpnResult<Self> {
-        let owned = duplicate_fd(fd)?;
-        let mut tun_config = Configuration::default();
-        // The `tun` crate takes ownership of the dup and closes it on drop.
-        tun_config
-            .raw_fd(owned.into_raw_fd())
-            .close_fd_on_drop(true)
-            .mtu(mtu);
-        let device = tun::create_as_async(&tun_config).map_err(|e| {
-            VpnError::tun_device_with_source("Failed to wrap VpnService tun fd", e)
-        })?;
-        Ok(Self {
-            device,
-            name: "tun".to_string(),
-            mtu,
-            vnet_hdr_enabled: false,
-            offload_status: TunOffloadStatus::disabled(
-                "Android VpnService tun has no kernel offload",
-            ),
         })
     }
 
@@ -498,7 +461,7 @@ const TUN_PERMISSION_HELP: &str =
 /// Only a *permission* failure is fatal here; any other failure (or Windows,
 /// whose wintun driver reports privilege problems through a different path) is
 /// left for [`TunDevice::create`] to report with the full device configuration.
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(target_os = "ios"))]
 pub fn ensure_tun_permission() -> VpnResult<()> {
     // Windows (wintun) surfaces privilege problems through a driver-specific
     // error path and needs the wintun runtime just to attempt creation; skip the
@@ -648,7 +611,7 @@ fn set_utun_socket_buffers(fd: &OwnedFd) {
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "android"))]
+#[cfg(target_vendor = "apple")]
 fn duplicate_fd(fd: RawFd) -> VpnResult<OwnedFd> {
     let duplicated = unsafe { libc::dup(fd) };
     if duplicated < 0 {

@@ -62,8 +62,7 @@ The handshake (`perform_handshake`) and data-stream loop
 Key source in this repo:
 
 - `src/tunnel/mobile.rs` — `MobileSession` (connect → handshake → run) and the
-  network-config it returns to the extension (shared with the Android
-  `VpnService`, see `docs/Android-App.md`).
+  network-config it returns to the extension.
 - `src/ffi.rs` — the C entry points.
 - `src/net/device.rs` — `TunDevice::from_raw_fd` and the shared Darwin fd I/O.
 - `ios/ezvpn.h` — the C header (also the authoritative JSON config/result shapes).

@@ -40,27 +40,6 @@ jobs:
       - name: Build Apple xcframework + header (debug)
         run: ./build-apple.sh debug
 
-  # Clippy for the Android-gated modules (src/ffi_android.rs and the Android
-  # branches of src/ffi.rs / src/tunnel/mobile.rs), plus a verify-only build of
-  # libezvpn.so for every release ABI (debug profile for speed), mirroring the
-  # release workflow's build-android-lib job. Nothing is published.
-  android:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
-      - name: Clippy (arm64-v8a)
-        run: |
-          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:?runner image has no Android NDK}"
-          rustup target add aarch64-linux-android
-          cargo ndk -t arm64-v8a --platform 29 clippy --lib -- -D warnings
-      - name: Build libezvpn.so (debug)
-        run: |
-          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:?runner image has no Android NDK}"
-          ABIS="arm64-v8a armeabi-v7a x86_64" ./build-android.sh debug
-
   # The host clippy compiles the Windows-gated module (src/ffi_windows.rs).
   windows:
     runs-on: windows-latest

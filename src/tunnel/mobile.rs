@@ -1,13 +1,12 @@
-//! Slim mobile connect path (iOS/macOS Network Extension, Android VpnService).
+//! Slim mobile connect path (iOS/macOS Network Extension).
 //!
 //! Mobile VPNs run inside an OS-managed container — a `NEPacketTunnelProvider`
-//! app extension on Apple platforms, a `VpnService` on Android — that owns the
-//! tunnel interface. Unlike the desktop [`crate::tunnel::client::VpnClient`],
+//! app extension on Apple platforms — that owns the tunnel interface. Unlike the desktop [`crate::tunnel::client::VpnClient`],
 //! this path:
 //!
 //! - does **not** create a tun device or configure routes/IP/MTU — the
-//!   extension owns that via `NEPacketTunnelNetworkSettings` (the Android
-//!   service via `VpnService.Builder`), then hands us the tunnel's fd;
+//!   extension owns that via `NEPacketTunnelNetworkSettings`, then hands us
+//!   the tunnel's fd;
 //! - does **not** install OS bypass routes itself. Instead [`MobileSession::connect`]
 //!   computes the underlay-bypass set the desktop `BypassRouteManager` would pin
 //!   (every relay IP plus the server's handshake-advertised candidate underlay
@@ -15,8 +14,7 @@
 //!   capture — including the server's advertised host prefix, which the
 //!   extension always routes) and [`MobileSession::network_config`] returns them as
 //!   host routes (`/32` / `/128`) for the extension to apply as
-//!   `excludedRoutes` (Android, which has no exclude API before 13, subtracts
-//!   them from the routed prefixes instead). Private-scope server addresses
+//!   `excludedRoutes`. Private-scope server addresses
 //!   (RFC1918/ULA/link-local)
 //!   are never bypassed: the app refuses to start when a routed prefix overlaps
 //!   the local network, so they are unreachable off-tunnel in any session that
@@ -38,11 +36,11 @@
 //!
 //! 1. [`MobileSession::connect`] — create an iroh endpoint, connect, handshake.
 //! 2. read [`MobileSession::network_config`], apply it as
-//!    `NEPacketTunnelNetworkSettings` / `VpnService.Builder`, obtain the fd.
+//!    `NEPacketTunnelNetworkSettings`, obtain the fd.
 //! 3. [`MobileSession::run`] — drive the tunnel over that fd until it ends.
 //!
 //! When the caller passes [`SessionEvents`] to `run` (the Apple extension
-//! does; Android does not yet), a lost session is reconnected in place, like
+//! does), a lost session is reconnected in place, like
 //! the desktop client's reconnect loop: same endpoint, same device id, same tun
 //! fd, retried with the desktop backoff until it succeeds or the caller stops
 //! the handle. If the server hands back different network parameters (a
@@ -65,7 +63,6 @@ use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
 use crate::transport::endpoint::{RelayConfig, connect_with_timeout, create_client_endpoint};
-use crate::tunnel::dns_proxy::DnsProxyConfig;
 use crate::tunnel::client::{
     ServerInfo, calculate_backoff, collect_local_iroh_udp_ports, collect_relay_ips,
     overlapping_underlay_excludes, perform_handshake, run_tunnel,
@@ -105,12 +102,9 @@ pub struct MobileConfig {
     /// Server addresses whose direct paths must never carry the tunnel (see
     /// [`crate::transport::path_selector`]).
     pub exclude_direct_paths: Vec<IpNet>,
-    /// Android only: the in-tunnel split-DNS forwarder (see
-    /// [`crate::tunnel::dns_proxy`]). `None` everywhere else.
-    pub dns_proxy: Option<DnsProxyConfig>,
 }
 
-/// The network parameters the extension (or VpnService) needs to configure the
+/// The network parameters the extension needs to configure the
 /// tunnel interface.
 ///
 /// Each family is optional, mirroring the server's assignment: IPv4-only,
@@ -188,8 +182,6 @@ pub struct MobileSession {
     /// The live connection, replaced on every reconnect, for on-demand path
     /// snapshots (`ezvpn_conn_path`) while [`Self::run`] owns the session.
     current_connection: Arc<Mutex<Connection>>,
-    /// Forwarder configuration handed to `run_tunnel` by [`Self::run`].
-    dns_proxy: Option<DnsProxyConfig>,
 }
 
 impl MobileSession {
@@ -236,7 +228,6 @@ impl MobileSession {
             routes6: cfg.routes6,
             device_id,
             link,
-            dns_proxy: cfg.dns_proxy,
         })
     }
 
@@ -266,8 +257,7 @@ impl MobileSession {
     /// the module docs), reporting progress through `events`; `run` then ends
     /// only on a non-recoverable error — including
     /// [`VpnError::ServerConfigChanged`] when the new session's network
-    /// parameters differ from the ones applied to the fd. The Android DNS
-    /// forwarder cannot be restarted, so a session using it never reconnects.
+    /// parameters differ from the ones applied to the fd.
     ///
     /// The two `run_tunnel` bypass hooks are `None`: the dynamic in-data-path
     /// bypass-route manager and server-address publisher channel are not used.
@@ -275,11 +265,9 @@ impl MobileSession {
     /// front, by the extension's `NEPacketTunnelNetworkSettings` (computed in
     /// [`Self::connect`], see module docs).
     pub async fn run(self, tun_fd: RawFd, events: Option<SessionEvents>) -> VpnResult<()> {
-        let events = events.filter(|_| self.dns_proxy.is_none());
         let applied = self.link.network_config();
         let local_iroh_udp_ports: Arc<HashSet<u16>> =
             Arc::new(collect_local_iroh_udp_ports(&self.endpoint));
-        let mut dns_proxy = self.dns_proxy;
         let mut link = self.link;
         loop {
             // `run_tunnel` consumes the device; wrap a fresh dup of the same fd
@@ -293,7 +281,6 @@ impl MobileSession {
                 None,
                 None,
                 local_iroh_udp_ports.clone(),
-                dns_proxy.take(),
             )
             .await
             {

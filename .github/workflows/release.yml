@@ -135,27 +135,6 @@ jobs:
           name: release-apple
           path: dist/apple/libezvpn-apple.xcframework.zip
 
-  build-android-lib:
-    needs: setup
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
-      - name: Build libezvpn.so per ABI + zip
-        # build-android.sh installs the Android Rust targets if missing, builds
-        # one libezvpn.so per ABI with the runner's preinstalled NDK, and stages
-        # dist/android/jniLibs + libezvpn-android.zip. That zip becomes the
-        # release asset the Android app's Gradle build downloads by default.
-        run: |
-          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:?runner image has no Android NDK}"
-          ./build-android.sh release
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-android
-          path: dist/android/libezvpn-android.zip
-
   build-windows:
     needs: setup
     if: needs.setup.outputs.is_prerelease == 'false'
@@ -196,8 +175,8 @@ jobs:
           path: dist/windows/ezvpn-windows.dll.zip
 
   publish-release:
-    needs: [setup, build-linux, build-macos, build-apple, build-android-lib, build-windows, build-windows-lib]
-    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-apple.result == 'success' && needs.build-android-lib.result == 'success' && needs.build-windows-lib.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    needs: [setup, build-linux, build-macos, build-apple, build-windows, build-windows-lib]
+    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-apple.result == 'success' && needs.build-windows-lib.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

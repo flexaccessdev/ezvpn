@@ -79,9 +79,9 @@ The app drives the tunnel with these calls (full signatures and JSON shapes in
    enough to poll for the `"connected"` state: it leaves out the connection
    path and custom-relay health.
 3. `ezvpn_conn_path(handle, out_buf, out_len)` — on demand (the app's
-   "Connection path…" button, as on Apple and Android): every iroh path with
+   "Connection path…" button, as on Apple): every iroh path with
    the selected one marked, plus each custom relay's `/healthz` result. Same
-   JSON as the Apple/Android `ezvpn_conn_path`; not for polling, since it makes
+   JSON as the Apple `ezvpn_conn_path`; not for polling, since it makes
    the relay health requests.
 4. `ezvpn_stop(handle)` — signal the loop to stop, wait for the route/adapter
    teardown to finish, and free the handle.

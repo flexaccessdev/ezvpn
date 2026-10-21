@@ -1,6 +1,5 @@
-//! C FFI surface for the fd-based mobile clients: the iOS and macOS Network
-//! Extension app extensions link it directly, and the Android JNI layer
-//! ([`crate::ffi_android`]) wraps the same handle and lifecycle.
+//! C FFI surface for the fd-based clients: the iOS and macOS Network Extension
+//! app extensions link it directly.
 //!
 //! The extension links `libezvpn.a` and drives the tunnel in three calls:
 //!
@@ -67,7 +66,6 @@
 //! ```
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -78,7 +76,6 @@ use serde::Deserialize;
 use crate::error::{VpnError, VpnResult};
 use crate::transport::endpoint::RelayConfig;
 use crate::transport::paths::connection_snapshot;
-use crate::tunnel::dns_proxy::DnsProxyConfig;
 use crate::tunnel::mobile::{MobileConfig, MobileSession, SessionEvent, SessionEvents};
 
 /// Callback run on the embedded runtime when the data loop started by
@@ -144,93 +141,6 @@ struct FfiConfig {
     /// direct paths, e.g. another VPN's range (see `transport::path_selector`).
     #[serde(default)]
     exclude_direct_paths: Vec<String>,
-    /// Android only: the in-tunnel split-DNS forwarder. Absent (or null) on
-    /// every other platform, which get conditional forwarding from the OS.
-    #[serde(default)]
-    dns_proxy: Option<FfiDnsProxy>,
-}
-
-/// The `dns_proxy` object of the config JSON (see [`crate::tunnel::dns_proxy`]).
-#[derive(Deserialize)]
-struct FfiDnsProxy {
-    /// Proxy IP literals the app points the VPN's DNS at (≤ 1 per family).
-    addresses: Vec<String>,
-    /// Domain suffixes resolved through the tunnel.
-    #[serde(default)]
-    match_domains: Vec<String>,
-    /// The tunnel's resolver IP literals (port 53).
-    servers: Vec<String>,
-    /// The underlying network's resolver IP literals (port 53); an IPv6
-    /// link-local one carries its scope as `fe80::1%<ifindex>`.
-    #[serde(default)]
-    fallback_servers: Vec<String>,
-    /// UDP socket fds the `VpnService` has `protect()`ed, at most one per
-    /// family, for the fallback upstreams. `dup`ed here; the app keeps and
-    /// closes its own.
-    #[serde(default)]
-    fallback_fds: Vec<i32>,
-}
-
-/// Parse a resolver literal with an optional `%<scope id>` suffix into a port-53
-/// socket address.
-fn parse_resolver(raw: &str) -> Result<SocketAddr, String> {
-    let (host, scope) = match raw.split_once('%') {
-        Some((h, s)) => (
-            h,
-            s.trim()
-                .parse::<u32>()
-                .map_err(|_| format!("invalid resolver scope in {raw:?} (expected a numeric interface index)"))?,
-        ),
-        None => (raw, 0),
-    };
-    let ip: IpAddr = host
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid resolver address {raw:?}"))?;
-    Ok(match ip {
-        IpAddr::V4(_) if scope != 0 => {
-            return Err(format!("invalid resolver address {raw:?} (IPv4 addresses take no scope)"));
-        }
-        IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, crate::tunnel::dns_proxy::DNS_PORT)),
-        IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, crate::tunnel::dns_proxy::DNS_PORT, 0, scope)),
-    })
-}
-
-fn parse_dns_proxy(raw: FfiDnsProxy) -> Result<DnsProxyConfig, String> {
-    let addresses = raw
-        .addresses
-        .iter()
-        .map(|a| a.trim().parse::<IpAddr>().map_err(|_| format!("invalid dns_proxy address {a:?}")))
-        .collect::<Result<Vec<_>, _>>()?;
-    if addresses.is_empty() {
-        return Err("dns_proxy.addresses must not be empty".to_string());
-    }
-    let servers = raw.servers.iter().map(|s| parse_resolver(s)).collect::<Result<Vec<_>, _>>()?;
-    if servers.is_empty() {
-        return Err("dns_proxy.servers must not be empty".to_string());
-    }
-    let fallback_servers = raw
-        .fallback_servers
-        .iter()
-        .map(|s| parse_resolver(s))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut fallback_sockets = Vec::new();
-    for fd in raw.fallback_fds {
-        // SAFETY: the app passes fds of sockets it owns and keeps open across
-        // this call; we only take our own dup.
-        let owned = unsafe { BorrowedFd::borrow_raw(fd) }
-            .try_clone_to_owned()
-            .map_err(|e| format!("cannot dup dns_proxy fallback fd {fd}: {e}"))?;
-        fallback_sockets.push(std::net::UdpSocket::from(owned));
-    }
-    Ok(DnsProxyConfig {
-        addresses,
-        match_domains: raw.match_domains,
-        servers,
-        fallback_servers,
-        fallback_sockets,
-    }
-    .normalized())
 }
 
 /// Parse CIDR strings into typed prefixes, failing on the first malformed entry
@@ -251,32 +161,17 @@ const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,tracing=warn";
 
 /// Initialize logging. Safe to call multiple times; subsequent calls are no-ops.
 ///
-/// Reads `RUST_LOG` (defaults to `info,iroh=warn,tracing=warn`). On Apple
-/// platforms the output goes to stderr, which the system captures into the
-/// unified log / Console. On Android stderr is discarded, so the output goes to
-/// logcat under the tag `ezvpn` instead.
+/// Reads `RUST_LOG` (defaults to `info,iroh=warn,tracing=warn`). The output goes
+/// to stderr, which the system captures into the unified log / Console.
 ///
 /// # Safety
 /// No arguments; always safe to call.
 #[unsafe(no_mangle)]
 pub extern "C" fn ezvpn_init_logging() {
-    #[cfg(target_os = "android")]
-    {
-        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.to_string());
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Trace)
-                .with_tag("ezvpn")
-                .with_filter(android_logger::FilterBuilder::new().parse(&filter).build()),
-        );
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
-        )
-        .try_init();
-    }
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
+    )
+    .try_init();
 }
 
 /// Generate a fresh client authentication keypair. Writes
@@ -403,8 +298,7 @@ pub unsafe extern "C" fn ezvpn_connect(
     }
 }
 
-/// The shared connect path behind [`ezvpn_connect`] and the Android JNI
-/// `connect`: parse the config JSON, connect + handshake on a fresh runtime, and
+/// The connect path behind [`ezvpn_connect`]: parse the config JSON, connect + handshake on a fresh runtime, and
 /// render the network-config JSON. Errors are ready-to-display messages.
 pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String> {
     let cfg: FfiConfig =
@@ -421,7 +315,6 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
         routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route")?,
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
         exclude_direct_paths: parse_routes::<IpNet>(&cfg.exclude_direct_paths, "excluded direct-path network")?,
-        dns_proxy: cfg.dns_proxy.map(parse_dns_proxy).transpose()?,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -527,7 +420,7 @@ impl EzvpnHandle {
         crate::ffi_common::conn_path_json(Some(snapshot))
     }
 
-    /// The shared body of [`ezvpn_run`]: `dup` the tun fd synchronously, then
+    /// The body of [`ezvpn_run`]: `dup` the tun fd synchronously, then
     /// spawn the data loop on the embedded runtime. `on_exit`, when given, runs
     /// on the runtime once the loop ends on its own (see [`ExitHook`]);
     /// `events`, when given, enables the in-place reconnect loop

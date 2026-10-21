@@ -187,11 +187,8 @@ pub async fn connection_snapshot(
 /// roots, i.e. exactly what iroh uses to verify the relay's own TLS (its
 /// `platform-verifier` feature is off), so a relay the tunnel trusts is one the
 /// health check trusts. reqwest's own default on the `rustls-no-provider`
-/// feature is `rustls-platform-verifier`, which on Android needs a JNI
-/// initialisation the host app never performs and otherwise panics with
-/// "Expect rustls-platform-verifier to be initialized" while the client is being
-/// built — a panic that aborts the process at the FFI boundary. Handing reqwest
-/// a preconfigured config keeps that verifier out entirely.
+/// feature is `rustls-platform-verifier`; handing reqwest a preconfigured config
+/// keeps that verifier out entirely.
 fn healthz_tls_config() -> rustls::ClientConfig {
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),

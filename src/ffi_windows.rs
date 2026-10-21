@@ -17,7 +17,7 @@
 //!    [`StatusSnapshot`], read in-process (no named pipe), minus the connection
 //!    path and custom-relay health so it is cheap to poll.
 //! 3. [`ezvpn_conn_path`] — on demand (the GUI's "Connection path…" dialog, as
-//!    on Apple and Android): every iroh path plus custom-relay health. Never
+//!    on Apple): every iroh path plus custom-relay health. Never
 //!    polled, since it makes a `/healthz` request per custom relay.
 //! 4. [`ezvpn_stop`] — signal the loop to stop, wait for the routes/TUN teardown
 //!    to complete (the run future's `Drop` removes routes and closes wintun),
@@ -445,7 +445,7 @@ pub unsafe extern "C" fn ezvpn_status(
 }
 
 /// Snapshot the live connection's iroh path(s) and custom-relay health as JSON
-/// into `out_buf` — the same document as the Apple/Android `ezvpn_conn_path`:
+/// into `out_buf` — the same document as the Apple `ezvpn_conn_path`:
 ///
 /// ```json
 /// { "paths": [

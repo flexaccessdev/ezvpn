@@ -45,7 +45,7 @@ pub const DATAGRAM_READ_BATCH: usize = 64;
 /// before sending them as one batch. The batch takes the connection lock
 /// (shared with the driver, which holds it across every encrypt + send) once,
 /// where a per-packet send takes it three times per packet and, on a TUN with
-/// no offload (macOS utun, Windows, Android: one packet per read), serializes
+/// no offload (macOS utun, Windows: one packet per read), serializes
 /// the reader against the driver's every send. A Linux GSO super-frame already
 /// segments into about this many datagrams, so one read fills a batch there.
 pub const DATAGRAM_SEND_BATCH: usize = 64;

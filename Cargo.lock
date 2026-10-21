@@ -47,23 +47,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "android_log-sys"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84521a3cf562bc62942e294181d9eef17eb38ceb8c68677bc49f144e4c3d4f8d"
-
-[[package]]
-name = "android_logger"
-version = "0.15.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbb4e440d04be07da1f1bf44fb4495ebd58669372fe0cffa6e48595ac5bd88a3"
-dependencies = [
- "android_log-sys",
- "env_filter 0.1.4",
- "log",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -822,16 +805,6 @@ dependencies = [
 
 [[package]]
 name = "env_filter"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
-dependencies = [
- "log",
- "regex",
-]
-
-[[package]]
-name = "env_filter"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
@@ -848,7 +821,7 @@ checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
 dependencies = [
  "anstream",
  "anstyle",
- "env_filter 2.0.0",
+ "env_filter",
  "jiff",
  "log",
 ]
@@ -900,9 +873,8 @@ dependencies = [
 
 [[package]]
 name = "ezvpn"
-version = "0.0.57"
+version = "0.0.58"
 dependencies = [
- "android_logger",
  "anyhow",
  "base64 0.23.1",
  "bytes",
@@ -918,13 +890,11 @@ dependencies = [
  "if-addrs",
  "ipnet",
  "iroh",
- "jni 0.21.1",
  "known-folders",
  "libc",
  "log",
  "mock_instant",
  "n0-watcher",
- "ndk-context",
  "noq-proto",
  "rand",
  "rand_chacha",
@@ -976,8 +946,8 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "flexaccess-iroh"
-version = "0.0.12"
-source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.12#df8f55b9dd0f717ffdfd98e4d9186abbf6c4038e"
+version = "0.0.13"
+source = "git+https://github.com/flexaccessdev/flexaccess-iroh?tag=v0.0.13#5e7b920dcd6f1c4ccd2c15ef537a2a515a18f7b6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1570,8 +1540,8 @@ dependencies = [
 
 [[package]]
 name = "iroh"
-version = "1.4.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.0#14b865c542027b4d4ee6602dec70c63463a65467"
+version = "1.4.1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.1#b6a211372ff2d0f00ce210786278e7fabc5138ef"
 dependencies = [
  "backon",
  "blake3",
@@ -1619,8 +1589,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.4.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.0#14b865c542027b4d4ee6602dec70c63463a65467"
+version = "1.4.1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.1#b6a211372ff2d0f00ce210786278e7fabc5138ef"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1637,8 +1607,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.4.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.0#14b865c542027b4d4ee6602dec70c63463a65467"
+version = "1.4.1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.1#b6a211372ff2d0f00ce210786278e7fabc5138ef"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -1686,8 +1656,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.4.0"
-source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.0#14b865c542027b4d4ee6602dec70c63463a65467"
+version = "1.4.1"
+source = "git+https://github.com/flexaccessdev/iroh.git?branch=ezvpn-send-backpressure-1.4.1#b6a211372ff2d0f00ce210786278e7fabc5138ef"
 dependencies = [
  "blake3",
  "bytes",
@@ -1879,9 +1849,9 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
@@ -2116,8 +2086,7 @@ dependencies = [
 [[package]]
 name = "netdev"
 version = "0.46.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3c52c2584961c68f5a6e3356797344061f818c93b8acc9cd6d7e284795e563e"
+source = "git+https://github.com/flexaccessdev/netdev.git?branch=ezvpn-in6-ifreq-0.46.3#a7aea3487bb0cc2d84379439a10083267eea4f37"
 dependencies = [
  "block2",
  "dispatch2",
@@ -2219,7 +2188,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.3"
-source = "git+https://github.com/flexaccessdev/net-tools.git?branch=ezvpn-bufforce-0.19.3#96143525bf51046a4cd2b8e65b4d6a9a0faf3a84"
+source = "git+https://github.com/flexaccessdev/net-tools.git?branch=ezvpn-bufforce-0.19.3#53a5d67a55c9f4fed0ca7d94f9ab6dad5dd7bb05"
 dependencies = [
  "atomic-waker",
  "bytes",
