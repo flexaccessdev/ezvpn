@@ -12,8 +12,6 @@ name = "ezvpn"
 # staticlib: linked into Apple Network Extensions (iOS and native macOS).
 # cdylib: `ezvpn.dll`, P/Invoked by the native Windows GUI (`ezvpn-windows`)
 #   via the C FFI in `src/ffi_windows.rs`. Built by `build-windows.ps1`.
-#   Also `libezvpn.so` for Android, loaded by the `ezvpn-android` app through
-#   the JNI surface in `src/ffi_android.rs`. Built by `build-android.sh`.
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
@@ -48,7 +46,7 @@ rand = "0.10"
 # Custom-relay `/healthz` checks (see `transport::paths`). `rustls-no-provider`
 # matches the exact reqwest feature iroh already enables, so this adds no new TLS
 # backend (no openssl / aws-lc); the probe hands reqwest a ring + webpki-roots
-# config so the platform verifier (unusable on Android) is never built.
+# config so the platform verifier is never built.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # Embedded Mozilla roots for the `/healthz` probe TLS config (same roots iroh
@@ -70,8 +68,7 @@ url = "2"
 daemonix = "0.1"
 
 # Linux-only: jemalloc as the CLI's global allocator (set in src/main.rs), in
-# place of glibc malloc. `target_os = "linux"` excludes Android, whose `.so`
-# keeps the platform allocator.
+# place of glibc malloc.
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.7"
 
@@ -92,19 +89,10 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 # Desktop-only: on-link subnet enumeration for the connect-time split-tunnel
-# overlap refusal (src/net/local_networks.rs). The mobile apps carry their own
-# ports of this check (ezvpn-apple TunnelCore, ezvpn-android tunnelcore).
-[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+# overlap refusal (src/net/local_networks.rs). The Apple app carries its own
+# port of this check (ezvpn-apple TunnelCore).
+[target.'cfg(not(target_os = "ios"))'.dependencies]
 if-addrs = "0.15"
-
-# Android-only: the JNI bridge for the `ezvpn-android` VpnService, and logcat
-# output for `log` (stderr is discarded on Android).
-[target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
-android_logger = "0.15"
-# iroh's Android DNS/interface discovery (hickory-resolver, netwatch) reaches
-# the JVM through this global; the app registers its Context via `EzvpnNative.init`.
-ndk-context = "0.1"
 
 [dev-dependencies]
 mock_instant = "0.6"

@@ -139,7 +139,7 @@ int ezvpn_status(const EzvpnHandle *handle, char *out_buf, size_t out_len);
 
 /*
  * Snapshot how the running tunnel reaches the server, as JSON into out_buf —
- * the same document as the Apple/Android ezvpn_conn_path, for an on-demand
+ * the same document as the Apple ezvpn_conn_path, for an on-demand
  * "connection path" view:
  *   {"paths":[
  *      {"kind":"direct","display":"Direct 1.2.3.4:52186 (rtt 1ms)","selected":true},

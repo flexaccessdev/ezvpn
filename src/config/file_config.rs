@@ -294,8 +294,8 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 
 // On-disk TOML loading is desktop-only (the mobile runtime config arrives as
 // JSON through the FFI; the default paths resolve via
-// `crate::runtime::config_dir`, a module not built on iOS/Android).
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+// `crate::runtime::config_dir`, a module not built on iOS).
+#[cfg(not(target_os = "ios"))]
 fn load_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -306,17 +306,17 @@ fn load_config<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 /// Default config path: the machine-global system config directory (see
 /// [`crate::runtime::config_dir`]), not a per-user home directory — `ezvpn` runs
 /// as root/LocalSystem.
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(target_os = "ios"))]
 fn default_vpn_server_config_path() -> PathBuf {
     crate::runtime::config_dir().join("vpn_server.toml")
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(target_os = "ios"))]
 fn default_vpn_client_config_path() -> PathBuf {
     crate::runtime::config_dir().join("vpn_client.toml")
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(target_os = "ios"))]
 pub fn load_vpn_server_config(path: Option<&Path>) -> Result<VpnServerConfig> {
     let config_path = match path {
         Some(p) => expand_tilde(p),
@@ -325,7 +325,7 @@ pub fn load_vpn_server_config(path: Option<&Path>) -> Result<VpnServerConfig> {
     load_config(&config_path)
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(target_os = "ios"))]
 pub fn load_vpn_client_config(path: Option<&Path>) -> Result<VpnClientConfig> {
     let config_path = match path {
         Some(p) => expand_tilde(p),

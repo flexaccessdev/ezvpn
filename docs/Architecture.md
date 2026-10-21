@@ -210,7 +210,7 @@ A datagram can only carry a single ~MTU-sized packet, so no coalesced super-fram
 ### Throughput Design
 
 - **Bounded paced batch sends**: the client TUN reader (one call per batch of TUN reads, see below) and the server's per-client writers (one call per `recv_many` batch) queue datagrams through `send_datagram_batch` in `stream.rs`. One `try_send_many_datagrams` (the non-evicting batch queue carried by the noq and iroh forks) queues the longest prefix the send buffer holds and reports how many that was; when not even the next datagram fits, that datagram awaits `send_datagram_wait`, applying QUIC backpressure directly. The connection's state lock is shared with its driver, which holds it while it encrypts and sends, so taking it once per run instead of several times per datagram keeps the producer from serializing against the driver (`max_datagram_size()` is likewise read once per batch). The evicting `send_many_datagrams` is never used: the send buffer charges each queued datagram its frame struct on top of its payload, so `datagram_send_buffer_space()`, exact for a single datagram, cannot size a run that is guaranteed to fit. The server TUN reader feeds a bounded queue per client and each independent writer drains it, preserving client isolation. Unguarded non-waiting sends are never used — they silently evict older queued datagrams while reporting success.
-- **Batched TUN reads**: the client TUN reader blocks for one packet, then drains what the TUN already has queued (`try_read_buf`, up to `DATAGRAM_SEND_BATCH` (64) datagrams) and sends the batch with one `send_datagram_batch`: one `max_datagram_size()` read and one send-buffer check per batch instead of three lock acquisitions per packet. On Linux a GSO super-frame fills a batch by itself; it matters on TUNs with no offload (macOS utun, Windows, Android), which hand over one packet per read.
+- **Batched TUN reads**: the client TUN reader blocks for one packet, then drains what the TUN already has queued (`try_read_buf`, up to `DATAGRAM_SEND_BATCH` (64) datagrams) and sends the batch with one `send_datagram_batch`: one `max_datagram_size()` read and one send-buffer check per batch instead of three lock acquisitions per packet. On Linux a GSO super-frame fills a batch by itself; it matters on TUNs with no offload (macOS utun, Windows), which hand over one packet per read.
 - **Batched datagram reads**: the client and server receive paths drain up to `DATAGRAM_READ_BATCH` (64) datagrams per `read_many_datagrams` call, one connection-lock acquisition per burst instead of per packet.
 - **Batched TUN writes**: the TUN writer drains up to `WRITE_BATCH_SIZE` (256) inbound packets per `recv_many` to amortize task wakeups, then coalesces same-flow runs into kernel GSO writes where supported.
 - **Datagram arena**: per-datagram `Bytes` are split off a long-lived 64 KB `BytesMut` (`copy_packet_to_arena`), so the allocator is hit once per arena chunk instead of once per datagram. Inbound datagrams arrive as owned `Bytes` from `read_many_datagrams` and cross the TUN-writer channel with no copy.
@@ -283,26 +283,9 @@ When both `network` and `network6` are configured, each client normally receives
 | Windows | `wintun.dll` | `netsh interface route` (VPN routes); `NetTCPIP` PowerShell cmdlets `Find-NetRoute`/`New-NetRoute` (underlay bypass host routes) | Administrator |
 
 The GUI clients build on this same per-platform TUN/route code. On Apple the OS
-hands the extension a `utun` fd (`docs/Apple-App.md`); on Android the
-`VpnService` hands the core its `establish()`ed tun fd and owns routes/DNS
-itself (`docs/Android-App.md`); on Windows the native GUI P/Invokes
-`ezvpn.dll`, which drives the desktop `VpnClient` (wintun + `netsh`) in-process
-(`docs/Windows-App.md`).
-
-#### Android Split DNS (In-Tunnel Forwarder)
-
-Android's `VpnService` has no per-domain DNS: `addDnsServer` replaces the
-resolvers for every name, and an app cannot bind port 53. The Android app
-therefore implements match domains the way Tailscale's MagicDNS does: the VPN's
-DNS server is a proxy address routed into the tun (`198.18.0.53` /
-`fd7e:7a00:d45::53`), and the client data path (`src/tunnel/dns_proxy.rs`)
-intercepts UDP/53 to it, forwards matched names to the tunnel's resolvers
-(ordinary sockets — the OS routes them back through the tunnel) and everything
-else to the underlying network's resolvers through `protect()`ed sockets the
-service hands over, rewriting DNS ids per in-flight query and writing answers
-back into the tun. TCP SYNs to the proxy's 53/853 get a RST; oversized answers
-are truncated (TC). The hook is a `None` on every non-Android caller of
-`run_tunnel`; the design and limits are in `docs/Android-App.md`.
+hands the extension a `utun` fd (`docs/Apple-App.md`); on Windows the native
+GUI P/Invokes `ezvpn.dll`, which drives the desktop `VpnClient` (wintun +
+`netsh`) in-process (`docs/Windows-App.md`).
 
 ### Split-Tunnel Overlap Refusal (Client)
 
@@ -663,7 +646,7 @@ VPN mode includes automatic reconnection when a connection attempt fails or the 
 - Every recoverable failure (`ConnectionLost` / `Network` / `Signaling` — see `VpnError::is_recoverable`) is retried. The first attempt is no different from any later one: a server that is down or not up yet is the ordinary case, not an error to exit on.
 - Permanent errors (`AuthenticationFailed` / `Config` / `TunDevice` / `ServerConfigChanged` / `RouteOverlapsLocalNetwork`, …) never retry — the same credential and config would fail the same way every time.
 - A long outage costs one bounded connect (`CONNECT_TIMEOUT`, 30 s) per attempt on the endpoint the client already holds, once a minute at the backoff cap. The desktop client has no event that cuts a backoff step short (no network-path or foreground signal), so the server's return is noticed up to a minute late.
-- The Apple app's fd-based session (`MobileSession::run`, `src/tunnel/mobile.rs`) runs the same backoff in place: it reconnects on the same endpoint, device id and utun fd, and reports progress through `ezvpn_run`'s event callback, which the extension shows as `reasserting`. If the server hands back different network settings (a restarted server re-allocated the address), the fd's interface is stale: the loop ends with `EZVPN_EVENT_RECONFIGURE` and the extension connects afresh and re-applies them. Android does not enable this yet; its service tears down on exit.
+- The Apple app's fd-based session (`MobileSession::run`, `src/tunnel/mobile.rs`) runs the same backoff in place: it reconnects on the same endpoint, device id and utun fd, and reports progress through `ezvpn_run`'s event callback, which the extension shows as `reasserting`. If the server hands back different network settings (a restarted server re-allocated the address), the fd's interface is stale: the loop ends with `EZVPN_EVENT_RECONFIGURE` and the extension connects afresh and re-applies them.
 - The loop publishes its progress through `ClientStatusHandle::set_reconnecting` (failed attempts, last error, next attempt due) into the `ClientStatus` snapshot — `failed_attempts`, `last_error`, `next_attempt_secs` — which `ezvpn client status` prints on a `Reconnecting:` line while down and the Windows app reads through `ezvpn_status`.
 
 **Health Monitoring:**
