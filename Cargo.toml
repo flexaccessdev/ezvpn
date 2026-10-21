@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.56"
+version = "0.0.57"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 readme = "README.md"
@@ -34,14 +34,14 @@ ipnet = { version = "2", features = ["serde"] }
 # Shared iroh transport layer (RelayConfig + per-relay probe, endpoint
 # build/rebuild, home-relay watchdog, endpoint-bound auth transcript). No
 # `mdns` feature: ezvpn runs no local-network discovery.
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.10" }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.12" }
 # Redirected to the fork below via `[patch.crates-io]`, which also covers the
 # shared crate's own `iroh` dependency so the graph holds a single `iroh`.
 # `unstable-custom-transports` only makes the path-selector API public, for the
 # client's `exclude_direct_paths` selector (src/transport/path_selector.rs).
-iroh = { version = "1.3.0", features = ["unstable-custom-transports"] }
-noq-proto = "1.3.0"
-n0-watcher = "1.0.0"
+iroh = { version = "1.4.0", features = ["unstable-custom-transports"] }
+noq-proto = "1.4.0"
+n0-watcher = "1.0.1"
 log = "0.4"
 libc = "0.2"
 rand = "0.10"
@@ -59,7 +59,7 @@ serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-toml = "1.1.3"
+toml = "1.1.8"
 tun = { version = "0.8", features = ["async"] }
 url = "2"
 
@@ -122,20 +122,23 @@ panic = "abort"
 # resolves to the same package (see flexaccess-iroh's README, "Consumers on a
 # fork of iroh"). Cargo.lock pins each tested branch commit.
 [patch.crates-io]
-# Forked from iroh v1.3.0. Preserves established-path transport backpressure so
+# Forked from iroh v1.4.0. Preserves established-path transport backpressure so
 # noq retains and retries the transmit instead of treating a local discard as
-# successful.
-iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send-backpressure-1.3.0" }
-# Forked from noq v1.3.0. Stamps each received batch as it is read rather than
+# successful, and wraps the noq fork's `try_send_many_datagrams`.
+iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send-backpressure-1.4.0" }
+# Forked from noq v1.4.0. Stamps each received batch as it is read rather than
 # once per endpoint-driver poll, and makes BBRv3 skip a non-positive RTT
 # sample: a stale receive timestamp read as a zero RTT, which the 10 s min-RTT
 # filter held, zeroing the BDP and leaving the congestion window erratic on
 # sub-millisecond paths. Also adds `UdpSocketState::send_connected` for the
-# netwatch fork's connected peer sockets on Apple platforms. All three crates
+# netwatch fork's connected peer sockets on Apple platforms, and
+# `Connection::try_send_many_datagrams`, the batch send that queues until the
+# send buffer is full and returns the count instead of evicting older
+# datagrams (`send_datagram_batch` in src/tunnel/stream.rs). All three crates
 # come from the fork so the graph holds a single `noq-udp`.
-noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
-noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
-noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.3.0" }
+noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.4.0" }
+noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.4.0" }
+noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.4.0" }
 # Forked from netwatch v0.19.3 (n0-computer/net-tools). Sizes iroh's UDP
 # socket buffers with SO_RCVBUFFORCE/SO_SNDBUFFORCE when the process holds
 # CAP_NET_ADMIN (the VPN runs as root), so Linux's default

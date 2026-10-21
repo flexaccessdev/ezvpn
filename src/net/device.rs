@@ -591,10 +591,12 @@ impl DarwinTunHalves {
     fn from_raw_fd(fd: RawFd) -> VpnResult<Self> {
         let fd = duplicate_fd(fd)?;
         set_utun_socket_buffers(&fd);
-        let fd = Arc::new(
-            AsyncFd::new(fd)
-                .map_err(|e| VpnError::tun_device_with_source("Failed to register utun fd", e))?,
-        );
+        // SAFETY: `fd` is an `OwnedFd` this function just `dup`ed, so it is a
+        // valid open descriptor that stays open, and keeps naming the same
+        // file description, for as long as the `AsyncFd` owns it.
+        let fd = Arc::new(unsafe { AsyncFd::register(fd) }.map_err(|e| {
+            VpnError::tun_device_with_source("Failed to register utun fd", e.into_parts().1)
+        })?);
         Ok(Self {
             reader: DarwinTunReader { fd: fd.clone() },
             writer: DarwinTunWriter { fd },
