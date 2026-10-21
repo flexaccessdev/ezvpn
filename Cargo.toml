@@ -43,7 +43,11 @@ iroh = { version = "1.4.0", features = ["unstable-custom-transports"] }
 noq-proto = "1.4.0"
 n0-watcher = "1.0.1"
 log = "0.4"
-libc = "0.2"
+# Capped below 0.2.190, which limits `in6_ifreq` to macOS: netdev (via iroh's
+# netwatch) still uses it on every Apple target, so the iOS slice of the
+# xcframework fails to compile against a newer libc. Lift the cap once netdev
+# ships shellrow/netdev#192 (defines the struct locally) and iroh picks it up.
+libc = ">=0.2, <0.2.190"
 rand = "0.10"
 # Custom-relay `/healthz` checks (see `transport::paths`). `rustls-no-provider`
 # matches the exact reqwest feature iroh already enables, so this adds no new TLS
