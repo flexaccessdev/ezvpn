@@ -34,7 +34,7 @@ use iroh::{Endpoint, EndpointId, RelayUrl, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::ReadBuf;
@@ -43,9 +43,30 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 /// Maximum number of frames drained from a channel per batch.
 const WRITE_BATCH_SIZE: usize = 256;
 
-/// Per-client outbound packet queue depth (fixed, like WireGuard's internal
-/// queue sizes). ~1.5 MB worst case per client at MTU-sized packets.
-const CLIENT_CHANNEL_SIZE: usize = 1024;
+/// Per-client control-stream queue depth (`ServerAddrs` and `Pong` frames).
+const CONTROL_CHANNEL_SIZE: usize = 1024;
+
+/// Per-client outbound data backlog budget, in bytes of queued datagrams plus
+/// [`QUEUED_DATAGRAM_OVERHEAD`] each. The TUN reader charges every datagram it
+/// hands to a client's writer against this budget and drops, counted by
+/// `packets_dropped_full`, what would exceed it, so a slow client's backlog
+/// stays bounded and never stalls routing for other clients.
+///
+/// This queue is the bottleneck buffer whenever a client's QUIC drain (userspace
+/// crypto, ~1.2 Gbit/s per connection on a LAN) is slower than the kernel feeds
+/// the server TUN, so it has to be sized for the inner TCP rather than for
+/// memory alone: Linux lets one TCP socket keep up to 4 MiB in flight
+/// (`tcp_wmem` autotuning), and the queue must hold that in-flight data or the
+/// flow loses segments on every burst. The former 1024-datagram (~1.4 MB) queue
+/// tail-dropped tens to hundreds of segments per 10 s download run and cost ~19%
+/// server→client throughput against a client on the same LAN; 16 MiB holds a
+/// few such flows without loss, at a worst-case standing queue of ~100 ms at
+/// that rate for a client whose inbound traffic does not back off.
+const CLIENT_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Budget charge per queued datagram on top of its payload: the `Bytes` handle
+/// and channel slot, so a backlog of tiny packets (pure ACKs) is bounded too.
+const QUEUED_DATAGRAM_OVERHEAD: usize = 64;
 
 /// Aggregate client→TUN writer queue depth (fixed). Shared by all clients, so
 /// it bounds memory (~750 KB worst case) while absorbing bursts.
@@ -103,9 +124,88 @@ struct ClientState {
     /// The iroh connection: the TUN reader sends IP packets to this client as
     /// unreliable datagrams on it, and status reporting reads its live paths.
     connection: Connection,
-    /// Bounded handoff to this client's datagram writer. A full queue drops
-    /// only this client's packet and never stalls routing for other clients.
-    datagram_tx: mpsc::Sender<Bytes>,
+    /// Byte-budgeted handoff to this client's datagram writer. A full queue
+    /// drops only this client's packet and never stalls routing for other
+    /// clients.
+    datagram_tx: ClientDatagramQueue,
+}
+
+/// Charge of one queued datagram against [`CLIENT_QUEUE_BYTES`].
+fn queued_datagram_cost(len: usize) -> usize {
+    len + QUEUED_DATAGRAM_OVERHEAD
+}
+
+/// Producer half of a client's outbound data queue: an unbounded channel whose
+/// occupancy is bounded by [`CLIENT_QUEUE_BYTES`] rather than by a datagram
+/// count, so MTU-sized segments and 52-byte ACKs are charged what they cost.
+/// `try_push` never waits: the TUN reader serves every client from one task.
+#[derive(Clone)]
+struct ClientDatagramQueue {
+    tx: mpsc::UnboundedSender<Bytes>,
+    /// Bytes charged for datagrams pushed and not yet released by the writer.
+    queued_bytes: Arc<AtomicUsize>,
+    /// Arena this client's queued datagrams are copied into. Per client, not
+    /// shared across the TUN reader: a queued `Bytes` keeps its whole
+    /// [`FRAME_ARENA_CHUNK`] alive, so with a shared arena one slow client's
+    /// small packets, interleaved with other clients' traffic, could pin a
+    /// chunk each and retain far more memory than the budget charges them.
+    /// Owning the arena bounds a client's retention to about its budget plus
+    /// a chunk. Only the TUN reader locks it, so the lock is uncontended.
+    arena: Arc<Mutex<BytesMut>>,
+}
+
+/// Consumer half: the client's writer drains batches and releases their charge
+/// once they are handed to QUIC, so the budget also covers the batch in hand.
+struct ClientDatagramReceiver {
+    rx: mpsc::UnboundedReceiver<Bytes>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl ClientDatagramQueue {
+    fn new() -> (Self, ClientDatagramReceiver) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                tx,
+                queued_bytes: queued_bytes.clone(),
+                arena: Arc::new(Mutex::new(BytesMut::with_capacity(FRAME_ARENA_CHUNK))),
+            },
+            ClientDatagramReceiver { rx, queued_bytes },
+        )
+    }
+
+    /// Queue one datagram, or return it when the budget is exhausted (`Full`)
+    /// or the writer is gone (`Closed`).
+    fn try_push(&self, datagram: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        let cost = queued_datagram_cost(datagram.len());
+        // Reserve first and give back on overshoot: correct with any number of
+        // producers, and the writer only ever releases.
+        let before = self.queued_bytes.fetch_add(cost, Ordering::AcqRel);
+        if before + cost > CLIENT_QUEUE_BYTES {
+            self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+            return Err(mpsc::error::TrySendError::Full(datagram));
+        }
+        self.tx.send(datagram).map_err(|mpsc::error::SendError(datagram)| {
+            self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+            mpsc::error::TrySendError::Closed(datagram)
+        })
+    }
+}
+
+impl ClientDatagramReceiver {
+    /// Append up to `limit` queued datagrams to `batch`, waiting for at least
+    /// one; returns 0 once every producer is gone. The batch stays charged until
+    /// [`Self::release`].
+    async fn recv_many(&mut self, batch: &mut Vec<Bytes>, limit: usize) -> usize {
+        self.rx.recv_many(batch, limit).await
+    }
+
+    /// Return the budget held by datagrams the writer has finished with.
+    fn release(&self, batch: &[Bytes]) {
+        let cost: usize = batch.iter().map(|d| queued_datagram_cost(d.len())).sum();
+        self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+    }
 }
 
 /// Per-client context used by the data handler.
@@ -1253,12 +1353,12 @@ impl VpnServer {
         // Create channel for the client's control-stream writer task. The task
         // owns the bi-stream's send half and writes `ServerAddrs` and `Pong` frames;
         // IP packets to this client are sent as datagrams by the TUN reader.
-        let (packet_tx, mut packet_rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_SIZE);
+        let (packet_tx, mut packet_rx) = mpsc::channel::<Bytes>(CONTROL_CHANNEL_SIZE);
 
-        // Keep a separate bounded data queue per client. Its writer uses the
-        // awaitable datagram API, so QUIC congestion applies backpressure here
-        // without allowing one slow client to block the server TUN reader.
-        let (datagram_tx, mut datagram_rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_SIZE);
+        // Keep a separate byte-budgeted data queue per client. Its writer uses
+        // the awaitable datagram API, so QUIC congestion applies backpressure
+        // here without allowing one slow client to block the server TUN reader.
+        let (datagram_tx, mut datagram_rx) = ClientDatagramQueue::new();
         crate::transport::paths::spawn_path_stats_logger(connection.clone(), "server");
         let datagram_conn = connection.clone();
         let datagram_stats = self.stats.clone();
@@ -1274,6 +1374,7 @@ impl VpnServer {
                 }
                 let mut outcome = DatagramSendOutcome::default();
                 let result = send_datagram_batch(&datagram_conn, &batch, &mut outcome).await;
+                datagram_rx.release(&batch);
                 batch.clear();
                 datagram_stats
                     .packets_to_clients
@@ -1513,12 +1614,11 @@ impl VpnServer {
     }
 
     /// Queue an IP packet (optionally offload-tagged) for one client's datagram
-    /// writer, folding preparation and bounded-queue drops into server stats.
+    /// writer, folding preparation and budget-exhausted drops into server stats.
     #[allow(clippy::too_many_arguments)]
     fn queue_client_datagrams(
         conn: &Connection,
-        datagram_tx: &mpsc::Sender<Bytes>,
-        arena: &mut BytesMut,
+        datagram_tx: &ClientDatagramQueue,
         seg_scratch: &mut Vec<u8>,
         pending: &mut Vec<Bytes>,
         offload: Option<&VirtioNetHdr>,
@@ -1528,9 +1628,13 @@ impl VpnServer {
         let mut outcome = Default::default();
         // Takes the connection lock; once per TUN packet, not per segment.
         let max_size = conn.max_datagram_size();
+        let mut arena = datagram_tx
+            .arena
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         prepare_ip_datagrams(
             max_size,
-            arena,
+            &mut arena,
             seg_scratch,
             pending,
             offload,
@@ -1548,7 +1652,7 @@ impl VpnServer {
                 .fetch_add(outcome.dropped_other, Ordering::Relaxed);
         }
         for datagram in pending.drain(..) {
-            match datagram_tx.try_send(datagram) {
+            match datagram_tx.try_push(datagram) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     stats.packets_dropped_full.fetch_add(1, Ordering::Relaxed);
@@ -1762,10 +1866,10 @@ impl VpnServer {
 
         let buffer_size = tun_reader.buffer_size();
         let mut read_storage = uninitialized_vec(buffer_size);
-        // Arena that per-datagram `Bytes` are split off, amortizing allocations
-        // across packets; scratch for software-segmenting offload super-frames
-        // (a GSO super-frame cannot fit in a single datagram).
-        let mut arena = BytesMut::with_capacity(FRAME_ARENA_CHUNK);
+        // Per-datagram `Bytes` are split off each client's own arena (see
+        // `ClientDatagramQueue::arena`); scratch for software-segmenting
+        // offload super-frames (a GSO super-frame cannot fit in a single
+        // datagram).
         let mut seg_scratch: Vec<u8> = Vec::new();
         let mut pending: Vec<Bytes> = Vec::new();
 
@@ -1843,7 +1947,6 @@ impl VpnServer {
             Self::queue_client_datagrams(
                 &connection,
                 &datagram_tx,
-                &mut arena,
                 &mut seg_scratch,
                 &mut pending,
                 offload.as_ref(),
@@ -2695,6 +2798,73 @@ mod tests {
         let ip = pool.allocate(client_id, 1).unwrap();
         pool.release(&client_id, 1);
         assert_eq!(pool.allocate(client_id, 2).unwrap(), ip);
+    }
+
+    // =========================================================================
+    // ClientDatagramQueue tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_client_queue_budget_is_bytes_not_count() {
+        let (tx, mut rx) = ClientDatagramQueue::new();
+        let payload = 1024 - QUEUED_DATAGRAM_OVERHEAD;
+        let fits = CLIENT_QUEUE_BYTES / 1024;
+
+        // Exactly the budget fits, far more datagrams than the old 1024 slots.
+        for _ in 0..fits {
+            tx.try_push(Bytes::from(vec![0u8; payload])).unwrap();
+        }
+        assert_eq!(tx.queued_bytes.load(Ordering::Relaxed), CLIENT_QUEUE_BYTES);
+
+        // Even a tiny ACK is refused once the budget is spent, and the refusal
+        // leaves the charge untouched.
+        let ack = Bytes::from_static(&[0u8; 52]);
+        assert!(matches!(
+            tx.try_push(ack.clone()),
+            Err(mpsc::error::TrySendError::Full(d)) if d.len() == 52
+        ));
+        assert_eq!(tx.queued_bytes.load(Ordering::Relaxed), CLIENT_QUEUE_BYTES);
+
+        // The writer's batch stays charged until it is released; then the
+        // budget is available again.
+        let mut batch = Vec::new();
+        let count = rx.recv_many(&mut batch, 256).await;
+        assert_eq!(count, 256);
+        assert!(matches!(
+            tx.try_push(ack.clone()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        rx.release(&batch);
+        assert_eq!(
+            tx.queued_bytes.load(Ordering::Relaxed),
+            CLIENT_QUEUE_BYTES - 256 * 1024
+        );
+        tx.try_push(ack.clone()).unwrap();
+        assert_eq!(
+            tx.queued_bytes.load(Ordering::Relaxed),
+            CLIENT_QUEUE_BYTES - 256 * 1024 + queued_datagram_cost(52)
+        );
+
+        // A gone writer reports Closed and does not charge.
+        drop(rx);
+        let before = tx.queued_bytes.load(Ordering::Relaxed);
+        assert!(matches!(
+            tx.try_push(ack),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert_eq!(tx.queued_bytes.load(Ordering::Relaxed), before);
+    }
+
+    #[tokio::test]
+    async fn test_client_queue_recv_many_ends_when_producers_drop() {
+        let (tx, mut rx) = ClientDatagramQueue::new();
+        tx.try_push(Bytes::from_static(b"x")).unwrap();
+        drop(tx);
+        let mut batch = Vec::new();
+        assert_eq!(rx.recv_many(&mut batch, 256).await, 1);
+        rx.release(&batch);
+        assert_eq!(rx.queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(rx.recv_many(&mut batch, 256).await, 0);
     }
 
     // =========================================================================
