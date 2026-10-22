@@ -34,7 +34,7 @@ use iroh::{Endpoint, EndpointId, RelayUrl, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::ReadBuf;
@@ -144,6 +144,14 @@ struct ClientDatagramQueue {
     tx: mpsc::UnboundedSender<Bytes>,
     /// Bytes charged for datagrams pushed and not yet released by the writer.
     queued_bytes: Arc<AtomicUsize>,
+    /// Arena this client's queued datagrams are copied into. Per client, not
+    /// shared across the TUN reader: a queued `Bytes` keeps its whole
+    /// [`FRAME_ARENA_CHUNK`] alive, so with a shared arena one slow client's
+    /// small packets, interleaved with other clients' traffic, could pin a
+    /// chunk each and retain far more memory than the budget charges them.
+    /// Owning the arena bounds a client's retention to about its budget plus
+    /// a chunk. Only the TUN reader locks it, so the lock is uncontended.
+    arena: Arc<Mutex<BytesMut>>,
 }
 
 /// Consumer half: the client's writer drains batches and releases their charge
@@ -161,6 +169,7 @@ impl ClientDatagramQueue {
             Self {
                 tx,
                 queued_bytes: queued_bytes.clone(),
+                arena: Arc::new(Mutex::new(BytesMut::with_capacity(FRAME_ARENA_CHUNK))),
             },
             ClientDatagramReceiver { rx, queued_bytes },
         )
@@ -1610,7 +1619,6 @@ impl VpnServer {
     fn queue_client_datagrams(
         conn: &Connection,
         datagram_tx: &ClientDatagramQueue,
-        arena: &mut BytesMut,
         seg_scratch: &mut Vec<u8>,
         pending: &mut Vec<Bytes>,
         offload: Option<&VirtioNetHdr>,
@@ -1620,9 +1628,13 @@ impl VpnServer {
         let mut outcome = Default::default();
         // Takes the connection lock; once per TUN packet, not per segment.
         let max_size = conn.max_datagram_size();
+        let mut arena = datagram_tx
+            .arena
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         prepare_ip_datagrams(
             max_size,
-            arena,
+            &mut arena,
             seg_scratch,
             pending,
             offload,
@@ -1854,10 +1866,10 @@ impl VpnServer {
 
         let buffer_size = tun_reader.buffer_size();
         let mut read_storage = uninitialized_vec(buffer_size);
-        // Arena that per-datagram `Bytes` are split off, amortizing allocations
-        // across packets; scratch for software-segmenting offload super-frames
-        // (a GSO super-frame cannot fit in a single datagram).
-        let mut arena = BytesMut::with_capacity(FRAME_ARENA_CHUNK);
+        // Per-datagram `Bytes` are split off each client's own arena (see
+        // `ClientDatagramQueue::arena`); scratch for software-segmenting
+        // offload super-frames (a GSO super-frame cannot fit in a single
+        // datagram).
         let mut seg_scratch: Vec<u8> = Vec::new();
         let mut pending: Vec<Bytes> = Vec::new();
 
@@ -1935,7 +1947,6 @@ impl VpnServer {
             Self::queue_client_datagrams(
                 &connection,
                 &datagram_tx,
-                &mut arena,
                 &mut seg_scratch,
                 &mut pending,
                 offload.as_ref(),
