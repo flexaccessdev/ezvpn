@@ -863,3 +863,7 @@ consistency checks live in [`docs/Architecture.md`](docs/Architecture.md).
   `show-auth-key` CLI, where all `ezvpn` client key generation happens. `ezvpn`
   links against the library only to parse, sign, and verify; that repo is
   authoritative for the token format and file parsing rules.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

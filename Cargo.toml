@@ -3,6 +3,7 @@ name = "ezvpn"
 version = "0.0.59"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
+license = "MIT"
 readme = "README.md"
 repository = "https://github.com/flexaccessdev/ezvpn"
 
