@@ -282,6 +282,21 @@ When both `network` and `network6` are configured, each client normally receives
 | macOS | `utunX` | `route add` | root |
 | Windows | `wintun.dll` | `netsh interface route` (VPN routes); `NetTCPIP` PowerShell cmdlets `Find-NetRoute`/`New-NetRoute` (underlay bypass host routes) | Administrator |
 
+**TUN subnet route.** A TUN configured with an address and netmask has the
+whole subnet routed onto it on every platform, as Linux does on its own. macOS
+needs help for IPv4: utun is point-to-point, so the kernel installs only a host
+route to the destination and ignores the netmask. `TunDevice::create`
+(`configure_macos_ipv4` in `src/net/device.rs`) assigns the address,
+destination and netmask with one `SIOCAIFADDR`, then adds the subnet route with
+an `RTM_ADD` on the `PF_ROUTE` routing socket; the route goes away with the
+interface. Without it a macOS server, whose destination is its own address, has
+no route back to its clients. The `tun` crate's own macOS IPv4 setup is
+bypassed: its per-field ioctls leave a classful netmask, and its routing step
+runs `route add` with the destination as gateway, which the kernel rejects for
+the server's own address while `route` still exits 0. IPv6 needs nothing, since
+the kernel adds the prefix route for an `inet6` address. Clients use a host mask
+(see "Client Isolation"), so no client gets a subnet route.
+
 The GUI clients build on this same per-platform TUN/route code. On Apple the OS
 hands the extension a `utun` fd (`docs/Apple-App.md`); on Windows the native
 GUI P/Invokes `ezvpn.dll`, which drives the desktop `VpnClient` (wintun +
