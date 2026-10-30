@@ -246,14 +246,17 @@ impl TunDevice {
     pub fn create(config: TunConfig) -> VpnResult<Self> {
         let mut tun_config = Configuration::default();
 
-        // Set IP configuration
-        tun_config
-            .address(config.address)
-            .netmask(config.netmask)
-            .mtu(config.mtu)
-            .up();
+        tun_config.mtu(config.mtu).up();
 
-        // `destination` is the point-to-point peer address on macOS/Linux, but
+        // Set IP configuration. macOS configures IPv4 itself after creation
+        // (see `configure_macos_ipv4`): the `tun` crate's per-field ioctls leave
+        // a classful netmask, and its routing step runs `route add` with the
+        // destination as gateway, which the kernel rejects when that is the
+        // interface's own address (the server's case) while `route` exits 0.
+        #[cfg(not(target_os = "macos"))]
+        tun_config.address(config.address).netmask(config.netmask);
+
+        // `destination` is the point-to-point peer address on Linux, but
         // the `tun` crate's Windows backend treats it as the adapter's default
         // gateway and installs a metric-0 `0.0.0.0/0` route for it
         // (CreateIpForwardEntry2 with PrefixLength=0) — silently turning a
@@ -262,7 +265,7 @@ impl TunDevice {
         // explicit host route the client adds (see `add_routes` for
         // `server_info.network`), and split-tunnel prefixes are always routed
         // explicitly.
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
         tun_config.destination(config.destination);
 
         // Set device name if specified
@@ -303,6 +306,9 @@ impl TunDevice {
                 log::info!("Linux TUN GSO disabled on device {}: {}", name, reason);
             }
         }
+
+        #[cfg(target_os = "macos")]
+        configure_macos_ipv4(&device, &name, &config)?;
 
         log::info!("Created TUN device: {} with IP {}", name, config.address);
 
@@ -494,6 +500,55 @@ pub fn ensure_tun_permission() -> VpnResult<()> {
             }
         }
     }
+}
+
+/// Assign the utun's IPv4 address and route its subnet onto it, so the result
+/// matches what Linux and Windows make of an address with a netmask.
+///
+/// The address, point-to-point destination and netmask go in with one
+/// `SIOCAIFADDR`, which also installs the host route to the destination. utun
+/// is point-to-point, so the kernel adds no route for the netmask; without the
+/// subnet route added here a server (whose destination is its own address)
+/// has no route back to its clients. The route belongs to the interface and
+/// goes away with it, like the kernel-made route on Linux. IPv6 needs nothing:
+/// the kernel adds the prefix route for an `inet6` address. A host mask (the
+/// client's) has no subnet to route.
+#[cfg(target_os = "macos")]
+fn configure_macos_ipv4(device: &AsyncDevice, name: &str, config: &TunConfig) -> VpnResult<()> {
+    let subnet = Ipv4Net::with_netmask(config.address, config.netmask)
+        .map_err(|e| {
+            VpnError::config_with_source(format!("Invalid TUN netmask {}", config.netmask), e)
+        })?
+        .trunc();
+    macos_net::set_ipv4_address(name, config.address, config.destination, subnet.netmask())
+        .map_err(|e| {
+            VpnError::tun_device_with_source(
+                format!("Failed to assign {} to {name}", config.address),
+                e,
+            )
+        })?;
+    if subnet.prefix_len() == 32 {
+        return Ok(());
+    }
+    let index_error = format!("Failed to get interface index of {name}");
+    let if_index = device
+        .tun_index()
+        .map_err(|e| VpnError::tun_device_with_source(index_error.clone(), e))?;
+    let if_index =
+        u16::try_from(if_index).map_err(|e| VpnError::tun_device_with_source(index_error, e))?;
+    // The utun was just created, so no route through it can exist yet: EEXIST
+    // means another interface already routes the subnet, and continuing would
+    // leave the clients without a return route.
+    macos_net::add_subnet_route(if_index, subnet).map_err(|e| {
+        let message = if e.raw_os_error() == Some(libc::EEXIST) {
+            format!("Failed to add route {subnet} via {name}: another interface already routes it")
+        } else {
+            format!("Failed to add route {subnet} via {name}")
+        };
+        VpnError::tun_device_with_source(message, e)
+    })?;
+    log::info!("Added route {} via {}", subnet, name);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1178,6 +1233,158 @@ mod windows_routes {
                 assert_eq!(row.NextHop.Ipv6.sin6_addr.u.Byte, [0u8; 16]);
             }
             assert_eq!(row.Metric, ROUTE_METRIC);
+        }
+    }
+}
+
+/// macOS interface IPv4 configuration through the kernel APIs `ifconfig(8)`
+/// and `route(8)` themselves use: the `SIOCAIFADDR` ioctl and an `RTM_ADD`
+/// message on the `PF_ROUTE` routing socket. Both return a typed errno
+/// (`EEXIST`) instead of text to parse, and spare a subprocess.
+#[cfg(target_os = "macos")]
+mod macos_net {
+    use ipnet::Ipv4Net;
+    use std::io;
+    use std::mem::{size_of, zeroed};
+    use std::net::Ipv4Addr;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// `_IOW('i', 26, struct ifaliasreq)` from `<sys/sockio.h>`; libc does
+    /// not export it.
+    const SIOCAIFADDR: libc::c_ulong = 0x8000_0000 // IOC_IN
+        | ((size_of::<libc::ifaliasreq>() as libc::c_ulong & 0x1fff) << 16)
+        | ((b'i' as libc::c_ulong) << 8)
+        | 26;
+
+    fn socket(domain: libc::c_int, ty: libc::c_int) -> io::Result<OwnedFd> {
+        let fd = unsafe { libc::socket(domain, ty, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Assign `address` with point-to-point peer `destination` and `netmask`
+    /// to the interface. The kernel installs the host route to `destination`.
+    pub fn set_ipv4_address(
+        name: &str,
+        address: Ipv4Addr,
+        destination: Ipv4Addr,
+        netmask: Ipv4Addr,
+    ) -> io::Result<()> {
+        let mut req: libc::ifaliasreq = unsafe { zeroed() };
+        if name.len() >= req.ifra_name.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("interface name {name:?} is too long"),
+            ));
+        }
+        for (dst, src) in req.ifra_name.iter_mut().zip(name.bytes()) {
+            *dst = src as libc::c_char;
+        }
+        req.ifra_addr = as_sockaddr(sockaddr_in(address));
+        req.ifra_broadaddr = as_sockaddr(sockaddr_in(destination));
+        req.ifra_mask = as_sockaddr(sockaddr_in(netmask));
+        let socket = socket(libc::AF_INET, libc::SOCK_DGRAM)?;
+        if unsafe { libc::ioctl(socket.as_raw_fd(), SIOCAIFADDR, &req) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn as_sockaddr(sin: libc::sockaddr_in) -> libc::sockaddr {
+        const _: () = assert!(size_of::<libc::sockaddr_in>() == size_of::<libc::sockaddr>());
+        unsafe { std::mem::transmute(sin) }
+    }
+
+    /// An `RTM_ADD` request: the header followed by the `RTA_DST`,
+    /// `RTA_GATEWAY` and `RTA_NETMASK` sockaddrs in address-bit order. Every
+    /// part's size is a multiple of 4, so `repr(C)` packs them exactly as the
+    /// kernel's 4-byte sockaddr alignment expects.
+    #[repr(C)]
+    struct AddRouteMessage {
+        header: libc::rt_msghdr,
+        dst: libc::sockaddr_in,
+        gateway: libc::sockaddr_dl,
+        netmask: libc::sockaddr_in,
+    }
+
+    fn sockaddr_in(addr: Ipv4Addr) -> libc::sockaddr_in {
+        let mut sa: libc::sockaddr_in = unsafe { zeroed() };
+        sa.sin_len = size_of::<libc::sockaddr_in>() as u8;
+        sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        sa.sin_addr.s_addr = u32::from_ne_bytes(addr.octets());
+        sa
+    }
+
+    fn add_route_message(if_index: u16, subnet: Ipv4Net) -> AddRouteMessage {
+        let mut msg: AddRouteMessage = unsafe { zeroed() };
+        msg.header.rtm_msglen = size_of::<AddRouteMessage>() as u16;
+        msg.header.rtm_version = libc::RTM_VERSION as u8;
+        msg.header.rtm_type = libc::RTM_ADD as u8;
+        msg.header.rtm_flags = libc::RTF_UP | libc::RTF_STATIC;
+        msg.header.rtm_addrs = libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK;
+        msg.header.rtm_seq = 1;
+        msg.dst = sockaddr_in(subnet.network());
+        msg.gateway.sdl_len = size_of::<libc::sockaddr_dl>() as u8;
+        msg.gateway.sdl_family = libc::AF_LINK as u8;
+        msg.gateway.sdl_index = if_index;
+        msg.netmask = sockaddr_in(subnet.netmask());
+        msg
+    }
+
+    /// Add an on-link route for `subnet` through the interface `if_index`.
+    ///
+    /// The gateway is the interface's link-level address (a `sockaddr_dl`
+    /// carrying only its index) with `RTF_GATEWAY` clear — the same interface
+    /// route `route add -interface <utun>` creates.
+    pub fn add_subnet_route(if_index: u16, subnet: Ipv4Net) -> io::Result<()> {
+        let socket = socket(libc::PF_ROUTE, libc::SOCK_RAW)?;
+        let msg = add_route_message(if_index, subnet);
+        let written = unsafe {
+            libc::write(
+                socket.as_raw_fd(),
+                (&msg as *const AddRouteMessage).cast(),
+                size_of::<AddRouteMessage>(),
+            )
+        };
+        if written < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn siocaifaddr_matches_sockio_h() {
+            assert_eq!(SIOCAIFADDR, 0x8040_691a);
+        }
+
+        #[test]
+        fn add_route_message_is_onlink_subnet_route() {
+            let msg = add_route_message(7, "10.99.0.0/24".parse().unwrap());
+            assert_eq!(
+                size_of::<AddRouteMessage>(),
+                size_of::<libc::rt_msghdr>() + 16 + 20 + 16
+            );
+            assert_eq!(msg.header.rtm_msglen as usize, size_of::<AddRouteMessage>());
+            assert_eq!(msg.header.rtm_type as i32, libc::RTM_ADD);
+            // On-link: no RTF_GATEWAY, no RTF_HOST.
+            assert_eq!(msg.header.rtm_flags, libc::RTF_UP | libc::RTF_STATIC);
+            assert_eq!(
+                msg.header.rtm_addrs,
+                libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK
+            );
+            assert_eq!(msg.dst.sin_addr.s_addr, u32::from_ne_bytes([10, 99, 0, 0]));
+            assert_eq!(msg.gateway.sdl_family as i32, libc::AF_LINK);
+            assert_eq!(msg.gateway.sdl_index, 7);
+            assert_eq!(
+                msg.netmask.sin_addr.s_addr,
+                u32::from_ne_bytes([255, 255, 255, 0])
+            );
         }
     }
 }
