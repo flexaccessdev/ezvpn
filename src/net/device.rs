@@ -536,18 +536,18 @@ fn configure_macos_ipv4(device: &AsyncDevice, name: &str, config: &TunConfig) ->
         .map_err(|e| VpnError::tun_device_with_source(index_error.clone(), e))?;
     let if_index =
         u16::try_from(if_index).map_err(|e| VpnError::tun_device_with_source(index_error, e))?;
-    match macos_net::add_subnet_route(if_index, subnet) {
-        Ok(RouteAddOutcome::Added) => log::info!("Added route {} via {}", subnet, name),
-        Ok(RouteAddOutcome::AlreadyExisted) => {
-            log::warn!("route {} via {} already exists (treating as success)", subnet, name)
-        }
-        Err(e) => {
-            return Err(VpnError::tun_device_with_source(
-                format!("Failed to add route {subnet} via {name}"),
-                e,
-            ));
-        }
-    }
+    // The utun was just created, so no route through it can exist yet: EEXIST
+    // means another interface already routes the subnet, and continuing would
+    // leave the clients without a return route.
+    macos_net::add_subnet_route(if_index, subnet).map_err(|e| {
+        let message = if e.raw_os_error() == Some(libc::EEXIST) {
+            format!("Failed to add route {subnet} via {name}: another interface already routes it")
+        } else {
+            format!("Failed to add route {subnet} via {name}")
+        };
+        VpnError::tun_device_with_source(message, e)
+    })?;
+    log::info!("Added route {} via {}", subnet, name);
     Ok(())
 }
 
@@ -1243,7 +1243,6 @@ mod windows_routes {
 /// (`EEXIST`) instead of text to parse, and spare a subprocess.
 #[cfg(target_os = "macos")]
 mod macos_net {
-    use super::RouteAddOutcome;
     use ipnet::Ipv4Net;
     use std::io;
     use std::mem::{size_of, zeroed};
@@ -1339,7 +1338,7 @@ mod macos_net {
     /// The gateway is the interface's link-level address (a `sockaddr_dl`
     /// carrying only its index) with `RTF_GATEWAY` clear — the same interface
     /// route `route add -interface <utun>` creates.
-    pub fn add_subnet_route(if_index: u16, subnet: Ipv4Net) -> io::Result<RouteAddOutcome> {
+    pub fn add_subnet_route(if_index: u16, subnet: Ipv4Net) -> io::Result<()> {
         let socket = socket(libc::PF_ROUTE, libc::SOCK_RAW)?;
         let msg = add_route_message(if_index, subnet);
         let written = unsafe {
@@ -1349,15 +1348,10 @@ mod macos_net {
                 size_of::<AddRouteMessage>(),
             )
         };
-        if written >= 0 {
-            return Ok(RouteAddOutcome::Added);
+        if written < 0 {
+            return Err(io::Error::last_os_error());
         }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EEXIST) {
-            Ok(RouteAddOutcome::AlreadyExisted)
-        } else {
-            Err(err)
-        }
+        Ok(())
     }
 
     #[cfg(test)]
