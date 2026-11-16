@@ -571,12 +571,10 @@ fn prepare_client_start(
 /// absolute paths (the daemon does `chdir("/")`). Errors are reported in the
 /// foreground before the fork.
 fn canonicalize_client_paths(resolved: &mut ResolvedVpnClientConfig) -> Result<()> {
-    for (field, slot) in [("auth key file", &mut resolved.auth_key_file)] {
-        if let Some(path) = slot.as_ref() {
-            let abs = std::fs::canonicalize(path)
-                .with_context(|| format!("resolving {field} {}", path.display()))?;
-            *slot = Some(abs);
-        }
+    if let Some(path) = resolved.auth_key_file.as_ref() {
+        let abs = std::fs::canonicalize(path)
+            .with_context(|| format!("resolving auth key file {}", path.display()))?;
+        resolved.auth_key_file = Some(abs);
     }
     Ok(())
 }
