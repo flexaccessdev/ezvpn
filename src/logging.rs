@@ -5,6 +5,9 @@
 //! and the relay rate-limit warning from iroh is reworded (see
 //! [`RELAY_RATE_LIMIT_NOTICE`]).
 
+use std::sync::{Arc, OnceLock};
+
+use env_logger::fmt::ConfigurableFormat;
 use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
 
 /// Log filter used when `RUST_LOG` is unset. iroh and tracing stay at `warn`:
@@ -80,18 +83,31 @@ fn shows_target(max_level: LevelFilter) -> bool {
     max_level >= LevelFilter::Debug
 }
 
-fn builder_from_env() -> env_logger::Builder {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER))
-}
-
 /// Install the global logger, filtered by `RUST_LOG` (default
 /// [`DEFAULT_LOG_FILTER`]) and writing to stderr. Fails if a logger is already
 /// installed.
 pub fn try_init() -> Result<(), SetLoggerError> {
-    // The filter is only known once a logger is built, and the format has to
-    // be set before that: build one to read the level, then the real one.
-    let max_level = builder_from_env().build().filter();
-    let inner = builder_from_env().format_target(shows_target(max_level)).build();
+    // The line format depends on the filter, which is only known once the
+    // logger is built, and `RUST_LOG` must be parsed just once (a bad
+    // directive is reported on every parse). So the logger is built with a
+    // format that is filled in right after, before anything can log.
+    let line_format = Arc::new(OnceLock::<ConfigurableFormat>::new());
+    let inner = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
+    )
+    .format({
+        let line_format = Arc::clone(&line_format);
+        move |formatter, record| match line_format.get() {
+            Some(format) => format.format(formatter, record),
+            None => Ok(()),
+        }
+    })
+    .build();
+    let max_level = inner.filter();
+    // env_logger's own default format, with or without the target.
+    let mut format = ConfigurableFormat::default();
+    format.target(shows_target(max_level));
+    let _ = line_format.set(format);
     log::set_boxed_logger(Box::new(Logger { inner }))?;
     log::set_max_level(max_level);
     Ok(())
