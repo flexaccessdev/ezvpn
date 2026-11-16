@@ -485,7 +485,7 @@ impl VpnClient {
         // GSO is a purely local TUN concern now (the datagram wire never carries
         // offload super-frames). It only affects local read GRO / write batching.
         if local_gso_enabled {
-            log::info!("Local TUN GSO/offload enabled");
+            log::debug!("Local TUN GSO/offload enabled");
         } else {
             let reason = offload_status.reason.as_deref().unwrap_or("unknown reason");
             log::info!("Local TUN GSO/offload disabled: {}", reason);
@@ -540,7 +540,7 @@ impl VpnClient {
         // socket ports. This prevents recursive self-encapsulation loops.
         let local_iroh_udp_ports = Arc::new(collect_local_iroh_udp_ports(endpoint));
         if !local_iroh_udp_ports.is_empty() {
-            log::info!(
+            log::debug!(
                 "Filtering tunneled traffic for {} local iroh UDP port(s)",
                 local_iroh_udp_ports.len()
             );

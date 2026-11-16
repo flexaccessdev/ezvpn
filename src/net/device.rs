@@ -297,7 +297,7 @@ impl TunDevice {
 
         #[cfg(target_os = "linux")]
         if offload_status.enabled {
-            log::info!("Linux TUN GSO enabled on device {}", name);
+            log::debug!("Linux TUN GSO enabled on device {}", name);
         } else {
             let reason = offload_status.reason.as_deref().unwrap_or("unknown reason");
             if config.enable_gso {
@@ -310,12 +310,12 @@ impl TunDevice {
         #[cfg(target_os = "macos")]
         configure_macos_ipv4(&device, &name, &config)?;
 
-        log::info!("Created TUN device: {} with IP {}", name, config.address);
+        log::debug!("Created TUN device: {} with IP {}", name, config.address);
 
         // Configure IPv6 address if specified (after device creation)
         if let (Some(addr6), Some(prefix)) = (config.address6, config.prefix_len6) {
             configure_tun_ipv6(&name, addr6, prefix)?;
-            log::info!("Configured TUN IPv6: {}/{}", addr6, prefix);
+            log::debug!("Configured TUN IPv6: {}/{}", addr6, prefix);
         }
 
         Ok(Self {

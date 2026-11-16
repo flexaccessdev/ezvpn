@@ -416,6 +416,12 @@ is size-capped: at 10 MiB it rotates to a single `<name>.log.1` backup
 instance. Override the cap (in bytes) with
 `EZVPN_LOG_MAX_BYTES`.
 
+How much is logged follows `RUST_LOG`. Unset, ezvpn logs its own lifecycle
+events (startup summary, clients connecting and disconnecting) plus warnings.
+`RUST_LOG=warn` keeps only warnings and errors. `RUST_LOG=warn,ezvpn=debug`
+adds ezvpn's per-step detail; once anything is at `debug`, every line is
+prefixed with the module it came from.
+
 `status` and `list` work without root/Administrator: the runtime directory is
 world-traversable and the control endpoint is read-only and world-connectable
 (Unix sockets are `0666`; the Windows pipe is opened read-only, which its
