@@ -673,7 +673,8 @@ configure the host once with your normal OS tooling:
    `radvd`).
 
 [docs/Server-Site-Gateway.md](docs/Server-Site-Gateway.md) walks through both,
-including the `radvd` config. Skip both steps when clients only need the server
+including the `radvd` config and the allow rule a host needs if its firewall
+filters forwarded traffic. Skip both steps when clients only need the server
 host itself, at its VPN IP: that traffic is never forwarded.
 
 Because the rules key on the VPN prefix (the server config's `network` /

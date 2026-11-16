@@ -39,6 +39,18 @@ loses it unless that interface is set to keep accepting them:
 sysctl -w net.ipv6.conf.eth0.accept_ra=2
 ```
 
+Turning forwarding on does not open the firewall. A host that filters routed
+traffic (UFW, firewalld, or a default-drop `FORWARD` policy) also needs a rule
+that lets the VPN prefix through to the LAN, and the replies back. NAT rules do
+not do this; netfilter filters forwarded packets separately:
+
+```bash
+iptables -A FORWARD -s 10.0.0.0/24 -o eth0 -j ACCEPT
+iptables -A FORWARD -d 10.0.0.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+```
+
+The same applies to IPv6 with `ip6tables` and the `network6` prefix.
+
 ## 2. Give the VPN prefix a return path
 
 A device on the LAN replies to the client's VPN address, and that reply has to
@@ -81,11 +93,15 @@ route for the VPN prefix that points at the server host:
   `AdvDefaultLifetime 0` matters: without it the server host also advertises
   itself as a default router for the whole LAN.
 
-  Devices pick the route up from the advertisement. A Linux device whose
-  kernel handles router advertisements ignores it unless its
+  The route is carried as an RFC 4191 Route Information Option, and only
+  devices that support that option pick it up. Support is not universal:
+  `radvd`'s own example config calls it "not very widely supported". A Linux
+  device whose kernel handles router advertisements ignores it unless its
   `net.ipv6.conf.<interface>.accept_ra_rt_info_max_plen` sysctl is at least
-  the prefix length (`64` here). systemd-networkd and NetworkManager handle
-  router advertisements in userspace and accept the route by default.
+  the prefix length (`64` here), while systemd-networkd and NetworkManager
+  handle router advertisements in userspace and accept the route by default.
+  For devices that ignore it, add the static route on the site's router as
+  above, or fall back to NAT.
 
 ## 3. Route the site from the client
 
@@ -104,8 +120,12 @@ A device at `192.168.1.20` on the LAN is then `192.168.1.20` from the client.
 - All of the above can be permanent. The NAT rule and the announced route
   both key on the VPN prefix, so they are inert while the tunnel is down.
   There are no up/down hooks to script.
-- No firewall rule is needed to keep clients apart or to let connections in.
-  See [Server NAT and Firewall](../README.md#server-nat-and-firewall).
+- No firewall rule is needed to keep clients apart (the server drops
+  client-to-client packets itself) or to open an inbound port for `ezvpn`
+  (there is none). See
+  [Server NAT and Firewall](../README.md#server-nat-and-firewall). Forwarded
+  traffic from the VPN prefix to the LAN is a separate matter, covered in
+  step 1.
 - A client refuses a `--route` that overlaps the network it is sitting on, so
   a site LAN in a commonly used range (`192.168.1.0/24`, say) cannot be
   reached from another LAN numbered the same way. See "Split-Tunnel Overlap
