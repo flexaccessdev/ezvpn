@@ -27,7 +27,8 @@ service manager (let it own backgrounding), not `--daemon`.
 
 These examples cover the **client**. The server uses the same service-manager
 pattern with `ezvpn server start -c ...`; it has no `--instance` flag and uses
-the fixed `default` instance for `server status` / `server list`.
+the fixed `default` instance for `server status` / `server list`. The macOS
+section has a worked [server example](#server).
 
 > The tunnel creates a TUN device and edits the routing table, so the service
 > must run with administrative privileges (root / LocalSystem).
@@ -221,6 +222,128 @@ default instance):
 ezvpn client status
 ezvpn client list
 ```
+
+### Server
+
+A host runs one server, so there is one plist and no `--instance`.
+
+Keep the config, the server key, and the authorized-keys file together in the
+system config directory, readable by root only:
+
+```bash
+sudo install -d -m 700 /usr/local/etc/ezvpn
+sudo ezvpn generate-server-key --output /usr/local/etc/ezvpn/vpn-server.key
+# then put vpn_server.toml and authorized_keys in the same directory
+```
+
+Use absolute paths inside `vpn_server.toml`. launchd starts the job with `/`
+as its working directory, and a relative `secret_file` or
+`authorized_keys_file` is resolved against the working directory, not against
+the config file:
+
+```toml
+[auth]
+authorized_keys_file = "/usr/local/etc/ezvpn/authorized_keys"
+
+[iroh]
+secret_file = "/usr/local/etc/ezvpn/vpn-server.key"
+```
+
+`/Library/LaunchDaemons/com.ezvpn.server.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ezvpn.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <!-- 2>&1 | sed | logger: every line goes to unified logging, prefixed -->
+        <string>/usr/local/bin/ezvpn server start -c /usr/local/etc/ezvpn/vpn_server.toml 2&gt;&amp;1 | /usr/bin/sed -l 's/^/ezvpn-server: /' | /usr/bin/logger</string>
+    </array>
+
+    <key>RunAtLoad</key><true/>
+
+    <!-- the shell's exit status is logger's, not ezvpn's: always restart -->
+    <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+The job is a shell pipeline rather than `ezvpn` itself, so that the server's
+output goes to macOS unified logging instead of a file that nothing rotates
+(see [Logs](#logs)). Two things follow from the pipeline:
+
+- `KeepAlive` is a plain `true`. launchd sees the exit status of the shell,
+  which is `logger`'s and is `0` even when `ezvpn` crashed, so the
+  `SuccessfulExit` form used for the client would never restart it.
+- launchd signals the shell, not `ezvpn`. That is fine for the server, which
+  has no shutdown work to do.
+
+Install and manage:
+
+```bash
+sudo chown root:wheel /Library/LaunchDaemons/com.ezvpn.server.plist
+sudo chmod 644        /Library/LaunchDaemons/com.ezvpn.server.plist
+
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.ezvpn.server.plist
+sudo launchctl print     system/com.ezvpn.server     # inspect
+sudo launchctl kickstart -k system/com.ezvpn.server  # restart
+sudo launchctl bootout   system/com.ezvpn.server     # stop + unload
+```
+
+There is no `ezvpn server stop`: stop the server with `launchctl bootout`. To
+upgrade, move the new binary into place at `/usr/local/bin/ezvpn` (do not copy
+over the running one, which can get the process killed) and restart the job
+with `kickstart -k`.
+
+App-level status / listing (no sudo needed):
+
+```bash
+ezvpn server status   # includes the Node ID that clients connect to
+ezvpn server list
+```
+
+### Logs
+
+launchd has no journald. It can only append a job's output to the
+`StandardOutPath` file, and it never rotates that file.
+
+The server plist above avoids the file: it pipes the output through
+`/usr/bin/logger` into unified logging, which caps and rotates its own store.
+Each line is prefixed with `ezvpn-server: ` on the way, because the tag given
+with `logger -t` does not show up in unified logging and the lines would
+otherwise be indistinguishable from any other `logger` output. Read them with
+`log` (`/usr/bin/log` in zsh, where `log` is a builtin):
+
+```bash
+P='process == "logger" AND eventMessage BEGINSWITH "ezvpn-server: "'
+/usr/bin/log show --last 1h --predicate "$P" --style compact   # recent
+/usr/bin/log stream --predicate "$P" --style compact           # follow
+```
+
+The client plists write to a file instead. The client is launched directly so
+that `launchctl bootout` delivers its `SIGTERM` to `ezvpn`, which then shuts
+the tunnel down cleanly; behind a shell pipeline the signal would go to the
+shell. With the default logging the file grows slowly (startup, connects and
+disconnects, warnings). It is opened in append mode, so it can be emptied in
+place without restarting the job:
+
+```bash
+sudo sh -c ': > /var/log/ezvpn-work.log'
+```
+
+Leave `RUST_LOG` out of the plist unless you are debugging. Unset, the filter
+is `info,iroh=warn,tracing=warn`: ezvpn's own events at `info`, with the iroh
+transport held at `warn`. A plain `RUST_LOG=info` replaces that whole filter,
+which lifts iroh to `info` as well, and iroh logs individual packets at that
+level: a mostly idle server left that way wrote about 1.6 GB to its log file
+in under three weeks.
 
 ---
 
