@@ -7,6 +7,9 @@ QUIC connections. Clients dial the server by its stable iroh `EndpointId`, so
 they do not need the server's current IP address and the server does not need
 open inbound ports. Relay fallback is used when a direct path is unavailable.
 
+Watch a server and a client being set up side by side, from install to the
+first ping through the tunnel: [flexaccess.dev/ezvpn#demo](https://flexaccess.dev/ezvpn#demo).
+
 > [!WARNING]
 > While `ezvpn` remains in the `0.0.x` series, there is no backward
 > compatibility between versions. Keep clients and servers on the same release,
