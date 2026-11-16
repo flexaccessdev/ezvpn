@@ -32,12 +32,18 @@ sysctl -w net.ipv6.conf.all.forwarding=1
 Persist them in `/etc/sysctl.d/`.
 
 On Linux, enabling IPv6 forwarding makes the kernel stop accepting router
-advertisements. A server host that gets its own IPv6 default route by SLAAC
-loses it unless that interface is set to keep accepting them:
+advertisements. This matters on a server host whose kernel is what handles
+them (one configured with ifupdown, for example): if it gets its own IPv6
+default route by SLAAC, it loses that route unless the interface is set to
+keep accepting them:
 
 ```bash
 sysctl -w net.ipv6.conf.eth0.accept_ra=2
 ```
+
+The sysctl does not apply where a network manager handles router
+advertisements in userspace. systemd-networkd, for one, sets the kernel's
+`accept_ra` to `0` and processes them itself.
 
 Turning forwarding on does not open the firewall. A host that filters routed
 traffic (UFW, firewalld, or a default-drop `FORWARD` policy) also needs a rule
