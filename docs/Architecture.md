@@ -4,9 +4,9 @@
 
 The primary deployment model is remote access to private resources without
 opening inbound ports on the VPN server. In practice that usually means running
-an `ezvpn` server inside a private network, such as an AWS VPC, so a home or
-remote client can reach private AWS resources or hosts in private/egress-only
-subnets. Split routing to explicit private prefixes is the main design target.
+an `ezvpn` server inside a private network, such as a home LAN or an AWS VPC,
+so a remote client can reach the devices on that LAN, or private AWS resources
+and hosts in private/egress-only subnets. Split routing to explicit private prefixes is the main design target.
 Full-tunnel default routing is supported, but remains more experimental because
 it interacts with broad host routes and the underlay bypass routes needed for
 iroh server and relay addresses.
@@ -21,10 +21,16 @@ Three design principles shape the architecture:
   address-collision management as with static-IP VPNs like WireGuard.
 - **Temporary split-tunnel access, not a permanent overlay.** Clients get
   ephemeral, dynamic IPs and can reach only the server's network; there is no
-  client-to-client connectivity (see "Client Isolation" below). This is a
-  different principle than Tailscale, which gives clients stable IPs so peers
-  can address one another as one of its use cases. For a permanent VPN
-  bridging two sites with stable subnets, WireGuard is the right tool.
+  client-to-client connectivity (see "Client Isolation" below). The shape is
+  WireGuard's remote-access one, without the open port: one server per site,
+  which clients dial in to, and the devices behind it run no VPN software and
+  keep their own addresses. A client either routes the site's prefixes through
+  the server and reaches those devices at their original IPs, or routes
+  nothing and reaches the server host alone at its VPN IP. This is a different
+  principle than Tailscale, where every device that belongs to the tailnet
+  runs its own node and gets a stable IP so peers can address one another. For
+  a permanent VPN bridging two sites with stable subnets, WireGuard is the
+  right tool. The README's "Deployment Model" section has the comparison.
 - **Single responsibility: tunneling only.** Firewall, forwarding/NAT, and DNS
   configuration are managed outside the VPN connector. The iOS app's in-app
   split DNS is the one deliberate exception, added because applying DNS inside
