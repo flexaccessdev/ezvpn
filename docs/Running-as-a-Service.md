@@ -28,7 +28,8 @@ service manager (let it own backgrounding), not `--daemon`.
 These examples cover the **client**. The server uses the same service-manager
 pattern with `ezvpn server start -c ...`; it has no `--instance` flag and uses
 the fixed `default` instance for `server status` / `server list`. The macOS
-section has a worked [server example](#server).
+and Windows sections each have a worked server example
+([launchd](#server), [NSSM](#server-nssm)).
 
 > The tunnel creates a TUN device and edits the routing table, so the service
 > must run with administrative privileges (root / LocalSystem).
@@ -368,7 +369,9 @@ $exe = "$env:ProgramData\ezvpn\ezvpn.exe"
 
 nssm install ezvpn-work $exe client start -c "C:\ProgramData\ezvpn\work.toml" --instance work
 
-# Logs (NSSM redirects the console output)
+# Logs (NSSM redirects the console output). NSSM does not create the
+# directory, and the service will not start without it.
+New-Item -ItemType Directory -Force C:\ProgramData\ezvpn\logs | Out-Null
 nssm set ezvpn-work AppStdout C:\ProgramData\ezvpn\logs\work.log
 nssm set ezvpn-work AppStderr C:\ProgramData\ezvpn\logs\work.log
 nssm set ezvpn-work Start SERVICE_AUTO_START
@@ -400,7 +403,9 @@ $exe = "$env:ProgramData\ezvpn\ezvpn.exe"
 # no --instance: this is the "default" instance
 nssm install ezvpn $exe client start -c "C:\ProgramData\ezvpn\vpn_client.toml"
 
-# Logs (NSSM redirects the console output)
+# Logs (NSSM redirects the console output). NSSM does not create the
+# directory, and the service will not start without it.
+New-Item -ItemType Directory -Force C:\ProgramData\ezvpn\logs | Out-Null
 nssm set ezvpn AppStdout C:\ProgramData\ezvpn\logs\client.log
 nssm set ezvpn AppStderr C:\ProgramData\ezvpn\logs\client.log
 nssm set ezvpn Start SERVICE_AUTO_START
@@ -425,6 +430,105 @@ A lighter alternative to a wrapper is **Task Scheduler**: create a task that run
 `ezvpn.exe client start ...` "At startup", "Run whether user is logged on or
 not", with "Run with highest privileges". You lose automatic crash-restart and
 clean log capture, so a service wrapper is preferred for production.
+
+### Server (NSSM)
+
+A host runs one server, so there is one service and no `--instance`. This
+assumes `ezvpn.exe` was installed by the installer into `%ProgramData%\ezvpn`
+with `wintun.dll` beside it, and that NSSM is installed (for example
+`winget install NSSM.NSSM`). Run everything from an elevated PowerShell.
+
+**Files.** Keep the config, the server key, and the authorized-keys file in
+`%ProgramData%\ezvpn`, and create the log directory (NSSM does not):
+
+```powershell
+$dir = "$env:ProgramData\ezvpn"
+ezvpn generate-server-key --output "$dir\vpn-server.key"
+# then put vpn_server.toml and authorized_keys in $dir
+New-Item -ItemType Directory -Force "$dir\logs" | Out-Null
+```
+
+Use absolute paths inside `vpn_server.toml`, in single quotes so that TOML
+does not read the backslashes as escapes:
+
+```toml
+[auth]
+authorized_keys_file = 'C:\ProgramData\ezvpn\authorized_keys'
+
+[iroh]
+secret_file = 'C:\ProgramData\ezvpn\vpn-server.key'
+```
+
+**Permissions.** The installer leaves `%ProgramData%\ezvpn` writable by SYSTEM
+and Administrators only. Other local users can still read it, which is what
+lets `ezvpn server status` and `ezvpn server list` run without elevation. The
+server key should not be readable by them, so take it out of that:
+
+```powershell
+# S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators
+# (SIDs, so the command also works on a non-English Windows).
+icacls "$dir\vpn-server.key" /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F"
+```
+
+**Service.**
+
+```powershell
+nssm install ezvpn-server "$dir\ezvpn.exe" server start -c "$dir\vpn_server.toml"
+nssm set ezvpn-server Start SERVICE_AUTO_START
+
+# Logs: ezvpn logs to stderr
+nssm set ezvpn-server AppStderr "$dir\logs\server.log"
+nssm set ezvpn-server AppRotateFiles 1
+nssm set ezvpn-server AppRotateOnline 1
+nssm set ezvpn-server AppRotateBytes 10485760
+
+nssm start   ezvpn-server
+nssm restart ezvpn-server
+nssm stop    ezvpn-server
+nssm remove  ezvpn-server confirm   # uninstall
+```
+
+There is no `ezvpn server stop`: stop the server with `nssm stop`. NSSM
+restarts the server if it exits, and the service starts at boot before anyone
+logs in.
+
+With those log settings NSSM starts a fresh `server.log` each time the service
+starts and keeps the previous one as `server-<timestamp>.log`. While the
+service runs it rotates the same way once the file passes `AppRotateBytes`
+(10 MiB here). Nothing deletes the old files.
+
+Redirect `AppStderr` only. Pointing `AppStdout` at the same file together with
+`AppRotateOnline` left the service stuck in "stop pending" on `nssm stop` when
+tested with NSSM 2.24-101.
+
+App-level status / listing (no elevation needed):
+
+```powershell
+ezvpn server status   # includes the Node ID that clients connect to
+ezvpn server list
+```
+
+**Windows Firewall.** `ezvpn` itself needs no inbound rule. Traffic from
+clients to the server host is a different matter: the tunnel adapter comes up
+in the Public profile, so Windows Firewall drops what clients send to the
+server's VPN IP, pings and services alike. The adapter is created anew on
+every start, so write the rule against the VPN prefix (the server config's
+`network`) and not against the adapter:
+
+```powershell
+# everything from VPN clients
+New-NetFirewallRule -DisplayName "ezvpn clients" -Direction Inbound -Action Allow -RemoteAddress 10.0.0.0/24
+
+# or one service only, e.g. Remote Desktop
+New-NetFirewallRule -DisplayName "ezvpn clients RDP" -Direction Inbound -Action Allow -RemoteAddress 10.0.0.0/24 -Protocol TCP -LocalPort 3389
+```
+
+**Upgrading.** Stop the service, run the installer again, and start the
+service.
+
+This covers reaching the Windows host itself at its VPN IP. Making it a
+gateway to the rest of its network (forwarding and NAT) is not documented
+yet; [Server-Site-Gateway.md](Server-Site-Gateway.md) has that setup for Linux.
 
 ---
 
