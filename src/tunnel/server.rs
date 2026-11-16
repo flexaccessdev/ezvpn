@@ -1223,7 +1223,7 @@ impl VpnServer {
         // The tunnel MTU is the fixed protocol constant VPN_MTU. Each IP packet
         // maps to one unreliable QUIC datagram; a packet exceeding the live
         // datagram size is dropped rather than fragmented (the inner flow adapts).
-        log::info!("Client {} connected (fixed MTU={})", remote_id, VPN_MTU);
+        log::debug!("Client {} handshake accepted (fixed MTU={})", remote_id, VPN_MTU);
         // Allocate IPv4 for client (if server has IPv4 configured)
         let assigned_ip = if let Some(ref ip_pool) = self.ip_pool {
             let mut pool = ip_pool.write().await;

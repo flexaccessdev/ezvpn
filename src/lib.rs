@@ -28,6 +28,7 @@ pub use flexaccess_keys;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod logging;
 pub mod net;
 pub mod secret;
 pub mod transport;

@@ -322,10 +322,7 @@ fn log_version() {
 /// Install the global logger. Must be called exactly once per process; for the
 /// client daemon this happens *after* the fork so output lands in the log file.
 fn init_logger() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
-    )
-    .init();
+    ezvpn::logging::try_init().expect("logger installed twice");
 }
 
 /// Build the multi-threaded Tokio runtime used by the async commands. Built

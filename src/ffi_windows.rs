@@ -160,10 +160,7 @@ where
 /// No arguments; always safe to call.
 #[unsafe(no_mangle)]
 pub extern "C" fn ezvpn_init_logging() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,iroh=warn,tracing=warn"),
-    )
-    .try_init();
+    let _ = crate::logging::try_init();
 }
 
 /// Generate a fresh client authentication keypair. Writes

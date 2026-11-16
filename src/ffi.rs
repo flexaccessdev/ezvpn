@@ -155,10 +155,6 @@ where
         .collect()
 }
 
-/// Default log filter for the mobile clients (overridable via `RUST_LOG` where
-/// the platform lets the app set environment variables).
-const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,tracing=warn";
-
 /// Initialize logging. Safe to call multiple times; subsequent calls are no-ops.
 ///
 /// Reads `RUST_LOG` (defaults to `info,iroh=warn,tracing=warn`). The output goes
@@ -168,10 +164,7 @@ const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,tracing=warn";
 /// No arguments; always safe to call.
 #[unsafe(no_mangle)]
 pub extern "C" fn ezvpn_init_logging() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
-    )
-    .try_init();
+    let _ = crate::logging::try_init();
 }
 
 /// Generate a fresh client authentication keypair. Writes
