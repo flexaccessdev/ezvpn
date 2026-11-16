@@ -1109,14 +1109,30 @@ async fn run_vpn_client(
         }
     };
 
-    tokio::select! {
+    let result = tokio::select! {
         res = run => res,
         _ = shutdown_signal() => {
             log::info!("Received shutdown signal, stopping VPN client");
             Ok(())
         }
+    };
+
+    // Close the endpoint so the server gets a CONNECTION_CLOSE now and frees
+    // this client's session and VPN IP, instead of finding out at its
+    // heartbeat timeout. The close frame goes out immediately; the timeout
+    // only caps the wait for the server's acknowledgement (e.g. when the
+    // network is already gone).
+    if tokio::time::timeout(CLIENT_CLOSE_TIMEOUT, endpoint.close())
+        .await
+        .is_err()
+    {
+        log::warn!("Endpoint close timed out after {CLIENT_CLOSE_TIMEOUT:?}");
     }
+    result
 }
+
+/// Upper bound on the graceful endpoint close when the client stops.
+const CLIENT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(all(test, unix))]
 mod tests {
