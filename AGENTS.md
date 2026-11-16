@@ -1,6 +1,10 @@
 no backward compatibility at all since it is still 0.0.x.
 run cargo clippy and cargo test after making rust code changes.
 no cargo fmt
+after touching Windows-gated code (`cfg(windows)`, src/ffi_windows.rs, build-windows.ps1),
+run `pwsh -File ci/windows/remote.ps1`: the CI workflow's Windows jobs (clippy, the debug
+ezvpn.dll build) against the working tree on the Windows CI VM, through ../devtools.
+`remote.ps1 fetch dist/windows tmp/windows-dll` brings the built DLL and header back.
 
 # Design notes
 Architecture and design notes live in `docs/Architecture.md`. In particular, see

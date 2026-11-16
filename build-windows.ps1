@@ -55,7 +55,10 @@ Write-Host "Building ezvpn.dll [$Profile] for $Target ..."
 & cargo build @cargoFlags
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
 
-$dllPath = Join-Path $ScriptDir "target\$Target\$outSubdir\ezvpn.dll"
+# Wherever cargo put it: CARGO_TARGET_DIR when set (the Windows CI VM sets it),
+# else the tree's own target\.
+$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $ScriptDir 'target' }
+$dllPath = Join-Path $targetDir "$Target\$outSubdir\ezvpn.dll"
 if (-not (Test-Path $dllPath)) { throw "expected DLL not found: $dllPath" }
 
 $dist = Join-Path $ScriptDir 'dist\windows'
@@ -64,7 +67,7 @@ Copy-Item $dllPath (Join-Path $dist 'ezvpn.dll') -Force
 Copy-Item (Join-Path $ScriptDir 'windows\ezvpn.h') (Join-Path $dist 'ezvpn.h') -Force
 
 # The import library and PDB are handy for local linking / debugging (optional).
-$implib = Join-Path $ScriptDir "target\$Target\$outSubdir\ezvpn.dll.lib"
+$implib = Join-Path $targetDir "$Target\$outSubdir\ezvpn.dll.lib"
 if (Test-Path $implib) { Copy-Item $implib (Join-Path $dist 'ezvpn.dll.lib') -Force }
 
 Write-Host ""
