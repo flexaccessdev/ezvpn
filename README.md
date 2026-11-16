@@ -891,7 +891,8 @@ excluded addresses.
 
 ## Running as a Service
 
-For unattended clients under systemd, launchd, or a Windows service, see
+For unattended clients under systemd, launchd, or a Windows service, and a
+server under launchd, see
 [`docs/Running-as-a-Service.md`](docs/Running-as-a-Service.md).
 
 That guide also covers the fixed runtime directory used by `status`, `list`,
