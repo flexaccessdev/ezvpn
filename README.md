@@ -41,8 +41,10 @@ the two classic pain points:
 
 `ezvpn` is meant for temporary split-tunnel access to the server's network, not
 a permanent overlay network. A typical deployment is a small `ezvpn` server
-inside a private network, such as an AWS VPC, where clients need to reach
-private AWS resources or instances in private/egress-only subnets.
+inside a private network, such as a home LAN or an AWS VPC, where clients need
+to reach the devices on that LAN or private AWS resources and instances in
+private/egress-only subnets. [Deployment Model](#deployment-model) describes
+the shape of that deployment and how it differs from WireGuard and Tailscale.
 
 `ezvpn` is not an anonymity network. If the default iroh relay/discovery
 infrastructure is used, iroh relay operators can observe connection metadata
@@ -54,6 +56,50 @@ Full-tunnel routing (`0.0.0.0/0` and `::/0`) is supported, but it is still more
 experimental than routing explicit private prefixes. Full tunneling touches more
 of the host routing table and depends on bypass routes that keep the iroh
 underlay path to the server and relay infrastructure outside the VPN route.
+
+## Deployment Model
+
+`ezvpn` follows the WireGuard remote-access model without the open port: one
+`ezvpn` server runs on one device at a site, and remote clients dial in to it.
+That device and the clients are the only machines that run `ezvpn`. Nothing
+else at the site installs anything, and clients reach those devices at the
+addresses they already have.
+
+There are two ways to use it:
+
+- **Reach a whole site through one gateway device.** Run the server on a device
+  at the site that forwards IP packets, and have clients route the site's
+  prefixes with `--route` / `--route6`. A remote client then reaches every
+  device on the site at its original address: `192.168.1.20` on the LAN is
+  still `192.168.1.20` from the client. The gateway does not have to be the
+  site's router; any always-on host on the LAN works, as long as replies to the
+  clients' VPN addresses find their way back to it. For IPv4 that is usually
+  NAT on the gateway. For IPv6 it can be plain routing instead, with the
+  gateway announcing the VPN prefix to the LAN in a router advertisement (for
+  example with `radvd`).
+  [docs/Server-Site-Gateway.md](docs/Server-Site-Gateway.md) has the setup.
+- **Reach one device by its VPN address.** Run the server on the device you
+  want to reach and connect with no `--route` at all. The client reaches that
+  device at the server's VPN IP (`10.0.0.1` in the examples) and nothing past
+  it, so there is no forwarding or NAT to set up. This is what the
+  [demo](https://flexaccess.dev/ezvpn#demo) and the
+  [Quick Start](#quick-start) show.
+
+How that compares:
+
+| | WireGuard (remote access) | `ezvpn` | Tailscale |
+|---|---|---|---|
+| Where the VPN software runs | One gateway per site, plus each remote client | One server per site, plus each remote client | Every device that belongs to the tailnet |
+| How a device at the site is addressed | Its original LAN IP, through the gateway | Its original LAN IP, through the server | Its own tailnet IP |
+| Reaching the gateway | An open UDP port, and a static IP or dynamic DNS | No open port and no known IP; clients dial the server's `EndpointId` | No open port |
+| Client VPN addresses | Static, planned by you | Dynamic, assigned by the server | Stable, assigned by the coordination service |
+| Client-to-client and site-to-site | Yes, if you configure it | No | Yes |
+
+In Tailscale's model each device you want to reach installs Tailscale and joins
+the tailnet as a node of its own, and peers address one another by tailnet IP.
+(A Tailscale subnet router gives the gateway arrangement too, as an addition to
+that per-device model.) In `ezvpn` the gateway arrangement is the whole model:
+the devices behind the server are not VPN members and have no VPN address.
 
 ## Features
 
@@ -79,10 +125,13 @@ Use `ezvpn` when you need:
   inbound firewall ports on the VPN server
 - Access to AWS resources that live behind private routes or in egress-only
   subnets, using an `ezvpn` server inside that network as the gateway
-- Access to an entire remote subnet
+- Access to an entire remote subnet, with every device on it at its original
+  IP and no VPN software on any of them
+- Access to a single machine behind NAT or CGNAT, at the server's VPN IP
 - Stable full-network routing between peers behind NAT
 - Cross-platform VPN connectivity on Linux, macOS, and Windows
-- A WireGuard/OpenVPN alternative over iroh transport
+- A WireGuard/OpenVPN remote-access alternative over iroh transport, with no
+  port to open
 
 `ezvpn` is a server-centered access tunnel, not a site-to-site network joiner,
 and it intentionally does not provide client-to-client connectivity. Within the
@@ -99,12 +148,15 @@ IPs carry no such guarantee and the whole class of stale-IP and address-collisio
 bookkeeping disappears. So do not use `ezvpn` for site-to-site routing between
 two LANs or for direct client-to-client traffic.
 
-This is a different principle than Tailscale, one of whose use cases is giving
-every client a stable IP so peers can address one another. `ezvpn` deliberately
-keeps client IPs dynamic and clients isolated, trading that capability for a
-conflict-free network with zero address configuration. And for a permanent VPN
-that bridges two sites with stable subnets, WireGuard is the right choice, not
-`ezvpn`.
+This is a different principle than Tailscale, where every device that belongs
+to the tailnet runs its own node and gets a stable IP so peers can address one
+another. `ezvpn` deliberately keeps client IPs dynamic and clients isolated,
+trading that capability for a conflict-free network with zero address
+configuration, and reaches the devices behind the server at their own
+addresses instead (see [Deployment Model](#deployment-model)). `ezvpn` shares
+WireGuard's remote-access shape, a gateway at the site that clients dial in
+to, but not its site-to-site one: for a permanent VPN that bridges two sites
+with stable subnets, WireGuard is the right choice, not `ezvpn`.
 
 `ezvpn` also follows a single-responsibility principle: the server and desktop
 client do one thing — tunneling. Firewall, forwarding/NAT, and DNS
@@ -295,6 +347,11 @@ ifconfig
 # Ping the server VPN IP from the client, for example:
 ping 10.0.0.1
 ```
+
+At this point the client can reach the server host itself, at its VPN IP. To
+reach the other devices on the server's network at their own addresses, add
+`--route` on the client and a return path on the server; see
+[docs/Server-Site-Gateway.md](docs/Server-Site-Gateway.md).
 
 ## Configuration Model
 
@@ -602,13 +659,22 @@ configure the host once with your normal OS tooling:
 
 1. Enable IP forwarding (e.g. `net.ipv4.ip_forward=1` /
    `net.ipv6.conf.all.forwarding=1` via `sysctl`).
-2. NAT the VPN prefix out the egress interface, unless the surrounding network
-   already routes the VPN prefix back to the server host:
+2. Give the VPN prefix a return path, so replies to the clients' VPN addresses
+   come back to the server host. NAT is the usual choice for IPv4:
 
    ```bash
    # iptables example, masquerading the server config's `network` prefix
    iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
    ```
+
+   NAT is not needed where the surrounding network already routes the VPN
+   prefix back to the server host. For IPv6 the server host can announce that
+   route itself, in a router advertisement to the LAN (for example with
+   `radvd`).
+
+[docs/Server-Site-Gateway.md](docs/Server-Site-Gateway.md) walks through both,
+including the `radvd` config. Skip both steps when clients only need the server
+host itself, at its VPN IP: that traffic is never forwarded.
 
 Because the rules key on the VPN prefix (the server config's `network` /
 `network6`), they are inert while the tunnel is down — so they can simply be
