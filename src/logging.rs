@@ -1,9 +1,14 @@
 //! Process-wide logger setup shared by the CLI and the FFI layers.
 //!
-//! This is `env_logger` reading `RUST_LOG`, plus one rewrite: the relay
-//! rate-limit warning from iroh is reworded (see [`RELAY_RATE_LIMIT_NOTICE`]).
+//! This is `env_logger` reading `RUST_LOG`, with two changes: the module path
+//! is left out of each line unless debug logging is on (see [`shows_target`]),
+//! and the relay rate-limit warning from iroh is reworded (see
+//! [`RELAY_RATE_LIMIT_NOTICE`]).
 
-use log::{Level, Log, Metadata, Record, SetLoggerError};
+use std::sync::{Arc, OnceLock};
+
+use env_logger::fmt::ConfigurableFormat;
+use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
 
 /// Log filter used when `RUST_LOG` is unset. iroh and tracing stay at `warn`:
 /// their INFO level logs per-packet spans.
@@ -68,15 +73,41 @@ impl Log for Logger {
     }
 }
 
+/// Whether log lines name the module they come from
+/// (`[<time> INFO  ezvpn::tunnel::server] ...` rather than `[<time> INFO ] ...`).
+///
+/// The module path is for whoever is debugging, and costs 20 to 40 columns on
+/// every line, so it appears only once some target is filtered at `debug` or
+/// `trace`.
+fn shows_target(max_level: LevelFilter) -> bool {
+    max_level >= LevelFilter::Debug
+}
+
 /// Install the global logger, filtered by `RUST_LOG` (default
 /// [`DEFAULT_LOG_FILTER`]) and writing to stderr. Fails if a logger is already
 /// installed.
 pub fn try_init() -> Result<(), SetLoggerError> {
+    // The line format depends on the filter, which is only known once the
+    // logger is built, and `RUST_LOG` must be parsed just once (a bad
+    // directive is reported on every parse). So the logger is built with a
+    // format that is filled in right after, before anything can log.
+    let line_format = Arc::new(OnceLock::<ConfigurableFormat>::new());
     let inner = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
     )
+    .format({
+        let line_format = Arc::clone(&line_format);
+        move |formatter, record| match line_format.get() {
+            Some(format) => format.format(formatter, record),
+            None => Ok(()),
+        }
+    })
     .build();
     let max_level = inner.filter();
+    // env_logger's own default format, with or without the target.
+    let mut format = ConfigurableFormat::default();
+    format.target(shows_target(max_level));
+    let _ = line_format.set(format);
     log::set_boxed_logger(Box::new(Logger { inner }))?;
     log::set_max_level(max_level);
     Ok(())
@@ -94,6 +125,17 @@ mod tests {
                 .args(format_args!("{message}"))
                 .build(),
         )
+    }
+
+    #[test]
+    fn module_paths_are_shown_only_with_debug_logging() {
+        let max_level = |filters: &str| env_logger::Builder::new().parse_filters(filters).build().filter();
+        assert!(!shows_target(max_level(DEFAULT_LOG_FILTER)));
+        assert!(!shows_target(max_level("warn")));
+        assert!(shows_target(max_level("debug")));
+        // One module at debug is enough: that is a debugging session.
+        assert!(shows_target(max_level("info,ezvpn::tunnel=debug")));
+        assert!(shows_target(max_level("trace")));
     }
 
     #[test]

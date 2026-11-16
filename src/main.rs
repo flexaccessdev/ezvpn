@@ -970,7 +970,6 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
             .await
             .context("Failed to create iroh endpoint")?;
 
-    log::info!("VPN Server Node ID: {}", endpoint.id());
     log::info!(
         "Clients connect with: ezvpn client start --server-node-id {} --auth-key-file <KEY FILE>",
         endpoint.id()
@@ -1077,7 +1076,7 @@ async fn run_vpn_client(
             async move { status_handle.snapshot().await }
         });
     match &_status_listener {
-        Ok(_) => log::info!(
+        Ok(_) => log::debug!(
             "Status control socket ready (ezvpn client status --instance {instance})"
         ),
         Err(e) => log::warn!("Status control socket unavailable: {e}"),

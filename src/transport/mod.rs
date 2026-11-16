@@ -275,7 +275,7 @@ pub fn set_congestion_config(config: CongestionConfig) {
             congestion_config()
         );
     } else {
-        log::info!("QUIC congestion controller: {config}");
+        log::debug!("QUIC congestion controller: {config}");
     }
 }
 

@@ -74,7 +74,6 @@ Type=simple
 ExecStart=/usr/local/bin/ezvpn client start -c /etc/ezvpn/%i.toml --instance %i
 Restart=on-failure
 RestartSec=5
-Environment=RUST_LOG=info
 
 [Install]
 WantedBy=multi-user.target
@@ -138,11 +137,6 @@ and change `Label`, the config path, `--instance`, and the log path.
     <key>KeepAlive</key>
     <dict><key>SuccessfulExit</key><false/></dict>
 
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key><string>info</string>
-    </dict>
-
     <!-- launchd has no journald; capture logs to files -->
     <key>StandardOutPath</key><string>/var/log/ezvpn-work.log</string>
     <key>StandardErrorPath</key><string>/var/log/ezvpn-work.log</string>
@@ -201,11 +195,6 @@ flag entirely (omitting it *is* `default`) and drop it from `status` too.
     <key>KeepAlive</key>
     <dict><key>SuccessfulExit</key><false/></dict>
 
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key><string>info</string>
-    </dict>
-
     <!-- launchd has no journald; capture logs to files -->
     <key>StandardOutPath</key><string>/var/log/ezvpn.log</string>
     <key>StandardErrorPath</key><string>/var/log/ezvpn.log</string>
@@ -256,8 +245,6 @@ $exe = "$env:ProgramData\ezvpn\ezvpn.exe"
 
 nssm install ezvpn-work $exe client start -c "C:\ProgramData\ezvpn\work.toml" --instance work
 
-nssm set ezvpn-work AppEnvironmentExtra RUST_LOG=info
-
 # Logs (NSSM redirects the console output)
 nssm set ezvpn-work AppStdout C:\ProgramData\ezvpn\logs\work.log
 nssm set ezvpn-work AppStderr C:\ProgramData\ezvpn\logs\work.log
@@ -289,8 +276,6 @@ $exe = "$env:ProgramData\ezvpn\ezvpn.exe"
 
 # no --instance: this is the "default" instance
 nssm install ezvpn $exe client start -c "C:\ProgramData\ezvpn\vpn_client.toml"
-
-nssm set ezvpn AppEnvironmentExtra RUST_LOG=info
 
 # Logs (NSSM redirects the console output)
 nssm set ezvpn AppStdout C:\ProgramData\ezvpn\logs\client.log

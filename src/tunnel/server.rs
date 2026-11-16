@@ -776,7 +776,7 @@ impl VpnServer {
             (None, None) => unreachable!(), // Caught above
         }
 
-        log::info!(
+        log::debug!(
             "Server local TUN GSO status: enabled={}{}",
             self.tun_offload_status.enabled,
             self.tun_offload_status
@@ -920,7 +920,7 @@ impl VpnServer {
         // Store JoinHandle for graceful shutdown.
         let tun_writer_stats = self.stats.clone();
         let tun_writer_handle = tokio::spawn(async move {
-            log::info!("TUN writer task started");
+            log::debug!("TUN writer task started");
             let mut batch = Vec::with_capacity(WRITE_BATCH_SIZE);
             // Run buffer of consecutive metadata-less packets, flushed through
             // write_batch so same-flow TCP segments coalesce into GSO
@@ -961,7 +961,7 @@ impl VpnServer {
                     plain_run.clear();
                 }
             }
-            log::info!("TUN writer task exiting (channel closed)");
+            log::debug!("TUN writer task exiting (channel closed)");
         });
 
         let server = Arc::new(self);
@@ -996,7 +996,7 @@ impl VpnServer {
                 }
             });
         match &_status_listener {
-            Ok(_) => log::info!("Status control socket ready (ezvpn server status)"),
+            Ok(_) => log::debug!("Status control socket ready (ezvpn server status)"),
             Err(e) => log::warn!("Status control socket unavailable: {e}"),
         }
         let _status_listener = _status_listener.ok();
@@ -1031,7 +1031,7 @@ impl VpnServer {
 
         // Graceful shutdown: drop channel sender to signal TUN writer to exit,
         // then await both tasks to ensure clean termination.
-        log::info!("Shutting down TUN tasks...");
+        log::debug!("Shutting down TUN tasks...");
         drop(tun_write_tx);
 
         // Abort TUN reader (it's blocked on TUN read, won't exit on its own)
@@ -1044,7 +1044,7 @@ impl VpnServer {
             log::warn!("TUN writer task panicked: {}", e);
         }
 
-        log::info!("TUN tasks shutdown complete");
+        log::debug!("TUN tasks shutdown complete");
         Ok(())
     }
 
@@ -1059,7 +1059,7 @@ impl VpnServer {
         // Drop self-encapsulated iroh UDP packets from the VPN tunnel path.
         let local_iroh_udp_ports = Arc::new(collect_local_iroh_udp_ports(endpoint));
         if !local_iroh_udp_ports.is_empty() {
-            log::info!(
+            log::debug!(
                 "Filtering tunneled traffic for {} local iroh UDP port(s)",
                 local_iroh_udp_ports.len()
             );
@@ -1136,7 +1136,7 @@ impl VpnServer {
             .map_err(|e| VpnError::Signaling(format!("Failed to accept connection: {}", e)))?;
 
         let remote_id = connection.remote_id();
-        log::info!("New VPN connection from {}", remote_id);
+        log::debug!("New VPN connection from {}", remote_id);
 
         // Accept the handshake bi-stream; it stays open as the data stream
         // once the handshake response is written.
@@ -1860,7 +1860,7 @@ impl VpnServer {
         mut tun_reader: crate::net::device::TunReader,
         endpoint: &Endpoint,
     ) -> VpnResult<()> {
-        log::info!("TUN reader started");
+        log::debug!("TUN reader started");
 
         let local_iroh_udp_ports = collect_local_iroh_udp_ports(endpoint);
 
