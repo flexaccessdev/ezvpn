@@ -271,6 +271,36 @@ function Download-Only {
     Print-Warn "the wintun.dll is missing or not in a valid DLL search path."
 }
 
+# Restrict the install directory and make the binary inherit from it.
+#
+# A folder created under %ProgramData% inherits an ACL that lets every local
+# user create files in it. ezvpn.exe runs elevated from this directory (as
+# LocalSystem under a service wrapper) and loads wintun.dll from it, and the
+# config and key files live here too, so only SYSTEM and Administrators may
+# write. Users keep read and execute, which is what lets `status` and `list`
+# run without elevation.
+#
+# SIDs rather than account names, so this also works on a non-English Windows:
+# S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators, S-1-5-32-545 = Users.
+function Set-InstallPermissions {
+    param(
+        [string]$InstallDir,
+        [string]$BinaryPath
+    )
+
+    & icacls.exe $InstallDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed on $InstallDir (exit code $LASTEXITCODE)"
+    }
+
+    # Move-Item keeps the ACL the file had in the temp directory, which grants
+    # nothing to Users. Reset it so the binary inherits the directory's ACL.
+    & icacls.exe $BinaryPath /reset /q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed on $BinaryPath (exit code $LASTEXITCODE)"
+    }
+}
+
 # Download binary to temporary location, test it, and install
 function Install-Binary {
     param(
@@ -324,7 +354,16 @@ function Install-Binary {
             exit 1
         }
 
+        try {
+            Set-InstallPermissions -InstallDir $installDir -BinaryPath $finalPath
+        }
+        catch {
+            Print-Error "Failed to set permissions on ${installDir}: $_"
+            exit 1
+        }
+
         Print-Info "Binary installed successfully to $finalPath"
+        Print-Info "$installDir is writable by SYSTEM and Administrators only; other users can read it"
 
         # Add to the systemwide (Machine) PATH if not already there
         # (case-insensitive exact match). Machine scope matches the systemwide

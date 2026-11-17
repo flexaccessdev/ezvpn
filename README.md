@@ -188,7 +188,8 @@ Silicon macOS (`arm64`). Other macOS architectures can build from source.
 
 Run from an **elevated** (Administrator) PowerShell — the installer places the
 binary systemwide in `%ProgramData%\ezvpn` (the same location used for config and
-runtime files) and updates the machine `PATH`:
+runtime files), restricts that directory so that only SYSTEM and Administrators
+can write to it, and updates the machine `PATH`:
 
 ```powershell
 irm https://flexaccessdev.github.io/ezvpn/install.ps1 | iex
@@ -892,7 +893,7 @@ excluded addresses.
 ## Running as a Service
 
 For unattended clients under systemd, launchd, or a Windows service, and a
-server under launchd, see
+server under launchd or as a Windows service, see
 [`docs/Running-as-a-Service.md`](docs/Running-as-a-Service.md).
 
 That guide also covers the fixed runtime directory used by `status`, `list`,
