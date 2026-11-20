@@ -830,9 +830,9 @@ The relay and address-lookup design is shared with
 [tunnel-rs](https://github.com/andrewtheguy/tunnel-rs) and
 [flextunnel](https://github.com/flexaccessdev/flextunnel), and is documented once
 in
-**[iroh-common-architecture](https://github.com/flexaccessdev/iroh-common-architecture)** —
-see [relays and address lookup](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/relays-and-address-lookup.md)
-for the design and [self-hosting](https://github.com/flexaccessdev/iroh-common-architecture/blob/main/self-hosting.md)
+**[flexaccess-iroh docs](https://github.com/flexaccessdev/flexaccess-iroh/tree/main/docs)** —
+see [relays and address lookup](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/relays-and-address-lookup.md)
+for the design and [self-hosting](https://github.com/flexaccessdev/flexaccess-iroh/blob/main/docs/self-hosting.md)
 for running your own relay.
 
 The short version as it applies to `ezvpn`:
