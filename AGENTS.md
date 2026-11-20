@@ -28,13 +28,14 @@ this repo; update it there and link to it.
 
 That shared layer's code — `RelayConfig` and the relay probe, endpoint
 building and rebuild, the home-relay watchdog, the endpoint-bound auth
-transcript — lives in the `flexaccess-iroh` crate (`../flexaccess-iroh`,
+transcript, the custom-relay `/healthz` check the status views show — lives in
+the `flexaccess-iroh` crate (`../flexaccess-iroh`,
 consumed by git tag). Fix it there, tag a release, and bump the tag here; never
 re-implement or fork a copy of it in this repo. Only ezvpn-specific pieces (the
 VPN ALPN, QUIC transport tuning, the auth context, the bounded connect, key
 files) belong in `src/transport/` and `src/auth.rs`. ezvpn depends on forks of
-iroh, noq (noq, noq-proto, noq-udp), netwatch and netdev, all under the
-`flexaccessdev` org (clones in `../iroh`, `../noq`, `../net-tools`, `../netdev`),
+iroh, noq (noq, noq-proto, noq-udp) and netwatch, all under the
+`flexaccessdev` org (clones in `../iroh`, `../noq`, `../net-tools`),
 one `ezvpn-*` branch each
 on top of the upstream release. They are applied through `[patch.crates-io]` in
 `Cargo.toml` rather than as git dependencies, so that every crate in the graph,
