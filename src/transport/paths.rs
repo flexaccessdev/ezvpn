@@ -4,18 +4,13 @@
 //! again whenever the selected path changes (e.g., relay -> direct).
 
 use crate::transport::endpoint::RelayConfig;
+pub use flexaccess_iroh::relay_health::CustomRelayStatus;
+use flexaccess_iroh::relay_health::probe_custom_relay_health;
 use futures::StreamExt;
-use futures::future::join_all;
 use iroh::TransportAddr;
 use iroh::endpoint::{Connection, PathList};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
-
-/// Per-request timeout for the custom-relay `/healthz` check. Kept short so the
-/// on-demand status call stays responsive even when a relay is unreachable.
-const HEALTHZ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Diagnostic-only: while the `EZVPN_PATH_STATS` env var is set, periodically
 /// log each path's congestion stats (cwnd, loss, congestion-controller state).
@@ -107,20 +102,6 @@ pub struct ConnPath {
     pub selected: bool,
 }
 
-/// Health of one configured custom relay, from an on-demand `/healthz` probe.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CustomRelayStatus {
-    pub url: String,
-    /// `Some(true)` when the relay's `/healthz` returned a 2xx, `Some(false)`
-    /// when it failed (unreachable, timed out, or a non-2xx response), or `None`
-    /// if the check could not be run at all (e.g. the HTTP client failed to
-    /// build). Note this probes the relay's plain HTTP health endpoint, which is
-    /// unauthenticated — it confirms the relay is up, not that the auth token is
-    /// accepted (the startup per-relay `online()` probe validates the token).
-    pub working: Option<bool>,
-    pub error: Option<String>,
-}
-
 /// One on-demand snapshot for connection-status UIs. Both path discovery and
 /// relay health are sampled only when this is requested; no watcher is retained.
 pub struct ConnectionSnapshot {
@@ -180,85 +161,6 @@ pub async fn connection_snapshot(
         description,
         paths: path_list,
         custom_relays,
-    }
-}
-
-/// TLS client config for the `/healthz` probe: ring plus the embedded Mozilla
-/// roots, i.e. exactly what iroh uses to verify the relay's own TLS (its
-/// `platform-verifier` feature is off), so a relay the tunnel trusts is one the
-/// health check trusts. reqwest's own default on the `rustls-no-provider`
-/// feature is `rustls-platform-verifier`; handing reqwest a preconfigured config
-/// keeps that verifier out entirely.
-fn healthz_tls_config() -> rustls::ClientConfig {
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default TLS protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth()
-}
-
-/// Probe the `/healthz` endpoint of every configured custom relay in parallel.
-/// Empty for the default relays (nothing custom to check).
-pub async fn probe_custom_relay_health(relay_config: &RelayConfig) -> Vec<CustomRelayStatus> {
-    let urls = relay_config.custom_urls();
-    if urls.is_empty() {
-        return Vec::new();
-    }
-    let client = match reqwest::Client::builder()
-        .tls_backend_preconfigured(healthz_tls_config())
-        .timeout(HEALTHZ_TIMEOUT)
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            let err = format!("failed to build health-check client: {e}");
-            return urls
-                .iter()
-                .map(|url| CustomRelayStatus {
-                    url: url.to_string(),
-                    working: None,
-                    error: Some(err.clone()),
-                })
-                .collect();
-        }
-    };
-    join_all(urls.iter().map(|url| probe_relay_healthz(&client, url))).await
-}
-
-/// Probe one relay's `/healthz`. `working` is `Some(true)` on a 2xx response,
-/// `Some(false)` otherwise (unreachable, timeout, or non-2xx).
-async fn probe_relay_healthz(client: &reqwest::Client, url: &iroh::RelayUrl) -> CustomRelayStatus {
-    // `RelayUrl` derefs to `url::Url`; join an absolute path so a missing/extra
-    // trailing slash on the configured URL does not matter.
-    let healthz = match url.join("/healthz") {
-        Ok(healthz) => healthz,
-        Err(e) => {
-            return CustomRelayStatus {
-                url: url.to_string(),
-                working: Some(false),
-                error: Some(format!("invalid relay URL: {e}")),
-            };
-        }
-    };
-    match client.get(healthz).send().await {
-        Ok(resp) if resp.status().is_success() => CustomRelayStatus {
-            url: url.to_string(),
-            working: Some(true),
-            error: None,
-        },
-        Ok(resp) => CustomRelayStatus {
-            url: url.to_string(),
-            working: Some(false),
-            error: Some(format!("/healthz returned HTTP {}", resp.status())),
-        },
-        Err(e) => CustomRelayStatus {
-            url: url.to_string(),
-            working: Some(false),
-            error: Some(e.to_string()),
-        },
     }
 }
 

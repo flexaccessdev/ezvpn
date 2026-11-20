@@ -32,8 +32,9 @@ futures = "0.3"
 ipnet = { version = "2", features = ["serde"] }
 # Shared iroh transport layer (RelayConfig + per-relay probe, endpoint
 # build/rebuild, home-relay watchdog, endpoint-bound auth transcript). No
-# `mdns` feature: ezvpn runs no local-network discovery.
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.15" }
+# `mdns` feature: ezvpn runs no local-network discovery. `relay-health` is the
+# custom-relay `/healthz` check the status views show (see `transport::paths`).
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.16", features = ["relay-health"] }
 # Redirected to the fork below via `[patch.crates-io]`, which also covers the
 # shared crate's own `iroh` dependency so the graph holds a single `iroh`.
 # `unstable-custom-transports` only makes the path-selector API public, for the
@@ -44,15 +45,6 @@ n0-watcher = "1.0.1"
 log = "0.4"
 libc = "0.2"
 rand = "0.10"
-# Custom-relay `/healthz` checks (see `transport::paths`). `rustls-no-provider`
-# matches the exact reqwest feature iroh already enables, so this adds no new TLS
-# backend (no openssl / aws-lc); the probe hands reqwest a ring + webpki-roots
-# config so the platform verifier is never built.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-# Embedded Mozilla roots for the `/healthz` probe TLS config (same roots iroh
-# verifies the relay connection with; see `transport::paths::healthz_tls_config`).
-webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -98,6 +90,8 @@ if-addrs = "0.15"
 [dev-dependencies]
 mock_instant = "0.6"
 rand_chacha = "0.10"
+# The crypto provider for the test endpoint in tests/stream_over_iroh.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27.0"
 
 [profile.release]
