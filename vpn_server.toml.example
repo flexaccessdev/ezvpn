@@ -169,7 +169,7 @@ secret_file = "./vpn-server.key"
 # OFF with custom relays, so nothing is published to or resolved from public
 # iroh infrastructure and clients reach the server through the relay URLs
 # they attach as dial hints. It is NOT real/VPN DNS. See "Relay and Address
-# Lookup" in README.md and https://github.com/flexaccessdev/iroh-common-architecture
+# Lookup" in README.md and https://github.com/flexaccessdev/flexaccess-iroh/tree/main/docs
 # for the full design.
 
 # NOTE: There is no [iroh.transport] section. QUIC transport settings are

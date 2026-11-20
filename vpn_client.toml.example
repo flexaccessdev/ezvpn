@@ -140,7 +140,7 @@ server_node_id = "changeme"
 # client resolves the server's home relay by endpoint ID; OFF with custom
 # relays, so nothing is resolved from public iroh infrastructure and the relay
 # URLs above are what reach the server. It is NOT real/VPN DNS. See "Relay and
-# Address Lookup" in README.md and https://github.com/flexaccessdev/iroh-common-architecture
+# Address Lookup" in README.md and https://github.com/flexaccessdev/flexaccess-iroh/tree/main/docs
 # for the full design.
 
 # ============================================================================
