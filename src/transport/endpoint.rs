@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use ipnet::IpNet;
 use flexaccess_iroh::endpoint::{
-    CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
+    CreatedEndpoint, EndpointOptions, PendingCloses, create_endpoint, endpoint_builder,
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
@@ -120,7 +120,10 @@ pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
     secret: SecretKey,
 ) -> Result<CreatedEndpoint> {
-    create_endpoint(relay_config, server_builder(relay_config, secret)?).await
+    // The endpoint lives on the process's runtime: a close its creation stops
+    // waiting for finishes there by itself.
+    let closes = PendingCloses::new();
+    create_endpoint(relay_config, server_builder(relay_config, secret)?, &closes).await
 }
 
 /// Create a client endpoint: ephemeral identity, never published (the client
@@ -142,6 +145,9 @@ pub async fn create_client_endpoint(
             exclude_direct_paths.to_vec(),
         )));
     }
-    let CreatedEndpoint { endpoint, .. } = create_endpoint(relay_config, builder).await?;
+    // The endpoint lives on its session's runtime: a close its creation stops
+    // waiting for finishes there by itself.
+    let closes = PendingCloses::new();
+    let CreatedEndpoint { endpoint, .. } = create_endpoint(relay_config, builder, &closes).await?;
     Ok(endpoint)
 }
