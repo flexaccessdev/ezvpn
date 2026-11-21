@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.64"
+version = "0.0.65"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 license = "MIT"
@@ -34,7 +34,7 @@ ipnet = { version = "2", features = ["serde"] }
 # build/rebuild, home-relay watchdog, endpoint-bound auth transcript). No
 # `mdns` feature: ezvpn runs no local-network discovery. `relay-health` is the
 # custom-relay `/healthz` check the status views show (see `transport::paths`).
-flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.17", features = ["relay-health"] }
+flexaccess-iroh = { git = "https://github.com/flexaccessdev/flexaccess-iroh", tag = "v0.0.18", features = ["relay-health"] }
 # Redirected to the fork below via `[patch.crates-io]`, which also covers the
 # shared crate's own `iroh` dependency so the graph holds a single `iroh`.
 # `unstable-custom-transports` only makes the path-selector API public, for the
