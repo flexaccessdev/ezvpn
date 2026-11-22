@@ -131,6 +131,24 @@ iperf3 -t 6 -O 1 -c <server VPN address>        # up
 iperf3 -t 6 -O 1 -c <server VPN address> -R     # down
 ```
 
+The three-client rows need three tunnels and three listeners, because one
+`iperf3 -s` serves one test at a time. On the server, run a listener per
+port (`iperf3 -s -D -p 5201`, `-p 5202`, `-p 5203`). On the client machine,
+start three clients with the same server and key, the second and third as
+`--instance b` and `--instance c`; each gets its own address and TUN device
+(`tun0`, `tun1`, `tun2` here). All three have a route to the server's VPN
+address, so bind each test to its device and start them together:
+
+```bash
+iperf3 -t 6 -O 1 --bind-dev tun0 -p 5201 -c <server VPN address> -R &
+iperf3 -t 6 -O 1 --bind-dev tun1 -p 5202 -c <server VPN address> -R &
+iperf3 -t 6 -O 1 --bind-dev tun2 -p 5203 -c <server VPN address> -R &
+wait
+```
+
+The aggregate is the sum of the three receiver rates (drop `-R` for up).
+Worker counts were set with `TOKIO_WORKER_THREADS` on each process.
+
 `nstat` before and after a run shows the reordering counters
 (`TcpExtTCPSACKReorder` on the sender, `TcpExtTCPOFOQueue` on the receiver),
 and `cat /sys/class/net/<dev>/queues/tx-*/xps_cpus` shows whether XPS is
