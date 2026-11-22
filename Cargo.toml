@@ -117,8 +117,13 @@ iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send
 # netwatch fork's connected peer sockets on Apple platforms, and
 # `Connection::try_send_many_datagrams`, the batch send that queues until the
 # send buffer is full and returns the count instead of evicting older
-# datagrams (`send_datagram_batch` in src/tunnel/stream.rs). All three crates
-# come from the fork so the graph holds a single `noq-udp`.
+# datagrams (`send_datagram_batch` in src/tunnel/stream.rs). Its MTU black hole
+# detector also judges a loss burst against the newest delivery of that
+# burst's own size: upstream took congestion loss among packets of slightly
+# different sizes for a black hole and reset the path MTU to 1200 for 60 s,
+# under which every full-size (1280-byte) inner packet is dropped as too
+# large. All three crates come from the fork so the graph holds a single
+# `noq-udp`.
 noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
 noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
 noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
