@@ -62,6 +62,30 @@ With it on, a UDP GSO batch crosses to the host as one buffer instead of
 being segmented in the guest. It is a setting of the underlay NIC, outside
 either VPN's control.
 
+### macOS and Windows clients against the Linux server
+
+The same day, one client at a time against the ezvpn server on `test1`
+(the build with peer sockets and two workers), both ends at default NIC
+settings. Unlike the Linux pair these cross a real network, and the "no
+tunnel" row is what that path carries for one TCP flow, so read each tunnel
+number against its own baseline. The client ran the same commit, built for
+its platform.
+
+| Client | | Down | Up |
+|---|---|---:|---:|
+| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2353 |
+| | ezvpn | 1796 | 425 |
+| Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2097 | 2359 |
+| | ezvpn | 1473 | 1452 |
+
+Mbit/s, median of 5 runs of 6 s, iperf3 run on the client (3.22.1 on
+Windows); every tunnel run used a direct path. Retransmits were 0–2 per run
+on macOS; the Windows iperf3 build does not report them. The macOS no-tunnel
+figures were identical on every run, which suggests a cap in the VM's NAT
+path. macOS upload is the outlier: the utun read path hands over one packet
+per read with no offload (see [Architecture](Architecture.md), "macOS utun
+reader").
+
 ## What the measurements showed
 
 ### A multi-queue NIC reorders a tunnel's packets
