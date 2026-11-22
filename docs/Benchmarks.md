@@ -200,6 +200,66 @@ path MTU to 1200, and every full-size inner packet was then too large to
 send. Fixed in v0.0.67; a 180 s run now holds its rate. Short runs never
 showed it, which is why the tables above use 6 s runs for both versions.
 
+## Opportunities left
+
+What these runs left open, with what is known about each. None of it is
+scheduled work.
+
+**macOS and iOS**
+
+- **Two syscalls per packet.** After the changes above a macOS upload spends
+  its client time in the utun `read` and the UDP `sendmsg`, 5–6 µs each, on
+  two threads. The `read` wakes the utun's kernel thread every time, and
+  the `sendmsg` probably does the same for the NIC's. Batching the syscalls
+  (`recvmsg_x`, `sendmsg_x`) was not tried: an empty `read` costs 0.35 µs,
+  so syscall entry is a small part of the 5–6. A raw `iperf3 -u` on the same
+  VM handed the kernel 280,000 packets per second (about 3.5 µs each), which
+  bounds what a cheaper send could give.
+- **Segmentation offload on the utun.** The utun Tailscale's network
+  extension gets from the system lists `TSO4`, `TSO6` and `CHANNEL_IO` among
+  its options; the one ezvpn opens through the kernel-control socket hands
+  over one MTU-sized packet per read. Whether a root process can get the
+  channel mode, and what it would take, was not investigated; it is the only
+  route seen here to fewer, larger reads.
+- **IPv6 preferred at equal round trip time.** The path selector follows
+  iroh's default and takes the IPv6 direct path when it is within 3 ms of
+  the IPv4 one. On this VM that cost about 15% of upload. It may be this
+  VM's NAT rather than macOS; it was not measured on a Mac with native IPv6.
+- **Reader polling may no longer be needed.** With the utun backlog, polling
+  the utun between batches (`TUN_DRAIN_SPIN`) changed neither throughput nor
+  CPU on the VM (850 Mbit/s and 9.3–9.5 s of CPU per 6 s run either way).
+  It was kept because iOS shares the code and was not measured.
+- **utun socket buffers.** The 4 MiB receive buffer was sized on the
+  assumption that packets queue there; with the limit of 32 pending packets
+  it never holds more than about 40 KiB. Whether the larger size still
+  matters, for the receive or the send buffer, was not re-tested.
+- **CPU at low rates.** A paced 100 Mbit/s upload cost the macOS client
+  about half a core (3.1 s of CPU per 6.1 s), against 1.5 cores at full
+  rate, and a `sendmsg` took about 14 µs there against 6 at full rate. The
+  likely cause is a thread wakeup per packet when nothing is queued, which
+  costs more in a VM; it was not measured on hardware.
+- **iOS is unmeasured.** The utun backlog applies to the iOS tunnel too,
+  through the same code, but nothing here ran on a device.
+
+**Linux**
+
+- **UDP segmentation offload on.** With `tx-udp-segmentation` on, Tailscale
+  moved 3.0–3.1 Gbit/s on the Linux pair against ezvpn's 2.2–2.3. ezvpn sent
+  with no retransmits there, so the gap is per-packet cost rather than loss;
+  it was not profiled.
+- **Worker count off these VMs.** Two runtime workers was chosen on guests
+  that overcommit their host two to one. One tunnel was fastest on one
+  worker (2.4 Gbit/s against 2.3), and a server with three clients needed
+  two or three. A dedicated machine, or a server with many clients, may want
+  a different number; `TOKIO_WORKER_THREADS` is the knob.
+
+**Windows**
+
+- **Not profiled.** The Windows client moved 1473 down and 1452 up against
+  2097 and 2359 with no tunnel, on v0.0.68. It was not run with the noq
+  change above, which is platform-independent, and nothing is known yet
+  about where its time goes.
+
 ## Reproducing
 
 Start a server on one machine and a client on the other, with `iperf3 -s` on
