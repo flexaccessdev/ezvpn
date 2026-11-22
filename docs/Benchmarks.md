@@ -75,6 +75,7 @@ its platform.
 |---|---|---:|---:|
 | macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2353 |
 | | ezvpn | 1796 | 425 |
+| | Tailscale 1.104.2 | 430 | 216 |
 | Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2097 | 2359 |
 | | ezvpn | 1473 | 1452 |
 
@@ -84,7 +85,10 @@ on macOS; the Windows iperf3 build does not report them. The macOS no-tunnel
 figures were identical on every run, which suggests a cap in the VM's NAT
 path. macOS upload is the outlier: the utun read path hands over one packet
 per read with no offload (see [Architecture](Architecture.md), "macOS utun
-reader").
+reader"). Tailscale on the same VM, run just before a repeat ezvpn pass that
+gave 1779 down and 407 up, is slower in both directions, so the VM's utun
+path limits either tunnel here; its direct path was the same LAN address,
+and it retransmitted 58–91 segments per run.
 
 ## What the measurements showed
 
