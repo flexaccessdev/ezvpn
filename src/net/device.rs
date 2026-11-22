@@ -609,6 +609,7 @@ impl DarwinTunHalves {
     fn from_raw_fd(fd: RawFd) -> VpnResult<Self> {
         let fd = duplicate_fd(fd)?;
         set_utun_socket_buffers(&fd);
+        set_utun_max_pending_packets(&fd);
         // SAFETY: `fd` is an `OwnedFd` this function just `dup`ed, so it is a
         // valid open descriptor that stays open, and keeps naming the same
         // file description, for as long as the `AsyncFd` owns it.
@@ -626,8 +627,8 @@ impl DarwinTunHalves {
 /// buffers.
 ///
 /// A utun is a kernel-control socket: packets the stack routes into it queue
-/// in the socket's receive buffer until we `read` them, and `write`s queue in
-/// its send buffer. The default is 512 KiB each, about 250 full-size packets.
+/// in the socket's receive buffer (up to [`UTUN_MAX_PENDING_PACKETS`] of them)
+/// until we `read` them, and `write`s queue in its send buffer. The default is 512 KiB each, about 250 full-size packets.
 /// A TCP sender's burst overflows that, and XNU answers the overflow with
 /// `ENOBUFS`, which the TCP stack treats as congestion: it collapses its window
 /// and trickles packets out one at a time, so the reader finds the queue empty
@@ -637,6 +638,55 @@ impl DarwinTunHalves {
 /// drains them in batches.
 #[cfg(target_vendor = "apple")]
 const UTUN_SOCKET_BUFFER_SIZE: libc::c_int = 4 * 1024 * 1024;
+
+/// How many outbound packets the kernel may hold on the utun socket for the
+/// reader, set through `UTUN_OPT_MAX_PENDING_PACKETS`.
+///
+/// The kernel moves a packet from the interface's send queue to the socket
+/// only while fewer than this many wait there, and the default is 1. Each
+/// `read` then empties the socket and has to wake the interface's starter
+/// thread for the next packet, so the reader and that thread hand off once
+/// per packet however many are queued behind it: on an M2 Mac VM the reader
+/// found the socket empty ten times per packet while 700 packets sat in the
+/// interface queue, and an upload ran at 450 Mbit/s. With a backlog allowed
+/// the starter thread delivers a run of packets per wakeup and the reader
+/// takes them back to back (about 700 Mbit/s there, more once the QUIC driver
+/// stopped holding the connection lock across its sends).
+///
+/// Small on purpose: the kernel counts the waiting packets by walking the
+/// socket's whole queue, under the socket lock, on every `read` and before
+/// every packet it adds (`ctl_getenqueuepacketcount` in XNU).
+/// 8 to 128 measured alike, 256 was slower, and at 1024 each `read` took 39 µs
+/// and the upload fell to 210 Mbit/s.
+#[cfg(target_vendor = "apple")]
+const UTUN_MAX_PENDING_PACKETS: u32 = 32;
+
+/// Let [`UTUN_MAX_PENDING_PACKETS`] packets wait on the utun socket; a failure
+/// only logs, leaving the kernel's default of one.
+#[cfg(target_vendor = "apple")]
+fn set_utun_max_pending_packets(fd: &OwnedFd) {
+    // From <net/if_utun.h>; the `libc` crate has no binding for it.
+    const UTUN_OPT_MAX_PENDING_PACKETS: libc::c_int = 16;
+    let count = UTUN_MAX_PENDING_PACKETS;
+    // SAFETY: `fd` is open for the call's duration and `count` is a live u32
+    // whose exact length is passed.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SYSPROTO_CONTROL,
+            UTUN_OPT_MAX_PENDING_PACKETS,
+            (&count as *const u32).cast(),
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        log::debug!(
+            "Could not set utun max pending packets to {}: {}",
+            count,
+            io::Error::last_os_error()
+        );
+    }
+}
 
 /// Raise the utun socket's receive and send buffers to
 /// [`UTUN_SOCKET_BUFFER_SIZE`]; a failure only logs, leaving the defaults.

@@ -2147,7 +2147,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.5.0#e385a90182bfd9378efb5043f2a1554229aed7af"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.5.0#f2bbbc6f0dd43a079ad294928e226b4583965424"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2168,7 +2168,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.5.0#e385a90182bfd9378efb5043f2a1554229aed7af"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.5.0#f2bbbc6f0dd43a079ad294928e226b4583965424"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2195,7 +2195,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.5.0#e385a90182bfd9378efb5043f2a1554229aed7af"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-rtt-sample-fixes-1.5.0#f2bbbc6f0dd43a079ad294928e226b4583965424"
 dependencies = [
  "cfg_aliases",
  "libc",
