@@ -774,9 +774,11 @@ sysctls (about 208 KiB by default), overflowing the receive queue under load.
 Because the VPN runs as root, ezvpn's transport stack sets the buffers with
 `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`, which are not subject to the cap.
 
-Measured numbers, the setup they came from, and a comparison run against
-Tailscale on the same machines (a yardstick, not a verdict) are in
-[docs/Benchmarks.md](docs/Benchmarks.md).
+Measured numbers and the setup they came from are in
+[docs/Benchmarks.md](docs/Benchmarks.md). They track ezvpn across versions and
+techniques; the Tailscale runs alongside are a control on the same machines,
+to tell a slow host from an ezvpn regression, and not a contest between the
+two.
 
 ## Reconnect Behavior
 

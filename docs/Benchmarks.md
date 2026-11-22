@@ -1,19 +1,26 @@
 # Benchmarks
 
-Throughput measurements kept for reference: what was measured, on what, and
-what each change was worth. The reasoning behind the changes is in
+Throughput measurements kept to compare ezvpn with itself: one version
+against the next, and one technique against another, on the same machines.
+This page records what was measured, on what, and what each change was
+worth. The reasoning behind the changes is in
 [Architecture](Architecture.md), "Throughput Design".
 
-> **These numbers are not evidence that ezvpn or Tailscale is the faster VPN.**
-> They come from one pair of virtual machines on one host, over a virtual
-> network with no real distance, loss or NAT, with one TCP flow per test, and
-> with each product at whatever version and defaults it had that day. The two
-> also do different jobs on the way (ezvpn carries IP in QUIC datagrams over
-> iroh; Tailscale runs WireGuard with its own userspace stack), and a change
-> of kernel, NIC, CPU, or a single offload flag reorders the table, as the
-> results below show. Tailscale is here as a familiar yardstick on the same
-> machines, to tell whether a number is in a sensible range, and for nothing
-> else. Measure on your own hardware and path before drawing conclusions.
+> **Tailscale is in these tables as a control, not as a competitor.** It is a
+> mature VPN that runs on the same machines, so when an ezvpn number comes
+> out unexpectedly low, a Tailscale run on the same pair tells the two causes
+> apart: if Tailscale is low too, the host or the network is having a bad
+> day; if Tailscale is where it was, ezvpn regressed.
+>
+> The numbers are not meant to show which of the two is the faster VPN, and
+> they cannot. They come from one pair of virtual machines on one host, over
+> a virtual network with no real distance, loss or NAT, with one TCP flow per
+> test, and with each product at whatever version and defaults it had that
+> day. The two also do different jobs on the way (ezvpn carries IP in QUIC
+> datagrams over iroh; Tailscale runs WireGuard with its own userspace
+> stack), and a change of kernel, NIC, CPU, or a single offload flag reorders
+> the table, as the results below show. Measure on your own hardware and path
+> before drawing conclusions.
 
 ## Setup (2026-11-22)
 
