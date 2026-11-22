@@ -64,31 +64,42 @@ either VPN's control.
 
 ### macOS and Windows clients against the Linux server
 
-The same day, one client at a time against the ezvpn server on `test1`
-(the build with peer sockets and two workers), both ends at default NIC
-settings. Unlike the Linux pair these cross a real network, and the "no
-tunnel" row is what that path carries for one TCP flow, so read each tunnel
-number against its own baseline. The client ran the same commit, built for
-its platform.
+The same day, one client at a time against the ezvpn server on `test1`,
+both ends at default NIC settings. Unlike the Linux pair these cross a real
+network, and the "no tunnel" row is what that path carries for one TCP flow,
+so read each tunnel number against its own baseline. The client ran the same
+commit as the server, built for its platform.
 
 | Client | | Down | Up |
 |---|---|---:|---:|
-| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2353 |
-| | ezvpn | 1796 | 425 |
-| | Tailscale 1.104.2 | 430 | 216 |
+| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2350 |
+| | Tailscale 1.104.2 | 435 | 219 |
+| | ezvpn v0.0.68 | 1777 | 410 |
+| | ezvpn, utun backlog + sends outside the lock, IPv6 direct path | 1773–1798 | 650–820 |
+| | ezvpn, the same, IPv4 direct path | 1774–1823 | 880–1000 |
 | Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2097 | 2359 |
-| | ezvpn | 1473 | 1452 |
+| | ezvpn v0.0.68 | 1473 | 1452 |
 
 Mbit/s, median of 5 runs of 6 s, iperf3 run on the client (3.22.1 on
-Windows); every tunnel run used a direct path. Retransmits were 0–2 per run
-on macOS; the Windows iperf3 build does not report them. The macOS no-tunnel
-figures were identical on every run, which suggests a cap in the VM's NAT
-path. macOS upload is the outlier: the utun read path hands over one packet
-per read with no offload (see [Architecture](Architecture.md), "macOS utun
-reader"). Tailscale on the same VM, run just before a repeat ezvpn pass that
-gave 1779 down and 407 up, is slower in both directions, so the VM's utun
-path limits either tunnel here; its direct path was the same LAN address,
-and it retransmitted 58–91 segments per run.
+Windows); the ranges are the medians of several passes, each after a client
+restart. Every tunnel run used a direct path. The macOS no-tunnel download
+was identical on every run, which suggests a cap in the VM's NAT path.
+Single macOS download runs dipped to 1200–1450 now and then on every build,
+v0.0.68 included, and one IPv4 pass of five had a median of 1367.
+
+ezvpn picks its direct path per connection. The selector counts an IPv6
+path as 3 ms faster than it measures and leaves the current direct path only
+for one at least 5 ms better after that bias, so at equal round trip time it
+keeps whichever family it selected first, and a client restart can land on
+either. On this VM an IPv4 path carried an upload about 15% faster than the
+IPv6 one, so the two are listed apart; read the family off
+`ezvpn client status` when reproducing a row. v0.0.68 was measured over IPv6.
+Upload retransmits were 0 on most passes over IPv6 and 0–130 per run over
+IPv4, which here usually went out through the router's public address and
+back.
+Tailscale's direct path was the server's LAN address and it retransmitted
+180 segments per upload run. The Linux pair measured the same on v0.0.68 and
+on the newer build (about 2.0 Gbit/s each way, alternating the two builds).
 
 ## What the measurements showed
 
@@ -140,6 +151,50 @@ makes cross-thread wakeups dearer than on bare metal, so the penalty for
 extra workers is probably larger here than on a dedicated machine;
 `TOKIO_WORKER_THREADS` overrides the count to check.
 
+### macOS handed the reader one packet per wakeup
+
+A macOS upload on v0.0.68 was not short of CPU: the client's two threads ran
+at about 70% each. Three measurements located the wait, taken on the VM
+above with temporary counters in the client and `netstat -qq -I utun5`:
+
+- The utun interface's send queue held about 740 packets and dropped on
+  overflow (264 drops in a 6 s run), so TCP was offering more than the
+  tunnel took.
+- The TUN reader, meanwhile, found the utun socket empty ten times for every
+  packet it read, and a `read` that returned a packet took 7–9 µs against
+  0.35 µs for an empty one.
+- With two workers the reader also waited about 430 µs per 64-packet batch
+  for the QUIC connection's lock, a third of its time.
+
+The first two are one cause. The kernel moves packets from the interface
+queue to the utun socket only while fewer than `UTUN_OPT_MAX_PENDING_PACKETS`
+wait there, and the default is 1, so every `read` has to wake the kernel
+thread that delivers the next packet. Upload by that limit, two workers,
+3 runs each (the path's address family was not recorded for this table, and
+it moves a row by up to 15%):
+
+| Pending packets | 1 (default) | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 1024 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Up, Mbit/s | 459 | 637 | 709 | 808 | 738 | 782 | 664 | 678 | 554 | 213 |
+
+Large values lose because the kernel counts the waiting packets by walking
+the socket's queue on every `read` and before each packet it adds
+(`ctl_getenqueuepacketcount` in XNU); at 1024 a `read` took 39 µs.
+ezvpn now sets 32.
+
+The lock wait was the QUIC driver sending under the connection's lock, one
+`sendmsg` of 6–7 µs per datagram on macOS. With the noq fork's driver
+releasing the lock across each send, the reader's lock wait fell from 330 ms
+to 10 ms per second and the upload reached the figures in the table above.
+What is left of the client's time is almost all two syscalls per packet,
+the utun `read` and the UDP `sendmsg` (5–6 µs each); neither has a
+batched form that saves the per-packet kernel work on macOS.
+
+Tailscale 1.104.2 on the same VM used 2.7 cores for its 215 Mbit/s upload,
+spread over eight or more threads at about a third of a core each, with
+roughly one thread's worth of time blocked or running inside `sendto` (about
+44 µs per packet at that rate).
+
 ### A false MTU black hole stalled long transfers
 
 Not a throughput number, but found by these runs: before v0.0.67 a sustained
@@ -148,6 +203,69 @@ about a minute. QUIC's black hole detector misread congestion loss, reset the
 path MTU to 1200, and every full-size inner packet was then too large to
 send. Fixed in v0.0.67; a 180 s run now holds its rate. Short runs never
 showed it, which is why the tables above use 6 s runs for both versions.
+
+## Opportunities left
+
+What these runs left open, with what is known about each. None of it is
+scheduled work.
+
+**macOS and iOS**
+
+- **Two syscalls per packet.** After the changes above a macOS upload spends
+  its client time in the utun `read` and the UDP `sendmsg`, 5–6 µs each, on
+  two threads. The `read` wakes the utun's kernel thread every time, and
+  the `sendmsg` probably does the same for the NIC's. Batching the syscalls
+  (`recvmsg_x`, `sendmsg_x`) was not tried: an empty `read` costs 0.35 µs,
+  so syscall entry is a small part of the 5–6. A raw `iperf3 -u` on the same
+  VM handed the kernel 280,000 packets per second (about 3.5 µs each), which
+  bounds what a cheaper send could give.
+- **Segmentation offload on the utun.** The utun Tailscale's network
+  extension gets from the system lists `TSO4`, `TSO6` and `CHANNEL_IO` among
+  its options; the one ezvpn opens through the kernel-control socket hands
+  over one MTU-sized packet per read. Whether a root process can get the
+  channel mode, and what it would take, was not investigated; it is the only
+  route seen here to fewer, larger reads.
+- **IPv6 bias in path selection.** The path selector follows iroh's default:
+  it counts an IPv6 direct path as 3 ms faster than it measures, and switches
+  between direct paths only for a 5 ms improvement after that bias. With no
+  path selected yet it therefore takes IPv6 when that is within 3 ms of IPv4,
+  and at equal round trip time it stays on whichever it has. On this VM a
+  connection that settled on IPv6 uploaded about 15% slower. It may be this
+  VM's NAT rather than macOS; it was not measured on a Mac with native IPv6.
+- **Reader polling may no longer be needed.** With the utun backlog, polling
+  the utun between batches (`TUN_DRAIN_SPIN`) changed neither throughput nor
+  CPU on the VM (850 Mbit/s and 9.3–9.5 s of CPU per 6 s run either way).
+  It was kept because iOS shares the code and was not measured.
+- **utun socket buffers.** The 4 MiB receive buffer was sized on the
+  assumption that packets queue there; with the limit of 32 pending packets
+  it never holds more than about 40 KiB. Whether the larger size still
+  matters, for the receive or the send buffer, was not re-tested.
+- **CPU at low rates.** A paced 100 Mbit/s upload cost the macOS client
+  about half a core (3.1 s of CPU per 6.1 s), against 1.5 cores at full
+  rate, and a `sendmsg` took about 14 µs there against 6 at full rate. The
+  likely cause is a thread wakeup per packet when nothing is queued, which
+  costs more in a VM; it was not measured on hardware.
+- **iOS is unmeasured.** The utun backlog applies to the iOS tunnel too,
+  through the same code, but nothing here ran on a device.
+
+**Linux**
+
+- **UDP segmentation offload on.** With `tx-udp-segmentation` on, Tailscale
+  moved 3.0–3.1 Gbit/s on the Linux pair against ezvpn's 2.2–2.3. ezvpn sent
+  with no retransmits there, so the gap is per-packet cost rather than loss;
+  it was not profiled.
+- **Worker count off these VMs.** Two runtime workers was chosen on guests
+  that overcommit their host two to one. One tunnel was fastest on one
+  worker (2.4 Gbit/s against 2.3), and a server with three clients needed
+  two or three. A dedicated machine, or a server with many clients, may want
+  a different number; `TOKIO_WORKER_THREADS` is the knob.
+
+**Windows**
+
+- **Not profiled.** The Windows client moved 1473 down and 1452 up against
+  2097 and 2359 with no tunnel, on v0.0.68. It was not run with the noq
+  change above, which is platform-independent, and nothing is known yet
+  about where its time goes.
 
 ## Reproducing
 

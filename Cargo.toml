@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.68"
+version = "0.0.69"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 license = "MIT"
@@ -122,7 +122,10 @@ iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send
 # burst's own size: upstream took congestion loss among packets of slightly
 # different sizes for a black hole and reset the path MTU to 1200 for 60 s,
 # under which every full-size (1280-byte) inner packet is dropped as too
-# large. All three crates come from the fork so the graph holds a single
+# large. Its connection driver also releases the connection lock across each
+# UDP send, so tasks queueing data for the connection (the TUN reader) no
+# longer wait out the send syscalls (see docs/Architecture.md, "Throughput
+# Design"). All three crates come from the fork so the graph holds a single
 # `noq-udp`.
 noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
 noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
