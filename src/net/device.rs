@@ -665,7 +665,9 @@ const UTUN_MAX_PENDING_PACKETS: u32 = 32;
 /// only logs, leaving the kernel's default of one.
 #[cfg(target_vendor = "apple")]
 fn set_utun_max_pending_packets(fd: &OwnedFd) {
-    // From <net/if_utun.h>; the `libc` crate has no binding for it.
+    // From <sys/sys_domain.h> and <net/if_utun.h>: the `libc` crate exports
+    // the first on macOS only and has no binding for the second.
+    const SYSPROTO_CONTROL: libc::c_int = 2;
     const UTUN_OPT_MAX_PENDING_PACKETS: libc::c_int = 16;
     let count = UTUN_MAX_PENDING_PACKETS;
     // SAFETY: `fd` is open for the call's duration and `count` is a live u32
@@ -673,7 +675,7 @@ fn set_utun_max_pending_packets(fd: &OwnedFd) {
     let rc = unsafe {
         libc::setsockopt(
             fd.as_raw_fd(),
-            libc::SYSPROTO_CONTROL,
+            SYSPROTO_CONTROL,
             UTUN_OPT_MAX_PENDING_PACKETS,
             (&count as *const u32).cast(),
             std::mem::size_of::<u32>() as libc::socklen_t,

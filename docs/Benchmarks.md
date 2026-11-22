@@ -87,9 +87,13 @@ was identical on every run, which suggests a cap in the VM's NAT path.
 Single macOS download runs dipped to 1200–1450 now and then on every build,
 v0.0.68 included, and one IPv4 pass of five had a median of 1367.
 
-ezvpn picks its direct path per connection and prefers IPv6 at equal round
-trip time; on this VM an IPv4 path carried an upload about 15% faster than
-the IPv6 one, so the two are listed apart. v0.0.68 was measured over IPv6.
+ezvpn picks its direct path per connection. The selector counts an IPv6
+path as 3 ms faster than it measures and leaves the current direct path only
+for one at least 5 ms better after that bias, so at equal round trip time it
+keeps whichever family it selected first, and a client restart can land on
+either. On this VM an IPv4 path carried an upload about 15% faster than the
+IPv6 one, so the two are listed apart; read the family off
+`ezvpn client status` when reproducing a row. v0.0.68 was measured over IPv6.
 Upload retransmits were 0 on most passes over IPv6 and 0–130 per run over
 IPv4, which here usually went out through the router's public address and
 back.
@@ -221,9 +225,12 @@ scheduled work.
   over one MTU-sized packet per read. Whether a root process can get the
   channel mode, and what it would take, was not investigated; it is the only
   route seen here to fewer, larger reads.
-- **IPv6 preferred at equal round trip time.** The path selector follows
-  iroh's default and takes the IPv6 direct path when it is within 3 ms of
-  the IPv4 one. On this VM that cost about 15% of upload. It may be this
+- **IPv6 bias in path selection.** The path selector follows iroh's default:
+  it counts an IPv6 direct path as 3 ms faster than it measures, and switches
+  between direct paths only for a 5 ms improvement after that bias. With no
+  path selected yet it therefore takes IPv6 when that is within 3 ms of IPv4,
+  and at equal round trip time it stays on whichever it has. On this VM a
+  connection that settled on IPv6 uploaded about 15% slower. It may be this
   VM's NAT rather than macOS; it was not measured on a Mac with native IPv6.
 - **Reader polling may no longer be needed.** With the utun backlog, polling
   the utun between batches (`TUN_DRAIN_SPIN`) changed neither throughput nor
