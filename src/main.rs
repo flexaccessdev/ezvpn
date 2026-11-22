@@ -325,13 +325,33 @@ fn init_logger() {
     ezvpn::logging::try_init().expect("logger installed twice");
 }
 
+/// Worker threads of the CLI's Tokio runtime, unless `TOKIO_WORKER_THREADS`
+/// says otherwise.
+///
+/// One connection's data path is a chain of tasks (TUN reader, QUIC
+/// connection driver, endpoint driver, TUN writer) that hand packets to each
+/// other through the connection's lock, so it gains nothing from running on
+/// more threads at once, and Tokio's default of one worker per core spreads
+/// the chain over idle workers, where each handoff becomes a cross-thread wake
+/// and a contended lock. Measured between two 6-vCPU Linux VMs (see
+/// docs/Benchmarks.md), one tunnel moved about 40% more on one or two workers
+/// than on six, and a server with three busy clients moved as much on two as
+/// on six. Two rather than one, so a saturated data path cannot starve the
+/// control plane and a server still spreads clients over two cores.
+const RUNTIME_WORKER_THREADS: usize = 2;
+
 /// Build the multi-threaded Tokio runtime used by the async commands. Built
 /// after any daemonization fork — a runtime cannot survive `fork()`.
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(Into::into)
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    // Tokio reads TOKIO_WORKER_THREADS only when no count is set, so leave
+    // the count unset when the variable is: it stays an override for
+    // measurement.
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        builder.worker_threads(cores.min(RUNTIME_WORKER_THREADS));
+    }
+    builder.enable_all().build().map_err(Into::into)
 }
 
 /// Default daemon log-file path for a client instance (absolute; in the log

@@ -774,6 +774,10 @@ sysctls (about 208 KiB by default), overflowing the receive queue under load.
 Because the VPN runs as root, ezvpn's transport stack sets the buffers with
 `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`, which are not subject to the cap.
 
+Measured numbers, the setup they came from, and a comparison run against
+Tailscale on the same machines (a yardstick, not a verdict) are in
+[docs/Benchmarks.md](docs/Benchmarks.md).
+
 ## Reconnect Behavior
 
 Client auto-reconnect is enabled by default. Disable it with

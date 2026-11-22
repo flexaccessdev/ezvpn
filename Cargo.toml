@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.67"
+version = "0.0.68"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 license = "MIT"
@@ -135,6 +135,9 @@ noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rt
 # apply as before. On Apple platforms it also opens a connected socket per
 # busy peer beside the unconnected main socket, sharing its port with
 # SO_REUSEPORT: XNU charges every send that names a destination 25-40 µs of
-# PCB connect/disconnect, which a connected socket skips (see
-# docs/Architecture.md, "Throughput Design").
+# PCB connect/disconnect, which a connected socket skips. On Linux the same
+# per-peer sockets keep a peer's datagrams on one NIC transmit queue: on a
+# multi-queue NIC with XPS an unconnected socket's queue follows the sending
+# thread's CPU, which reorders the tunnel's packets (see docs/Architecture.md,
+# "Throughput Design").
 netwatch = { git = "https://github.com/flexaccessdev/net-tools.git", branch = "ezvpn-bufforce-0.20.2" }

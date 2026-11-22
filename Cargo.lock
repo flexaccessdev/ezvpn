@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "ezvpn"
-version = "0.0.67"
+version = "0.0.68"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2099,7 +2099,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.20.2"
-source = "git+https://github.com/flexaccessdev/net-tools.git?branch=ezvpn-bufforce-0.20.2#03e3b773e5c3482d8096324b9badd073d0ebd440"
+source = "git+https://github.com/flexaccessdev/net-tools.git?branch=ezvpn-bufforce-0.20.2#3dc53a2fb937da73432db46d0564809f0d239c5f"
 dependencies = [
  "atomic-waker",
  "bytes",
