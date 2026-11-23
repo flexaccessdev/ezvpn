@@ -162,7 +162,10 @@ retransmits per run: 64 datagrams do not fit a UDP payload, the send fails
 with `EMSGSIZE`, and the socket layer drops the whole batch without
 reporting it. ezvpn now sends up to 32, which fits at any MTU it can
 discover (32 × 1452 bytes is 46 KB) and also fits a frame of iroh's relay
-protocol, whose limit is a little under the UDP one.
+protocol, whose limit is a little under the UDP one. The fork also stops a
+batch at one UDP payload in bytes, for a path MTU above 2046 that ezvpn
+never has: upstream's 10 fit there (ten 4,096-byte segments send, sixteen
+do not), and 32 would not.
 
 The build with 32 against v0.0.69 and Tailscale 1.104.7, each round running
 all three, median of 6 rounds:
@@ -185,8 +188,10 @@ larger sends moved a third more data for the same CPU. The pacer still
 decides how many datagrams may leave at once; the cap only sets how many
 sends that takes, so a slow path, whose pacer releases a few datagrams at a
 time, sends as before. A relay-only path behaved the same on both builds
-(the public relay's rate limit set the rate for both). The driver's other
-limit, 20 datagrams built per poll, made no difference (20 against 128).
+(the public relay's rate limit set the rate for both). The driver also
+yields to other tasks once a poll has built 20 datagrams or more, a
+threshold it checks after each transmit, so with 32 per send it yields after
+every one; raising the threshold to 128 made no difference.
 
 The cap is the same on every platform. The Windows client (the VM in the
 table above, against `test1`) with its own cap at 10 and at 32, five rounds
@@ -364,10 +369,10 @@ scheduled work.
 
 - **Sends filled to the UDP payload.** About 45 datagrams per send measured
   3% (down) and 5% (up) above the 32 ezvpn uses, and in its session put ezvpn
-  ahead of Tailscale both ways (3248 and 3166 against 2939 and 2972). It
-  needs the batch bounded in bytes where the path MTU is known, in noq's
-  protocol layer, and the bound has to respect the relay frame limit as well
-  as the UDP one; 32 needs neither.
+  ahead of Tailscale both ways (3248 and 3166 against 2939 and 2972). The
+  fork's byte bound already keeps such a batch inside a UDP payload; what
+  raising the cap still needs is a bound that also respects the relay frame
+  limit, a few bytes lower, which 32 datagrams stay under by themselves.
 - **The sender is one thread's worth.** With one runtime worker the sending
   side held a core at 100% for 2.2 Gbit/s (v0.0.69) with no steal time; with
   two, each worker ran at 65–70% and the guest lost half a core to a core to
