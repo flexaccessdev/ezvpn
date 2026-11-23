@@ -123,11 +123,11 @@ iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send
 # different sizes for a black hole and reset the path MTU to 1200 for 60 s,
 # under which every full-size (1280-byte) inner packet is dropped as too
 # large. Its connection driver also releases the connection lock across each
-# UDP send, so tasks queueing data for the connection (the TUN reader) no
-# longer wait out the send syscalls, and on Linux packs up to 32 datagrams
-# into one GSO send where upstream stops at 10 (see docs/Architecture.md,
-# "Throughput Design"). All three crates come from the fork so the graph holds
-# a single `noq-udp`.
+# UDP send (except on Windows, where that slowed downloads), so tasks queueing
+# data for the connection (the TUN reader) no longer wait out the send
+# syscalls, and packs up to 32 datagrams into one GSO send where upstream
+# stops at 10 (see docs/Architecture.md, "Throughput Design"). All three
+# crates come from the fork so the graph holds a single `noq-udp`.
 noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
 noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
 noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }

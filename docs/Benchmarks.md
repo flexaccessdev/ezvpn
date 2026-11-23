@@ -160,9 +160,9 @@ the variants taken in turn:
 A cap of 64 with no bound on the bytes fell to 430 Mbit/s with 10,000
 retransmits per run: 64 datagrams do not fit a UDP payload, the send fails
 with `EMSGSIZE`, and the socket layer drops the whole batch without
-reporting it. ezvpn now sends up to 32 on Linux, which fits at any MTU it
-can discover (32 × 1452 bytes is 46 KB) and also fits a frame of iroh's
-relay protocol, whose limit is a little under the UDP one.
+reporting it. ezvpn now sends up to 32, which fits at any MTU it can
+discover (32 × 1452 bytes is 46 KB) and also fits a frame of iroh's relay
+protocol, whose limit is a little under the UDP one.
 
 The build with 32 against v0.0.69 and Tailscale 1.104.7, each round running
 all three, median of 6 rounds:
@@ -187,8 +187,54 @@ sends that takes, so a slow path, whose pacer releases a few datagrams at a
 time, sends as before. A relay-only path behaved the same on both builds
 (the public relay's rate limit set the rate for both). The driver's other
 limit, 20 datagrams built per poll, made no difference (20 against 128).
-Other platforms keep 10: macOS sends one datagram per call anyway, and
-Windows was not measured.
+
+The cap is the same on every platform. The Windows client (the VM in the
+table above, against `test1`) with its own cap at 10 and at 32, five rounds
+taking the variants in turn:
+
+| Windows client | Down | Up |
+|---|---:|---:|
+| 10 per send | 1008 | 1329 |
+| 32 per send | 993 | 1640 |
+
+A download is sent by the server, and the server's own cap made no
+difference to it there (1004 with 10, 1021 with 32): the Windows receive
+side is the limit. The client used 1.3 cores for an upload at 10 per send
+and 1.2 at 32. macOS takes one datagram per send whatever the cap, and
+measured the same before and after: against the server with 32 per send,
+the v0.0.69 client moved 1800 down and 812 up and the new one 1788 and 799
+(six passes each, medians; single downloads dipped to 1250–1460 on both,
+as they did before).
+
+### Releasing the connection lock cost Windows its download
+
+The Windows runs above turned up a second difference. v0.0.69 made the QUIC
+driver release the connection's lock across each UDP send, for macOS
+uploads (see below). The same binary source built for Windows with and
+without that change, the cap at 10 in both, five rounds in turn:
+
+| Windows client | Down | Up |
+|---|---:|---:|
+| Lock held across the send (as before v0.0.69) | 1194 | 1357 |
+| Lock released (v0.0.69) | 1008 | 1329 |
+
+It was not profiled; the client's CPU was the same 1.5 cores either way.
+The driver now holds the lock across the send on Windows only. Between the
+Linux guests the two measured alike when the change was made, and macOS is
+what it was made for. The v0.0.68 Windows client, v0.0.69, and the build
+with both changes (32 per send, lock held on Windows), each against the
+server with 32 per send, five rounds in turn:
+
+| Windows client | Down | Up |
+|---|---:|---:|
+| v0.0.68 (the binary of the earlier table) | 1196 | 1404 |
+| v0.0.69 | 1036 | 1367 |
+| 32 per send, lock held on Windows | 1193 | 1726 |
+| No tunnel | 2068 | 2314 |
+
+The first row measured 1473 and 1452 in the morning's session: the path to
+this VM carried less in the evening for every build, so the rows compare
+with each other and not with the earlier table.
 
 ### More runtime threads were slower
 
@@ -342,13 +388,12 @@ scheduled work.
 
 **Windows**
 
-- **Not profiled.** The Windows client moved 1473 down and 1452 up against
-  2097 and 2359 with no tunnel, on v0.0.68. It was not run with the noq
-  change above, which is platform-independent, and nothing is known yet
+- **Not profiled.** The Windows client moves about 1.2 Gbit/s down and 1.7
+  up against 2.1 and 2.3 with no tunnel. Its download did not respond to
+  either end's send batch and lost 16% to the lock change that was then
+  taken back for Windows, which points at the receive side (the driver, the
+  datagram reader and one Wintun write per packet), but nothing is known yet
   about where its time goes.
-- **Send batch still 10.** Windows has UDP segmentation offload on send too,
-  and the driver's cap is raised on Linux only. Whether a larger batch helps
-  there was not measured.
 
 ## Reproducing
 
