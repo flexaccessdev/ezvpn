@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "ezvpn"
-version = "0.0.69"
+version = "0.0.70"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
