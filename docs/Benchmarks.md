@@ -2,9 +2,28 @@
 
 Throughput measurements kept to compare ezvpn with itself: one version
 against the next, and one technique against another, on the same machines.
-This page records what was measured, on what, and what each change was
-worth. The reasoning behind the changes is in
-[Architecture](Architecture.md), "Throughput Design".
+The reasoning behind the changes is in [Architecture](Architecture.md),
+"Throughput Design".
+
+## v0.0.70 against v0.0.69
+
+Mbit/s, down / up, one TCP flow, 2026-11-22. Each column is one session in
+which the rows were measured in turn, round after round; the numbers are
+medians. Each ezvpn row ran that version at both ends.
+
+| | Linux pair, UDP offload on | Linux pair, default NIC | macOS client | Windows client |
+|---|---:|---:|---:|---:|
+| No tunnel | 18943 / 21017 | 20934 / 20700 | 1946 / 2353 | 2089 / 2334 |
+| Tailscale (control) | 2935 / 3163 | 1707 / 1738 | 436 / 218 | not installed |
+| ezvpn v0.0.69 | 2247 / 2188 | 1885 / 1987 | 1594 / 966 | 988 / 1285 |
+| **ezvpn v0.0.70** | **2993 / 2847** | **2097 / 2337** | **1798 / 924** | **1206 / 1648** |
+
+v0.0.70 sends up to 32 datagrams per UDP send where v0.0.69 sent 10, which is
+the Linux gain and the Windows upload gain, and on Windows it holds the
+connection lock across a send again, which is the Windows download gain. Both
+are under "What the measurements showed" below. macOS takes one datagram per
+send and is unchanged; its download difference here is two slow v0.0.69 runs,
+of a kind every build has (see the macOS table).
 
 > **Tailscale is in these tables as a control, not as a competitor.** It is a
 > mature VPN that runs on the same machines, so when an ezvpn number comes
@@ -30,88 +49,91 @@ worth. The reasoning behind the changes is in
 | Host CPU | Intel Core i5-8400T (6 cores, no SMT); each guest has 6 vCPUs, so the two guests together overcommit the host 2:1 |
 | Guest | Debian 13, kernel 6.12.117, 2 GB RAM |
 | NIC | `virtio_net`, 6 queues (multi-queue), XPS at its default of one transmit queue per CPU, `tx-udp-segmentation` off by default |
-| ezvpn | v0.0.67 and the build that follows it (connected per-peer sockets on Linux, two runtime workers); direct IPv4 path, Cubic, inner MTU 1280 |
-| Tailscale | 1.104.7, direct path, `tailscale0` MTU 1280 |
-| Tool | iperf3 3.18, one TCP flow, 6 s per run after a 1 s warm-up, median of 5 runs; "up" is client to server, "down" is server to client (`-R`) |
+| ezvpn | v0.0.69 and v0.0.70, the same version at both ends; direct path, Cubic, inner MTU 1280 |
+| Tailscale | 1.104.7 on the Linux pair, 1.104.2 on macOS; direct path, `tailscale0` MTU 1280 |
+| Tool | iperf3 3.18 (3.22.1 on Windows), one TCP flow, 6 s per run after a 1 s warm-up; "up" is client to server, "down" is server to client (`-R`) |
 
-Both tunnels ran on the same pair, one test at a time. Run-to-run spread was
-usually within ±5%; anything else running on the physical host moves every
-row (an unrelated busy VM halved all of them for a few minutes), so the rows
-of one table were always taken back to back.
+One test ran at a time. Anything else running on the physical host moves
+every row (an unrelated busy VM halved all of them for a few minutes), so
+the rows of a table were taken in turn, one round after another, and the
+tunnel was restarted for every ezvpn run.
 
 ## Results
 
-Mbit/s, median of 5 runs. "Retr" is the inner TCP sender's retransmits per run.
+Mbit/s, medians. "Retr" is the median of the inner TCP sender's retransmits
+per run. Only the current version and the one before it are listed; what
+older versions measured is with the change that moved them, under "What the
+measurements showed".
 
-### Default NIC settings
+### Linux pair, `tx-udp-segmentation` on
 
-| | Down | Up | Retr (down / up) |
-|---|---:|---:|---:|
-| No tunnel (TCP with TSO over the bridge) | 21208 | 20476 | 306 / 27 |
-| Tailscale 1.104.7 | 1749 | 1249 | 2201 / 1112 |
-| ezvpn v0.0.67 | 1037 | 1024 | 930 / 1077 |
-| ezvpn, peer sockets + two workers | 1931 | 1940 | 0 / 1 |
-
-Tailscale's two directions were not stable from one session to the next here:
-an earlier pass on the same day gave 1289 down and 1827 up.
-
-### With `ethtool -K eth0 tx-udp-segmentation on` on both guests
+Five rounds.
 
 | | Down | Up | Retr (down / up) |
 |---|---:|---:|---:|
-| No tunnel | 21261 | 20686 | 48 / 424 |
-| Tailscale 1.104.7 | 3030 | 3112 | 1806 / 2494 |
-| ezvpn v0.0.67 | 1215 | 1243 | 1177 / 1477 |
-| ezvpn, peer sockets + two workers | 2207 | 2278 | 0 / 0 |
+| No tunnel (TCP with TSO over the bridge) | 18943 | 21017 | 1215 / 0 |
+| Tailscale 1.104.7 | 2935 | 3163 | 1780 / 1251 |
+| ezvpn v0.0.69 | 2247 | 2188 | 0 / 0 |
+| ezvpn v0.0.70 | 2993 | 2847 | 0 / 0 |
 
-`virtio_net` supports UDP segmentation offload but leaves it off by default.
-With it on, a UDP GSO batch crosses to the host as one buffer instead of
-being segmented in the guest. It is a setting of the underlay NIC, outside
-either VPN's control.
+`virtio_net` supports UDP segmentation offload but leaves it off by default
+(`ethtool -K eth0 tx-udp-segmentation on`). With it on, a UDP GSO batch
+crosses to the host as one buffer instead of being segmented in the guest.
+It is a setting of the underlay NIC, outside either VPN's control. One round
+was slow for every row (Tailscale 1282 and 1518, no tunnel 12505 and 13576).
 
-A later change (32 datagrams per UDP send) raised ezvpn in both tables. It
-was measured in a session of its own, so its numbers are under
-"Ten datagrams per send" below, next to the v0.0.69 and Tailscale runs taken
-with it, and not added to these rows.
+### Linux pair, default NIC settings
+
+Five rounds.
+
+| | Down | Up | Retr (down / up) |
+|---|---:|---:|---:|
+| No tunnel | 20934 | 20700 | 0 / 0 |
+| Tailscale 1.104.7 | 1707 | 1738 | 2174 / 1699 |
+| ezvpn v0.0.69 | 1885 | 1987 | 0 / 0 |
+| ezvpn v0.0.70 | 2097 | 2337 | 0 / 0 |
+
+One v0.0.70 round read 0 in both directions with 3 retransmits, which is
+what the rate-limited public relay path gives: the test began before a
+direct path had been selected. It is one of the five behind the medians. Six
+further starts of each version all had a direct path within the few seconds
+the test waits.
 
 ### macOS and Windows clients against the Linux server
 
-The same day, one client at a time against the ezvpn server on `test1`,
-both ends at default NIC settings. Unlike the Linux pair these cross a real
-network, and the "no tunnel" row is what that path carries for one TCP flow,
-so read each tunnel number against its own baseline. The client ran the same
-commit as the server, built for its platform.
+One client at a time against the ezvpn server on `test1`, both ends at
+default NIC settings. Unlike the Linux pair these cross a real network, and
+the "no tunnel" row is what that path carries for one TCP flow, so read each
+tunnel number against its own baseline.
 
 | Client | | Down | Up |
 |---|---|---:|---:|
-| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2350 |
-| | Tailscale 1.104.2 | 435 | 219 |
-| | ezvpn v0.0.68 | 1777 | 410 |
-| | ezvpn, utun backlog + sends outside the lock, IPv6 direct path | 1773–1798 | 650–820 |
-| | ezvpn, the same, IPv4 direct path | 1774–1823 | 880–1000 |
-| Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2097 | 2359 |
-| | ezvpn v0.0.68 | 1473 | 1452 |
+| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2353 |
+| | Tailscale 1.104.2 | 436 | 218 |
+| | ezvpn v0.0.69 | 1594 | 966 |
+| | ezvpn v0.0.70 | 1798 | 924 |
+| Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2089 | 2334 |
+| | ezvpn v0.0.69 | 988 | 1285 |
+| | ezvpn v0.0.70 | 1206 | 1648 |
 
-Mbit/s, median of 5 runs of 6 s, iperf3 run on the client (3.22.1 on
-Windows); the ranges are the medians of several passes, each after a client
-restart. Every tunnel run used a direct path. The macOS no-tunnel download
-was identical on every run, which suggests a cap in the VM's NAT path.
-Single macOS download runs dipped to 1200–1450 now and then on every build,
-v0.0.68 included, and one IPv4 pass of five had a median of 1367.
+Four rounds on macOS, five on Windows, iperf3 run on the client. Every
+tunnel run used a direct path. Tailscale is not installed on the Windows VM.
+
+The macOS no-tunnel download was identical on every run, which suggests a
+cap in the VM's NAT path. Single macOS downloads dip to 1150–1500 now and
+then on every build: the four v0.0.69 runs were 1164, 1803, 1384 and 1804,
+and the v0.0.70 ones 1512, 1801, 1814 and 1795, so the two versions download
+alike. The ezvpn clients used 1.6–1.7 cores and Tailscale's network
+extension 3.3 for a download and 2.7 for an upload.
 
 ezvpn picks its direct path per connection. The selector counts an IPv6
 path as 3 ms faster than it measures and leaves the current direct path only
 for one at least 5 ms better after that bias, so at equal round trip time it
 keeps whichever family it selected first, and a client restart can land on
-either. On this VM an IPv4 path carried an upload about 15% faster than the
-IPv6 one, so the two are listed apart; read the family off
-`ezvpn client status` when reproducing a row. v0.0.68 was measured over IPv6.
-Upload retransmits were 0 on most passes over IPv6 and 0–130 per run over
-IPv4, which here usually went out through the router's public address and
-back.
-Tailscale's direct path was the server's LAN address and it retransmitted
-180 segments per upload run. The Linux pair measured the same on v0.0.68 and
-on the newer build (about 2.0 Gbit/s each way, alternating the two builds).
+either. On the macOS VM an IPv4 path carried a v0.0.69 upload about 15%
+faster than the IPv6 one (880–1000 against 650–820); read the family off
+`ezvpn client status` when reproducing a row. All but one of the macOS runs
+above were over IPv4.
 
 ## What the measurements showed
 
@@ -139,7 +161,7 @@ queue the kernel keeps fixed.
 ### Ten datagrams per send
 
 Turning `tx-udp-segmentation` on took Tailscale from 1.7 to 3.0 Gbit/s and
-ezvpn only from 1.9 to 2.2. With the offload on, a UDP GSO send reaches the
+ezvpn v0.0.69 only from 1.9 to 2.2. With the offload on, a UDP GSO send reaches the
 host as one buffer, so what a send costs is shared by the datagrams in it,
 in the guest's stack, in the host's virtio backend and again in the
 receiving guest. Tailscale's wireguard-go fills a send up to the UDP payload
@@ -167,21 +189,9 @@ batch at one UDP payload in bytes, for a path MTU above 2046 that ezvpn
 never has: upstream's 10 fit there (ten 4,096-byte segments send, sixteen
 do not), and 32 would not.
 
-The build with 32 against v0.0.69 and Tailscale 1.104.7, each round running
-all three, median of 6 rounds:
-
-| | Down | Up | Down, offload off | Up, offload off |
-|---|---:|---:|---:|---:|
-| ezvpn v0.0.69 (10 per send) | 2180 | 2170 | 1786 | 1922 |
-| ezvpn, 32 per send | 2972 | 2818 | 2022 | 2167 |
-| Tailscale 1.104.7 | 2952 | 3042 | 1703 | 1481 |
-
-ezvpn's inner TCP retransmitted nothing in the offload-on runs and in the
-offload-off downloads; a few offload-off uploads had 25 to 650 retransmits
-on both builds alike. Tailscale's runs had 400 to 3,400 each. The last two
-of the six offload-on rounds were disturbed (Tailscale fell to 1426 down in
-one, both ezvpn builds to 1500–1600 down in the other), which is the case
-the Tailscale rows are there to show: the host, not a build.
+The Linux rows of Results are this change: v0.0.69 sends 10 per send and
+v0.0.70 sends 32. ezvpn's inner TCP retransmitted nothing in those runs with
+the offload on, and Tailscale's 1,100 to 3,600 per run.
 
 Both ezvpn processes used about 1.3 cores at either batch size, so the
 larger sends moved a third more data for the same CPU. The pacer still
@@ -193,8 +203,8 @@ yields to other tasks once a poll has built 20 datagrams or more, a
 threshold it checks after each transmit, so with 32 per send it yields after
 every one; raising the threshold to 128 made no difference.
 
-The cap is the same on every platform. The Windows client (the VM in the
-table above, against `test1`) with its own cap at 10 and at 32, five rounds
+The cap is the same on every platform. The Windows client (the VM of
+Results, against `test1`) with its own cap at 10 and at 32, five rounds
 taking the variants in turn:
 
 | Windows client | Down | Up |
@@ -226,20 +236,8 @@ without that change, the cap at 10 in both, five rounds in turn:
 It was not profiled; the client's CPU was the same 1.5 cores either way.
 The driver now holds the lock across the send on Windows only. Between the
 Linux guests the two measured alike when the change was made, and macOS is
-what it was made for. The v0.0.68 Windows client, v0.0.69, and the build
-with both changes (32 per send, lock held on Windows), each against the
-server with 32 per send, five rounds in turn:
-
-| Windows client | Down | Up |
-|---|---:|---:|
-| v0.0.68 (the binary of the earlier table) | 1196 | 1404 |
-| v0.0.69 | 1036 | 1367 |
-| 32 per send, lock held on Windows | 1193 | 1726 |
-| No tunnel | 2068 | 2314 |
-
-The first row measured 1473 and 1452 in the morning's session: the path to
-this VM carried less in the evening for every build, so the rows compare
-with each other and not with the earlier table.
+what it was made for. With this and the 32 per send, v0.0.70's Windows
+client moves 1206 down and 1648 up against v0.0.69's 988 and 1285 (Results).
 
 ### More runtime threads were slower
 
@@ -302,7 +300,8 @@ ezvpn now sets 32.
 The lock wait was the QUIC driver sending under the connection's lock, one
 `sendmsg` of 6–7 µs per datagram on macOS. With the noq fork's driver
 releasing the lock across each send, the reader's lock wait fell from 330 ms
-to 10 ms per second and the upload reached the figures in the table above.
+to 10 ms per second and the upload reached 650–820 Mbit/s over an IPv6
+direct path and 880–1000 over IPv4 (v0.0.69).
 What is left of the client's time is almost all two syscalls per packet,
 the utun `read` and the UDP `sendmsg` (5–6 µs each); neither has a
 batched form that saves the per-packet kernel work on macOS.
