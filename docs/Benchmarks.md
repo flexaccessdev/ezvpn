@@ -69,6 +69,11 @@ With it on, a UDP GSO batch crosses to the host as one buffer instead of
 being segmented in the guest. It is a setting of the underlay NIC, outside
 either VPN's control.
 
+A later change (32 datagrams per UDP send) raised ezvpn in both tables. It
+was measured in a session of its own, so its numbers are under
+"Ten datagrams per send" below, next to the v0.0.69 and Tailscale runs taken
+with it, and not added to these rows.
+
 ### macOS and Windows clients against the Linux server
 
 The same day, one client at a time against the ezvpn server on `test1`,
@@ -130,6 +135,60 @@ Tailscale is affected the same way: disabling XPS took it from about
 1290/1830 to 2173/2200 in that session. ezvpn now avoids it without touching
 the NIC, by sending to a busy peer on a connected socket, whose transmit
 queue the kernel keeps fixed.
+
+### Ten datagrams per send
+
+Turning `tx-udp-segmentation` on took Tailscale from 1.7 to 3.0 Gbit/s and
+ezvpn only from 1.9 to 2.2. With the offload on, a UDP GSO send reaches the
+host as one buffer, so what a send costs is shared by the datagrams in it,
+in the guest's stack, in the host's virtio backend and again in the
+receiving guest. Tailscale's wireguard-go fills a send up to the UDP payload
+limit, about 48 of its packets (from its source; not measured here). The
+QUIC driver (noq, as quinn before it) capped a send at 10 datagrams whatever
+the socket could take.
+
+ezvpn by the driver's cap, `tx-udp-segmentation` on, median of 6 runs with
+the variants taken in turn:
+
+| Datagrams per send | Down | Up |
+|---|---:|---:|
+| 10 (v0.0.69) | 2208 | 2122 |
+| 24 | 2757 | 2692 |
+| 32 | 3143 | 2834 |
+| As many as fit one UDP payload (about 45) | 3232 | 2986 |
+
+A cap of 64 with no bound on the bytes fell to 430 Mbit/s with 10,000
+retransmits per run: 64 datagrams do not fit a UDP payload, the send fails
+with `EMSGSIZE`, and the socket layer drops the whole batch without
+reporting it. ezvpn now sends up to 32 on Linux, which fits at any MTU it
+can discover (32 × 1452 bytes is 46 KB) and also fits a frame of iroh's
+relay protocol, whose limit is a little under the UDP one.
+
+The build with 32 against v0.0.69 and Tailscale 1.104.7, each round running
+all three, median of 6 rounds:
+
+| | Down | Up | Down, offload off | Up, offload off |
+|---|---:|---:|---:|---:|
+| ezvpn v0.0.69 (10 per send) | 2180 | 2170 | 1786 | 1922 |
+| ezvpn, 32 per send | 2972 | 2818 | 2022 | 2167 |
+| Tailscale 1.104.7 | 2952 | 3042 | 1703 | 1481 |
+
+ezvpn's inner TCP retransmitted nothing in the offload-on runs and in the
+offload-off downloads; a few offload-off uploads had 25 to 650 retransmits
+on both builds alike. Tailscale's runs had 400 to 3,400 each. The last two
+of the six offload-on rounds were disturbed (Tailscale fell to 1426 down in
+one, both ezvpn builds to 1500–1600 down in the other), which is the case
+the Tailscale rows are there to show: the host, not a build.
+
+Both ezvpn processes used about 1.3 cores at either batch size, so the
+larger sends moved a third more data for the same CPU. The pacer still
+decides how many datagrams may leave at once; the cap only sets how many
+sends that takes, so a slow path, whose pacer releases a few datagrams at a
+time, sends as before. A relay-only path behaved the same on both builds
+(the public relay's rate limit set the rate for both). The driver's other
+limit, 20 datagrams built per poll, made no difference (20 against 128).
+Other platforms keep 10: macOS sends one datagram per call anyway, and
+Windows was not measured.
 
 ### More runtime threads were slower
 
@@ -257,10 +316,24 @@ scheduled work.
 
 **Linux**
 
-- **UDP segmentation offload on.** With `tx-udp-segmentation` on, Tailscale
-  moved 3.0–3.1 Gbit/s on the Linux pair against ezvpn's 2.2–2.3. ezvpn sent
-  with no retransmits there, so the gap is per-packet cost rather than loss;
-  it was not profiled.
+- **Sends filled to the UDP payload.** About 45 datagrams per send measured
+  3% (down) and 5% (up) above the 32 ezvpn uses, and in its session put ezvpn
+  ahead of Tailscale both ways (3248 and 3166 against 2939 and 2972). It
+  needs the batch bounded in bytes where the path MTU is known, in noq's
+  protocol layer, and the bound has to respect the relay frame limit as well
+  as the UDP one; 32 needs neither.
+- **The sender is one thread's worth.** With one runtime worker the sending
+  side held a core at 100% for 2.2 Gbit/s (v0.0.69) with no steal time; with
+  two, each worker ran at 65–70% and the guest lost half a core to a core to
+  steal, for about the same throughput. What a second thread adds here is
+  lock handoffs and wakeups, not capacity. Of that one thread's time on
+  v0.0.69, 71% was user space and 29% the kernel: QUIC packet building and
+  send-side bookkeeping in noq's protocol layer 30%, AES-GCM 18%, `memcpy`
+  9% (a segment is copied into scratch, then the arena, then the QUIC send
+  buffer), software segmentation and its TCP checksums 3.5%. It was not
+  profiled again with 32 per send, which should shrink the kernel share.
+  Tailscale spends more CPU per packet (2.0 cores a side at 3.1 Gbit/s
+  against 1.3) but spreads it over seven threads.
 - **Worker count off these VMs.** Two runtime workers was chosen on guests
   that overcommit their host two to one. One tunnel was fastest on one
   worker (2.4 Gbit/s against 2.3), and a server with three clients needed
@@ -273,6 +346,9 @@ scheduled work.
   2097 and 2359 with no tunnel, on v0.0.68. It was not run with the noq
   change above, which is platform-independent, and nothing is known yet
   about where its time goes.
+- **Send batch still 10.** Windows has UDP segmentation offload on send too,
+  and the driver's cap is raised on Linux only. Whether a larger batch helps
+  there was not measured.
 
 ## Reproducing
 
