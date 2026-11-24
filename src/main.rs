@@ -8,8 +8,9 @@
 compile_error!("the ezvpn CLI only supports Linux, macOS, and Windows");
 
 // jemalloc on Linux (see the Cargo.toml note); macOS and Windows keep the
-// system allocator.
-#[cfg(target_os = "linux")]
+// system allocator. Not under Miri, which cannot run jemalloc's C and checks
+// allocations through its own allocator instead.
+#[cfg(all(target_os = "linux", not(miri)))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

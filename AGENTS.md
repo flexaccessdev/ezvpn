@@ -4,6 +4,7 @@
 - run cargo clippy and cargo test after rust code changes; a `cargo fmt` reformat alone runs neither (nor the Windows run below)
 - Rust is kept as `cargo fmt` formats it under `rustfmt.toml`, and CI checks it.
 - For codex only no `cargo fmt` because when it does git diff, it gets stuck after cargo fmt.
+- after touching `unsafe` code, run it under Miri on each OS that compiles it: `scripts/miri.sh` on Linux and on macvm, `scripts/miri.ps1` on windows-ci-build. For new unsafe that stays off the network and the TUN device, add its test to `scripts/miri-tests.txt`.
 - after touching Windows-gated code (`cfg(windows)`, `src/ffi_windows.rs`, `build-windows.ps1`), run `pwsh -File ci/windows/remote.ps1`: the CI workflow's Windows jobs (clippy, the debug ezvpn.dll build) against the working tree on the Windows CI VM, through ../devtools. `remote.ps1 fetch dist/windows tmp/windows-dll` brings the built DLL and header back.
 
 # Design notes

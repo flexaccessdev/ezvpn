@@ -91,7 +91,7 @@ use tokio::sync::Notify;
 
 use crate::config::VpnClientConfig;
 use crate::control::{ClientEvent, ClientStatusHandle};
-use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison};
+use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison, write_cstr};
 use crate::transport::endpoint::{RelayConfig, create_client_endpoint};
 use crate::tunnel::client::VpnClient;
 
@@ -210,14 +210,14 @@ pub extern "C" fn ezvpn_init_logging() {
 pub unsafe extern "C" fn ezvpn_generate_client_key(out_buf: *mut c_char, out_len: usize) -> c_int {
     match crate::ffi_common::generate_client_key_json() {
         Ok(json) => {
-            if write_cstr(out_buf, out_len, &json) {
+            if unsafe { write_cstr(out_buf, out_len, &json) } {
                 1
             } else {
                 0
             }
         }
         Err(msg) => {
-            write_cstr(out_buf, out_len, &msg);
+            unsafe { write_cstr(out_buf, out_len, &msg) };
             0
         }
     }
@@ -230,7 +230,9 @@ pub unsafe extern "C" fn ezvpn_generate_client_key(out_buf: *mut c_char, out_len
 /// then holds the truncated output rather than a diagnostic.
 ///
 /// # Safety
-/// - `secret_key` must be a valid, NUL-terminated UTF-8 C string.
+/// - `secret_key` may be null; otherwise it must point to readable bytes up to
+///   and including a NUL terminator. Null and non-UTF-8 secrets are reported
+///   as errors, not undefined behavior.
 /// - `out_buf` must point to at least `out_len` writable bytes (may be null only
 ///   if `out_len` is 0).
 #[unsafe(no_mangle)]
@@ -240,26 +242,26 @@ pub unsafe extern "C" fn ezvpn_client_public_key(
     out_len: usize,
 ) -> c_int {
     if secret_key.is_null() {
-        write_cstr(out_buf, out_len, "secret_key is null");
+        unsafe { write_cstr(out_buf, out_len, "secret_key is null") };
         return 0;
     }
     let secret = match unsafe { CStr::from_ptr(secret_key) }.to_str() {
         Ok(secret) => secret,
         Err(_) => {
-            write_cstr(out_buf, out_len, "secret_key is not valid UTF-8");
+            unsafe { write_cstr(out_buf, out_len, "secret_key is not valid UTF-8") };
             return 0;
         }
     };
     match crate::ffi_common::client_public_key(secret) {
         Ok(public) => {
-            if write_cstr(out_buf, out_len, &public) {
+            if unsafe { write_cstr(out_buf, out_len, &public) } {
                 1
             } else {
                 0
             }
         }
         Err(msg) => {
-            write_cstr(out_buf, out_len, &msg);
+            unsafe { write_cstr(out_buf, out_len, &msg) };
             0
         }
     }
@@ -297,13 +299,13 @@ pub unsafe extern "C" fn ezvpn_start(
     out_len: usize,
 ) -> *mut EzvpnHandle {
     if config_json.is_null() {
-        write_cstr(out_buf, out_len, "config_json is null");
+        unsafe { write_cstr(out_buf, out_len, "config_json is null") };
         return ptr::null_mut();
     }
     let json = match unsafe { CStr::from_ptr(config_json) }.to_str() {
         Ok(s) => s,
         Err(_) => {
-            write_cstr(out_buf, out_len, "config_json is not valid UTF-8");
+            unsafe { write_cstr(out_buf, out_len, "config_json is not valid UTF-8") };
             return ptr::null_mut();
         }
     };
@@ -312,7 +314,7 @@ pub unsafe extern "C" fn ezvpn_start(
     match start_inner(json, target) {
         Ok(handle) => Box::into_raw(Box::new(handle)),
         Err(msg) => {
-            write_cstr(out_buf, out_len, &msg);
+            unsafe { write_cstr(out_buf, out_len, &msg) };
             ptr::null_mut()
         }
     }
@@ -495,9 +497,9 @@ async fn run_client(
 /// `out_len > 0`); the null-handle return writes an empty string.
 ///
 /// # Safety
-/// `handle` must be a valid pointer returned by [`ezvpn_start`] and not yet
-/// passed to [`ezvpn_stop`]. `out_buf` must point to at least `out_len` writable
-/// bytes (may be null only if `out_len` is 0).
+/// `handle` must be null (refused with `-1`) or a valid pointer returned by
+/// [`ezvpn_start`] and not yet passed to [`ezvpn_stop`]. `out_buf` must point to
+/// at least `out_len` writable bytes (may be null only if `out_len` is 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ezvpn_status(
     handle: *const EzvpnHandle,
@@ -505,7 +507,7 @@ pub unsafe extern "C" fn ezvpn_status(
     out_len: usize,
 ) -> c_int {
     if handle.is_null() {
-        write_cstr(out_buf, out_len, "");
+        unsafe { write_cstr(out_buf, out_len, "") };
         return -1;
     }
     let handle = unsafe { &*handle };
@@ -513,7 +515,7 @@ pub unsafe extern "C" fn ezvpn_status(
         Ok(j) => j,
         Err(e) => format!("{{\"error\":\"failed to serialize status: {e}\"}}"),
     };
-    if write_cstr(out_buf, out_len, &json) {
+    if unsafe { write_cstr(out_buf, out_len, &json) } {
         1
     } else {
         0
@@ -543,9 +545,9 @@ pub unsafe extern "C" fn ezvpn_status(
 /// `out_len > 0`); the null-handle return writes an empty string.
 ///
 /// # Safety
-/// `handle` must be a valid pointer returned by [`ezvpn_start`] and not yet
-/// passed to [`ezvpn_stop`]. `out_buf` must point to at least `out_len` writable
-/// bytes (may be null only if `out_len` is 0).
+/// `handle` must be null (refused with `-1`) or a valid pointer returned by
+/// [`ezvpn_start`] and not yet passed to [`ezvpn_stop`]. `out_buf` must point to
+/// at least `out_len` writable bytes (may be null only if `out_len` is 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ezvpn_conn_path(
     handle: *const EzvpnHandle,
@@ -553,7 +555,7 @@ pub unsafe extern "C" fn ezvpn_conn_path(
     out_len: usize,
 ) -> c_int {
     if handle.is_null() {
-        write_cstr(out_buf, out_len, "");
+        unsafe { write_cstr(out_buf, out_len, "") };
         return -1;
     }
     let handle = unsafe { &*handle };
@@ -568,7 +570,7 @@ pub unsafe extern "C" fn ezvpn_conn_path(
         Ok(rt) => rt.block_on(handle.status.connection_snapshot()),
         Err(e) => {
             let json = format!("{{\"error\":\"failed to build runtime: {e}\"}}");
-            return if write_cstr(out_buf, out_len, &json) {
+            return if unsafe { write_cstr(out_buf, out_len, &json) } {
                 1
             } else {
                 0
@@ -576,7 +578,7 @@ pub unsafe extern "C" fn ezvpn_conn_path(
         }
     };
     let json = crate::ffi_common::conn_path_json(snapshot);
-    if write_cstr(out_buf, out_len, &json) {
+    if unsafe { write_cstr(out_buf, out_len, &json) } {
         1
     } else {
         0
@@ -609,18 +611,30 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
     // `handle` (Box) drops here, freeing the allocation.
 }
 
-/// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if
-/// the full string fit, `false` if it was truncated or the buffer was unusable.
-fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
-    if buf.is_null() || len == 0 {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi_common::test_support::{check_key_exports, cstr};
+
+    #[test]
+    fn key_exports_honor_buffer_contracts() {
+        check_key_exports(ezvpn_generate_client_key, ezvpn_client_public_key);
     }
-    let bytes = s.as_bytes();
-    // Reserve one byte for the trailing NUL.
-    let copy = bytes.len().min(len - 1);
-    unsafe {
-        ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, copy);
-        *buf.add(copy) = 0;
+
+    #[test]
+    fn null_handle_is_refused() {
+        let mut buf = vec![0x55 as c_char; 4];
+        assert_eq!(
+            unsafe { ezvpn_status(ptr::null(), buf.as_mut_ptr(), buf.len()) },
+            -1
+        );
+        assert_eq!(cstr(&buf), "");
+        let mut buf = vec![0x55 as c_char; 4];
+        assert_eq!(
+            unsafe { ezvpn_conn_path(ptr::null(), buf.as_mut_ptr(), buf.len()) },
+            -1
+        );
+        assert_eq!(cstr(&buf), "");
+        unsafe { ezvpn_stop(ptr::null_mut()) };
     }
-    copy == bytes.len()
 }
