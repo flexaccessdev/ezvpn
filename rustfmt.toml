@@ -1,0 +1,3 @@
+# rustfmt's defaults, held to the 2024 style edition. CI checks them
+# (.github/workflows/rust-format.yml).
+style_edition = "2024"
