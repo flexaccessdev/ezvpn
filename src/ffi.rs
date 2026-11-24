@@ -74,7 +74,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 use crate::error::{VpnError, VpnResult};
-use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison};
+use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison, write_cstr};
 use crate::transport::endpoint::RelayConfig;
 use crate::transport::paths::connection_snapshot;
 use crate::tunnel::mobile::{MobileConfig, MobileSession, SessionEvent, SessionEvents};
@@ -646,18 +646,24 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
     unsafe { Box::from_raw(handle) }.stop();
 }
 
-/// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if
-/// the full string fit, `false` if it was truncated or the buffer was unusable.
-fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
-    if buf.is_null() || len == 0 {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffi_common::test_support::{check_key_exports, cstr};
+
+    #[test]
+    fn key_exports_honor_buffer_contracts() {
+        check_key_exports(ezvpn_generate_client_key, ezvpn_client_public_key);
     }
-    let bytes = s.as_bytes();
-    // Reserve one byte for the trailing NUL.
-    let copy = bytes.len().min(len - 1);
-    unsafe {
-        ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copy);
-        *buf.add(copy) = 0;
+
+    #[test]
+    fn null_handle_is_refused() {
+        let mut buf = vec![0x55 as c_char; 4];
+        assert_eq!(
+            unsafe { ezvpn_conn_path(ptr::null(), buf.as_mut_ptr(), buf.len()) },
+            -1
+        );
+        assert_eq!(cstr(&buf), "");
+        unsafe { ezvpn_stop(ptr::null_mut()) };
     }
-    copy == bytes.len()
 }

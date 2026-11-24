@@ -47,6 +47,26 @@ impl EventTarget {
     }
 }
 
+/// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if
+/// the full string fit, `false` if it was truncated or the buffer was unusable.
+///
+/// The caller passes on its own FFI contract: `buf` points to at least `len`
+/// writable bytes, or is null.
+#[cfg(any(test, target_os = "ios", target_os = "macos", target_os = "windows"))]
+pub(crate) fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
+    if buf.is_null() || len == 0 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    // Reserve one byte for the trailing NUL.
+    let copy = bytes.len().min(len - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast::<u8>(), copy);
+        *buf.add(copy) = 0;
+    }
+    copy == bytes.len()
+}
+
 /// Lock an FFI handle's stop flag, recovering it from a callback that panicked
 /// (the flag itself is always valid). Event callbacks run under this lock and
 /// skip once the flag is set, so `ezvpn_stop` (which sets it) waits out a
@@ -103,10 +123,163 @@ pub fn conn_path_json(snapshot: Option<ConnectionSnapshot>) -> String {
     serde_json::json!({ "paths": paths, "custom_relays": custom_relays }).to_string()
 }
 
+/// Test helpers for the FFI surfaces, written from the C caller's side.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::ffi::{CStr, c_char};
+
+    /// The NUL-terminated string at the start of `buf`; panics if `buf` holds no
+    /// NUL, which reads only inside the buffer (unlike `CStr::from_ptr`).
+    pub fn cstr(buf: &[c_char]) -> &str {
+        // SAFETY: `c_char` and `u8` have the same size and alignment.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len()) };
+        CStr::from_bytes_until_nul(bytes)
+            .expect("no NUL inside the buffer")
+            .to_str()
+            .expect("not UTF-8")
+    }
+
+    /// Drive one FFI surface's exported key functions through their buffer
+    /// contracts: a buffer of exactly the right size, one byte short, room for
+    /// only the NUL, none at all, and refused secrets. Each buffer is allocated
+    /// at exactly the length passed, so under Miri a write past `out_len` (or a
+    /// read past the secret's NUL) is reported as undefined behavior.
+    #[cfg(any(target_os = "ios", target_os = "macos", target_os = "windows"))]
+    pub fn check_key_exports(
+        generate: unsafe extern "C" fn(*mut c_char, usize) -> std::ffi::c_int,
+        public_key: unsafe extern "C" fn(*const c_char, *mut c_char, usize) -> std::ffi::c_int,
+    ) {
+        use std::ffi::CString;
+        const FILL: c_char = 0x55;
+
+        let mut doc = vec![FILL; 512];
+        assert_eq!(unsafe { generate(doc.as_mut_ptr(), doc.len()) }, 1);
+        let doc: serde_json::Value = serde_json::from_str(cstr(&doc)).unwrap();
+        let secret = CString::new(doc["secret_key"].as_str().unwrap()).unwrap();
+        let public = doc["public_key"].as_str().unwrap();
+
+        let mut exact = vec![FILL; public.len() + 1];
+        assert_eq!(
+            unsafe { public_key(secret.as_ptr(), exact.as_mut_ptr(), exact.len()) },
+            1
+        );
+        assert_eq!(cstr(&exact), public);
+
+        // One byte short: truncated, and the NUL still lands inside.
+        let mut short = vec![FILL; public.len()];
+        assert_eq!(
+            unsafe { public_key(secret.as_ptr(), short.as_mut_ptr(), short.len()) },
+            0
+        );
+        assert_eq!(cstr(&short), &public[..public.len() - 1]);
+
+        let mut nul_only = vec![FILL; 1];
+        assert_eq!(
+            unsafe { generate(nul_only.as_mut_ptr(), nul_only.len()) },
+            0
+        );
+        assert_eq!(nul_only[0], 0);
+        assert_eq!(unsafe { generate(std::ptr::null_mut(), 0) }, 0);
+        assert_eq!(
+            unsafe { public_key(secret.as_ptr(), std::ptr::null_mut(), 0) },
+            0
+        );
+
+        let mut err = vec![FILL; 128];
+        assert_eq!(
+            unsafe { public_key(std::ptr::null(), err.as_mut_ptr(), err.len()) },
+            0
+        );
+        assert_eq!(cstr(&err), "secret_key is null");
+        let not_utf8 = [0xffu8 as c_char, 0];
+        assert_eq!(
+            unsafe { public_key(not_utf8.as_ptr(), err.as_mut_ptr(), err.len()) },
+            0
+        );
+        assert_eq!(cstr(&err), "secret_key is not valid UTF-8");
+        assert_eq!(
+            unsafe { public_key(c"not-a-key".as_ptr(), err.as_mut_ptr(), err.len()) },
+            0
+        );
+        assert!(
+            cstr(&err).starts_with("invalid secret key"),
+            "{}",
+            cstr(&err)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::cstr;
     use super::*;
     use crate::transport::paths::{ConnPath, CustomRelayStatus};
+    use std::ffi::CStr;
+
+    // Every buffer below is allocated at exactly the length passed, so under
+    // Miri a write past it is reported rather than landing in spare capacity.
+    #[test]
+    fn write_cstr_stays_inside_the_buffer() {
+        const FILL: c_char = 0x55;
+
+        let mut exact = vec![FILL; 7];
+        assert!(write_cstr(exact.as_mut_ptr(), exact.len(), "abcdef"));
+        assert_eq!(cstr(&exact), "abcdef");
+
+        let mut short = vec![FILL; 7];
+        assert!(!write_cstr(short.as_mut_ptr(), short.len(), "abcdefg"));
+        assert_eq!(cstr(&short), "abcdef");
+
+        let mut nul_only = vec![FILL; 1];
+        assert!(!write_cstr(nul_only.as_mut_ptr(), nul_only.len(), "abc"));
+        assert_eq!(nul_only[0], 0);
+        assert!(write_cstr(nul_only.as_mut_ptr(), nul_only.len(), ""));
+
+        // Unusable buffers are left alone.
+        let mut untouched = vec![FILL; 4];
+        assert!(!write_cstr(untouched.as_mut_ptr(), 0, "abc"));
+        assert_eq!(untouched, vec![FILL; 4]);
+        assert!(!write_cstr(std::ptr::null_mut(), 8, "abc"));
+    }
+
+    type Seen = Mutex<Vec<(c_int, Option<String>)>>;
+
+    extern "C" fn record(ctx: *mut c_void, event: c_int, message: *const c_char) {
+        // SAFETY: the test below passes a `Seen` that outlives every emit.
+        let seen = unsafe { &*ctx.cast::<Seen>() };
+        let message = (!message.is_null()).then(|| {
+            unsafe { CStr::from_ptr(message) }
+                .to_str()
+                .unwrap()
+                .to_owned()
+        });
+        seen.lock().unwrap().push((event, message));
+    }
+
+    #[test]
+    fn event_target_hands_back_ctx_and_message() {
+        let seen: Seen = Mutex::new(Vec::new());
+        let target = EventTarget {
+            callback: record,
+            ctx: (&raw const seen).cast_mut().cast(),
+        };
+        target.emit(1, None);
+        target.emit(2, Some("connected"));
+        target.emit(3, Some("bad\0nul"));
+        // The run loop reports from its own thread.
+        std::thread::scope(|s| {
+            s.spawn(move || target.emit(4, Some("from worker")));
+        });
+        assert_eq!(
+            seen.into_inner().unwrap(),
+            vec![
+                (1, None),
+                (2, Some("connected".to_owned())),
+                (3, Some("(unprintable)".to_owned())),
+                (4, Some("from worker".to_owned())),
+            ]
+        );
+    }
 
     #[test]
     fn conn_path_document_shape() {

@@ -881,6 +881,68 @@ fn write_utun_frame_vectored(
     Ok(())
 }
 
+#[cfg(all(test, target_vendor = "apple"))]
+mod darwin_io_tests {
+    use super::*;
+    use std::mem::MaybeUninit;
+
+    /// A pipe in place of the utun socket, its read end non-blocking as the
+    /// utun fd is. Miri emulates `pipe`, `writev` and non-blocking `read`, so
+    /// these run the real read/write paths under it.
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rx, tx) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let flags = unsafe { libc::fcntl(rx.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(rx.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        (rx, tx)
+    }
+
+    #[test]
+    fn frame_lands_after_bytes_already_filled() {
+        let (rx, tx) = pipe();
+        let packet = [0x60, 0, 0, 0, 1, 2, 3, 4];
+        let header = darwin_packet_information(&packet).unwrap();
+        assert_eq!(header, (libc::AF_INET6 as u32).to_be_bytes());
+        write_utun_frame_vectored(tx.as_raw_fd(), &header, &packet).unwrap();
+
+        let mut storage = [MaybeUninit::<u8>::uninit(); 32];
+        let mut buf = ReadBuf::uninit(&mut storage);
+        buf.put_slice(&[0xaa, 0xbb]);
+        read_utun_frame_into(rx.as_raw_fd(), &mut buf).unwrap();
+        let expected: Vec<u8> = [&[0xaa, 0xbb][..], &header, &packet].concat();
+        assert_eq!(buf.filled(), &expected[..]);
+    }
+
+    #[test]
+    fn empty_socket_would_block_and_full_buffer_is_refused() {
+        let (rx, _tx) = pipe();
+        let mut storage = [MaybeUninit::<u8>::uninit(); 4];
+        let mut buf = ReadBuf::uninit(&mut storage);
+        let err = read_utun_frame_into(rx.as_raw_fd(), &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(buf.filled().is_empty());
+
+        buf.put_slice(&[1, 2, 3, 4]);
+        let err = read_utun_frame_into(rx.as_raw_fd(), &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn packet_information_needs_an_ip_version() {
+        assert_eq!(
+            darwin_packet_information(&[0x45]).unwrap(),
+            (libc::AF_INET as u32).to_be_bytes()
+        );
+        assert!(darwin_packet_information(&[]).is_err());
+        assert!(darwin_packet_information(&[0x50]).is_err());
+    }
+}
+
 enum TunReaderInner {
     #[cfg(not(target_vendor = "apple"))]
     Standard(DeviceReader),
@@ -1317,6 +1379,22 @@ mod macos_net {
         destination: Ipv4Addr,
         netmask: Ipv4Addr,
     ) -> io::Result<()> {
+        let req = alias_request(name, address, destination, netmask)?;
+        let socket = socket(libc::AF_INET, libc::SOCK_DGRAM)?;
+        if unsafe { libc::ioctl(socket.as_raw_fd(), SIOCAIFADDR, &req) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The `SIOCAIFADDR` request for [`set_ipv4_address`]; `name` must leave
+    /// room for its NUL in `ifra_name`.
+    fn alias_request(
+        name: &str,
+        address: Ipv4Addr,
+        destination: Ipv4Addr,
+        netmask: Ipv4Addr,
+    ) -> io::Result<libc::ifaliasreq> {
         let mut req: libc::ifaliasreq = unsafe { zeroed() };
         if name.len() >= req.ifra_name.len() {
             return Err(io::Error::new(
@@ -1330,11 +1408,7 @@ mod macos_net {
         req.ifra_addr = as_sockaddr(sockaddr_in(address));
         req.ifra_broadaddr = as_sockaddr(sockaddr_in(destination));
         req.ifra_mask = as_sockaddr(sockaddr_in(netmask));
-        let socket = socket(libc::AF_INET, libc::SOCK_DGRAM)?;
-        if unsafe { libc::ioctl(socket.as_raw_fd(), SIOCAIFADDR, &req) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        Ok(req)
     }
 
     fn as_sockaddr(sin: libc::sockaddr_in) -> libc::sockaddr {
@@ -1406,6 +1480,42 @@ mod macos_net {
         #[test]
         fn siocaifaddr_matches_sockio_h() {
             assert_eq!(SIOCAIFADDR, 0x8040_691a);
+        }
+
+        #[test]
+        fn alias_request_fills_name_and_addresses() {
+            let address = Ipv4Addr::new(10, 77, 0, 2);
+            let destination = Ipv4Addr::new(10, 77, 0, 1);
+            let netmask = Ipv4Addr::new(255, 255, 255, 0);
+            let req = alias_request("utun12", address, destination, netmask).unwrap();
+            let name: Vec<u8> = req.ifra_name.iter().map(|&c| c as u8).collect();
+            assert_eq!(&name[..7], b"utun12\0");
+            for (sa, addr) in [
+                (req.ifra_addr, address),
+                (req.ifra_broadaddr, destination),
+                (req.ifra_mask, netmask),
+            ] {
+                assert_eq!(sa.sa_len as usize, size_of::<libc::sockaddr_in>());
+                assert_eq!(sa.sa_family as i32, libc::AF_INET);
+                // sa_data holds sin_port (zero) then sin_addr.
+                let data: Vec<u8> = sa.sa_data.iter().map(|&c| c as u8).collect();
+                assert_eq!(
+                    &data[..6],
+                    &[
+                        0,
+                        0,
+                        addr.octets()[0],
+                        addr.octets()[1],
+                        addr.octets()[2],
+                        addr.octets()[3]
+                    ]
+                );
+            }
+
+            // IFNAMSIZ is 16: 15 bytes plus the NUL fit, 16 do not.
+            assert!(alias_request(&"u".repeat(15), address, destination, netmask).is_ok());
+            let err = alias_request(&"u".repeat(16), address, destination, netmask).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
 
         #[test]

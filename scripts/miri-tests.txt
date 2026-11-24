@@ -1,0 +1,12 @@
+# Test filters scripts/miri.sh and scripts/miri.ps1 run under Miri: the tests
+# that exercise ezvpn's own unsafe code without the network or the TUN device
+# (Miri cannot run tokio's reactor, the ioctls, or the routing and IP Helper
+# calls). `lib` filters the library's tests, `bin` the ezvpn binary's (Unix
+# only). A filter for a module this target does not build matches nothing.
+lib ffi_common::
+lib ffi::tests::
+lib ffi_windows::tests::
+lib net::device::darwin_io_tests::
+lib net::device::macos_net::tests::
+lib net::device::windows_routes::tests::
+bin tests::drain_
