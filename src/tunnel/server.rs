@@ -44,16 +44,46 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot};
 const WRITE_BATCH_SIZE: usize = 256;
 
 /// How many connections may be in their handshake at once: accepted, and not
-/// yet authenticated. `max_clients` counts sessions, which a connection
-/// becomes only once its key has been checked. Until then this bounds how
-/// many there are and [`HANDSHAKE_TIMEOUT`] how long each lasts; a connection
-/// arriving beyond them waits to be accepted.
+/// yet answered. `max_clients` counts sessions, which a connection becomes
+/// only once its key has been checked. Until then this bounds how many there
+/// are and [`HANDSHAKE_TIMEOUT`] how long each lasts. A connection arriving
+/// beyond them is refused, and its client connects again: left unaccepted it
+/// would wait in the QUIC stack's own queue, which is far longer and has no
+/// deadline, behind whatever was abandoned there.
 ///
-/// A connection can be made to hold about 12 MiB before it has authenticated
-/// (see [`HANDSHAKE_TIMEOUT`]), so this many hold about 770 MiB at most. A
-/// handshake takes milliseconds, so 64 at a time does not slow clients that
-/// all reconnect after a server restart.
+/// The receive buffers of a connection that has not authenticated are
+/// budgeted at about 12 MiB (see [`HANDSHAKE_TIMEOUT`]), about 770 MiB for
+/// this many. That is what the buffers count, not a ceiling on memory: a
+/// queued datagram is charged its payload and keeps the whole received batch
+/// it arrived in allocated. A handshake takes milliseconds, so 64 at a time
+/// seldom refuses a client, even when all reconnect after a server restart.
 const MAX_PENDING_HANDSHAKES: usize = 64;
+
+/// A connection's place among the [`MAX_PENDING_HANDSHAKES`] and the time its
+/// handshake has, from arriving to taking the server's reply. Dropping this
+/// gives the place up.
+struct PendingHandshake {
+    _slot: OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
+}
+
+impl PendingHandshake {
+    /// Write the handshake reply before the deadline. The peer decides how
+    /// much the stream may carry, so one that allows nothing would otherwise
+    /// hold the reply, and whatever the connection has reserved, for as long
+    /// as it liked.
+    async fn reply(&self, send: &mut SendStream, response: &VpnHandshakeResponse) -> VpnResult<()> {
+        let response = response.encode()?;
+        tokio::time::timeout_at(self.deadline, write_message(send, &response))
+            .await
+            .map_err(|_| {
+                VpnError::Signaling(format!(
+                    "Handshake reply not taken within {}s of the connection arriving",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })?
+    }
+}
 
 /// Per-client control-stream queue depth (`ServerAddrs` and `Pong` frames).
 const CONTROL_CHANNEL_SIZE: usize = 1024;
@@ -220,6 +250,36 @@ impl ClientDatagramReceiver {
     }
 }
 
+/// An address assigned to a client, and how many of its connections hold it.
+///
+/// A client that reconnects is given the address it already has, while its
+/// older connection may still be up or its new one may yet fail its
+/// handshake. Each connection that was assigned the address lets go of it
+/// once, in whatever order they end, and the address is free for another
+/// client only when none holds it.
+#[derive(Debug)]
+struct Lease<A> {
+    ip: A,
+    holders: usize,
+}
+
+impl<A: Copy> Lease<A> {
+    fn new(ip: A) -> Self {
+        Self { ip, holders: 1 }
+    }
+
+    /// End one hold on `key`'s address. Returns the address if that was the
+    /// last, having removed it from `in_use`.
+    fn release(in_use: &mut HashMap<(EndpointId, u64), Self>, key: &(EndpointId, u64)) -> Option<A> {
+        let lease = in_use.get_mut(key)?;
+        lease.holders -= 1;
+        if lease.holders > 0 {
+            return None;
+        }
+        in_use.remove(key).map(|lease| lease.ip)
+    }
+}
+
 /// Per-client context used by the data handler.
 struct ClientContext {
     assigned_ip: Option<Ipv4Addr>,
@@ -249,7 +309,7 @@ struct IpPool {
     /// Maximum IP in the range.
     max_ip: u32,
     /// IPs currently in use (mapped from (client endpoint ID, device ID)).
-    in_use: HashMap<(EndpointId, u64), Ipv4Addr>,
+    in_use: HashMap<(EndpointId, u64), Lease<Ipv4Addr>>,
     /// Released IPs available for reuse.
     released: Vec<Ipv4Addr>,
     /// Reserved IPs that should never be assigned to clients.
@@ -321,7 +381,7 @@ impl IpPool {
             return Ok(());
         }
         // O(n) scan of in_use: small in practice, avoids extra lookup map.
-        if self.in_use.values().any(|assigned| *assigned == ip) {
+        if self.in_use.values().any(|assigned| assigned.ip == ip) {
             return Err(format!("{} {} is already assigned to a client", label, ip));
         }
         self.released.retain(|released_ip| *released_ip != ip);
@@ -354,7 +414,7 @@ impl IpPool {
                 continue;
             }
             // O(n) scan of in_use: small in practice, avoids extra lookup map.
-            if self.in_use.values().any(|assigned| *assigned == ip) {
+            if self.in_use.values().any(|assigned| assigned.ip == ip) {
                 continue;
             }
             candidate = Some(ip);
@@ -379,12 +439,14 @@ impl IpPool {
         None
     }
 
-    /// Allocate an IP address for a client.
+    /// Allocate an IP address for a client. Every `Some` is one hold on the
+    /// address (see [`Lease`]) and is paired with one [`Self::release`].
     fn allocate(&mut self, endpoint_id: EndpointId, device_id: u64) -> Option<Ipv4Addr> {
         let key = (endpoint_id, device_id);
         // Check if client already has an IP
-        if let Some(&ip) = self.in_use.get(&key) {
-            return Some(ip);
+        if let Some(lease) = self.in_use.get_mut(&key) {
+            lease.holders += 1;
+            return Some(lease.ip);
         }
 
         // Try to reuse a released IP first
@@ -392,22 +454,22 @@ impl IpPool {
             if self.reserved.contains(&ip) {
                 continue;
             }
-            self.in_use.insert(key, ip);
+            self.in_use.insert(key, Lease::new(ip));
             return Some(ip);
         }
 
         // Allocate new IP if available
         if let Some(ip) = self.next_unreserved_ip() {
-            self.in_use.insert(key, ip);
+            self.in_use.insert(key, Lease::new(ip));
             Some(ip)
         } else {
             None // Pool exhausted
         }
     }
 
-    /// Release an IP address when a client disconnects.
+    /// End one hold on a client's IP address; the last one frees the address.
     fn release(&mut self, endpoint_id: &EndpointId, device_id: u64) {
-        if let Some(ip) = self.in_use.remove(&(*endpoint_id, device_id)) {
+        if let Some(ip) = Lease::release(&mut self.in_use, &(*endpoint_id, device_id)) {
             self.released.push(ip);
         }
     }
@@ -478,7 +540,7 @@ struct Ip6Pool {
     /// IPs currently in use (mapped from (client endpoint ID, device ID)).
     /// In node-id mode this exists only for duplicate detection/rejection
     /// (plus idempotent re-allocate and release).
-    in_use: HashMap<(EndpointId, u64), Ipv6Addr>,
+    in_use: HashMap<(EndpointId, u64), Lease<Ipv6Addr>>,
 }
 
 impl Ip6Pool {
@@ -570,12 +632,14 @@ impl Ip6Pool {
         self.network
     }
 
-    /// Allocate an IPv6 address for a client.
+    /// Allocate an IPv6 address for a client. Every `Some` is one hold on
+    /// the address (see [`Lease`]) and is paired with one [`Self::release`].
     fn allocate(&mut self, endpoint_id: EndpointId, device_id: u64) -> Option<Ipv6Addr> {
         let key = (endpoint_id, device_id);
         // Check if client already has an IP
-        if let Some(&ip) = self.in_use.get(&key) {
-            return Some(ip);
+        if let Some(lease) = self.in_use.get_mut(&key) {
+            lease.holders += 1;
+            return Some(lease.ip);
         }
 
         match self.alloc {
@@ -586,7 +650,7 @@ impl Ip6Pool {
             } => {
                 // Try to reuse a released IP first
                 if let Some(ip) = released.pop() {
-                    self.in_use.insert(key, ip);
+                    self.in_use.insert(key, Lease::new(ip));
                     return Some(ip);
                 }
 
@@ -594,7 +658,7 @@ impl Ip6Pool {
                 if *next_ip <= max_ip {
                     let ip = Ipv6Addr::from(*next_ip);
                     *next_ip += 1;
-                    self.in_use.insert(key, ip);
+                    self.in_use.insert(key, Lease::new(ip));
                     Some(ip)
                 } else {
                     None // Pool exhausted
@@ -608,19 +672,19 @@ impl Ip6Pool {
                 // same address; hash collisions are ~2^-64).
                 if ip == self.network.network()
                     || ip == self.server_ip
-                    || self.in_use.values().any(|&used| used == ip)
+                    || self.in_use.values().any(|used| used.ip == ip)
                 {
                     return None;
                 }
-                self.in_use.insert(key, ip);
+                self.in_use.insert(key, Lease::new(ip));
                 Some(ip)
             }
         }
     }
 
-    /// Release an IPv6 address when a client disconnects.
+    /// End one hold on a client's IPv6 address; the last one frees the address.
     fn release(&mut self, endpoint_id: &EndpointId, device_id: u64) {
-        if let Some(ip) = self.in_use.remove(&(*endpoint_id, device_id)) {
+        if let Some(ip) = Lease::release(&mut self.in_use, &(*endpoint_id, device_id)) {
             // Only sequential mode tracks released IPs for reuse; node-id mode
             // re-derives the same address on reconnect.
             if let Ip6Alloc::Sequential {
@@ -1079,16 +1143,13 @@ impl VpnServer {
 
         let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
         loop {
-            // Taken before accepting, so connections beyond the limit wait
-            // here rather than each getting a task. The semaphore lives for
-            // this loop and is never closed.
-            let handshake_slot = handshake_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("handshake semaphore is never closed");
             let Some(incoming) = endpoint.accept().await else {
                 break;
+            };
+            let Some((incoming, pending)) =
+                admit_handshake(incoming, &handshake_slots, HANDSHAKE_TIMEOUT)
+            else {
+                continue;
             };
             let server = self.clone();
             let tun_write_tx = tun_write_tx.clone();
@@ -1098,7 +1159,7 @@ impl VpnServer {
                 if let Err(e) = server
                     .handle_connection(
                         incoming,
-                        handshake_slot,
+                        pending,
                         tun_write_tx,
                         local_iroh_udp_ports,
                         endpoint,
@@ -1153,18 +1214,18 @@ impl VpnServer {
         true
     }
 
-    /// Handle an incoming VPN connection. `handshake_slot` is its place among
-    /// the [`MAX_PENDING_HANDSHAKES`], given up once it has authenticated.
+    /// Handle an incoming VPN connection. `pending` is held until the
+    /// handshake has been answered, one way or the other.
     async fn handle_connection(
         &self,
         incoming: Incoming,
-        handshake_slot: OwnedSemaphorePermit,
+        pending: PendingHandshake,
         tun_write_tx: mpsc::Sender<TunWriteRequest>,
         local_iroh_udp_ports: Arc<HashSet<u16>>,
         endpoint: Endpoint,
     ) -> VpnResult<()> {
         let (connection, mut send, recv, handshake) =
-            receive_handshake(incoming, HANDSHAKE_TIMEOUT).await?;
+            receive_handshake(incoming, pending.deadline).await?;
         let remote_id = connection.remote_id();
 
         log::debug!(
@@ -1176,14 +1237,9 @@ impl VpnServer {
         // Verify the client's public-key credential. Failures are logged with
         // the specific reason; the wire rejection stays generic.
         if !self.verify_client_auth(&handshake.auth, &remote_id) {
-            // Bounded like the handshake: this peer decides how much the
-            // stream may carry, and one that allows nothing would hold the
-            // reply, and its handshake slot, for as long as it liked.
-            let response = VpnHandshakeResponse::rejected("Public-key authentication failed").encode()?;
-            if let Ok(written) =
-                tokio::time::timeout(HANDSHAKE_TIMEOUT, write_message(&mut send, &response)).await
-            {
-                written?;
+            let response = VpnHandshakeResponse::rejected("Public-key authentication failed");
+            if let Err(e) = pending.reply(&mut send, &response).await {
+                log::debug!("Client {remote_id} was not told of its rejection: {e}");
             }
             let _ = send.finish();
             return Err(VpnError::Signaling(
@@ -1191,7 +1247,6 @@ impl VpnServer {
             ));
         }
         log::debug!("Client {} authenticated", remote_id);
-        drop(handshake_slot);
 
         // Monitor and report connection path changes (e.g., relay -> direct)
         let _path_watcher =
@@ -1204,7 +1259,7 @@ impl VpnServer {
             // We exceeded the limit - decrement and reject
             self.active_connections.fetch_sub(1, Ordering::SeqCst);
             let response = VpnHandshakeResponse::rejected("Server full");
-            write_message(&mut send, &response.encode()?).await?;
+            pending.reply(&mut send, &response).await?;
             let _ = send.finish();
             return Err(VpnError::IpAssignment("Server full".into()));
         }
@@ -1212,6 +1267,7 @@ impl VpnServer {
         // From this point on, we must decrement active_connections on any error
         let result = self
             .handle_connection_inner(
+                pending,
                 send,
                 recv,
                 remote_id,
@@ -1233,10 +1289,11 @@ impl VpnServer {
     ///
     /// `send`/`recv` are the handshake bi-stream halves; after the handshake
     /// response is written they are the control stream (heartbeats and
-    /// server-address publications).
+    /// server-address publications). `pending` ends with that response.
     #[allow(clippy::too_many_arguments)]
     async fn handle_connection_inner(
         &self,
+        pending: PendingHandshake,
         mut send: SendStream,
         recv: RecvStream,
         remote_id: EndpointId,
@@ -1351,8 +1408,15 @@ impl VpnServer {
             self.config.network6,
         ));
 
-        // The stream stays open past the response, as the control stream.
-        write_message(&mut send, &response.encode()?).await?;
+        // The stream stays open past the response, as the control stream. A
+        // client that does not take the response never becomes a session, so
+        // what was assigned to it goes back to the pools here.
+        if let Err(e) = pending.reply(&mut send, &response).await {
+            self.release_addresses(remote_id, device_id, assigned_ip.is_some(), assigned_ip6.is_some())
+                .await;
+            return Err(e);
+        }
+        drop(pending);
 
         // Log connection based on what was assigned
         match (assigned_ip, assigned_ip6) {
@@ -1526,8 +1590,6 @@ impl VpnServer {
 
         // Handle client data
         let clients = self.clients.clone();
-        let ip_pool = self.ip_pool.clone();
-        let ip6_pool = self.ip6_pool.clone();
         let ip_to_endpoint = self.ip_to_endpoint.clone();
         let ip6_to_endpoint = self.ip6_to_endpoint.clone();
 
@@ -1567,44 +1629,38 @@ impl VpnServer {
         // DashMap remove_if atomically checks and removes if the predicate holds.
         let removed = clients.remove_if(&client_key, |_, state| state.session_id == session_id);
 
-        let (endpoint_to_release, release_ipv4, release_ipv6) =
-            if let Some((_, client_state)) = removed {
-                // Remove IPv4 mapping if it points to us
-                if let Some(ip4) = assigned_ip {
-                    ip_to_endpoint
-                        .remove_if(&ip4, |_, (ep, dev)| *ep == remote_id && *dev == device_id);
-                }
-
-                // Remove IPv6 mapping if it points to us
-                if let Some(ip6) = assigned_ip6 {
-                    ip6_to_endpoint.remove_if(&ip6, |_, (ep6, dev6)| {
-                        *ep6 == remote_id && *dev6 == device_id
-                    });
-                }
-
-                (
-                    Some((remote_id, device_id)),
-                    client_state.assigned_ip.is_some(),
-                    client_state.assigned_ip6.is_some(),
-                )
-            } else {
-                // Session_id didn't match or client already gone - do nothing
-                (None, false, false)
-            };
-
-        if let Some((endpoint_id, dev_id)) = endpoint_to_release {
-            // Release IPv4 if allocated for this session
-            if release_ipv4 && let Some(ref ip_pool) = ip_pool {
-                ip_pool.write().await.release(&endpoint_id, dev_id);
+        if removed.is_some() {
+            // Remove IPv4 mapping if it points to us
+            if let Some(ip4) = assigned_ip {
+                ip_to_endpoint.remove_if(&ip4, |_, (ep, dev)| *ep == remote_id && *dev == device_id);
             }
 
-            // Release IPv6 if allocated for this session
-            if release_ipv6 && let Some(ref ip6_pool) = ip6_pool {
-                ip6_pool.write().await.release(&endpoint_id, dev_id);
+            // Remove IPv6 mapping if it points to us
+            if let Some(ip6) = assigned_ip6 {
+                ip6_to_endpoint
+                    .remove_if(&ip6, |_, (ep6, dev6)| *ep6 == remote_id && *dev6 == device_id);
             }
         }
 
+        // Each connection holds the addresses its own handshake was assigned,
+        // so this one's hold ends here even when a newer connection of the
+        // client has taken the session over: the addresses stay assigned
+        // until the last holder lets go.
+        self.release_addresses(remote_id, device_id, assigned_ip.is_some(), assigned_ip6.is_some())
+            .await;
+
         result
+    }
+
+    /// End one connection's hold on the addresses its handshake was assigned
+    /// (`v4`, `v6`: which families it was assigned one in).
+    async fn release_addresses(&self, endpoint_id: EndpointId, device_id: u64, v4: bool, v6: bool) {
+        if v4 && let Some(ref ip_pool) = self.ip_pool {
+            ip_pool.write().await.release(&endpoint_id, device_id);
+        }
+        if v6 && let Some(ref ip6_pool) = self.ip6_pool {
+            ip6_pool.write().await.release(&endpoint_id, device_id);
+        }
     }
 
     /// Enqueue a TUN write request to be processed by the dedicated TUN writer task.
@@ -2217,15 +2273,35 @@ async fn publish_server_addrs(
     }
 }
 
+/// Give a connection that has just arrived a place among the pending
+/// handshakes, with `limit` to finish in, or refuse it if every place is
+/// taken. Accepting goes on either way: see [`MAX_PENDING_HANDSHAKES`].
+fn admit_handshake(
+    incoming: Incoming,
+    slots: &Arc<Semaphore>,
+    limit: Duration,
+) -> Option<(Incoming, PendingHandshake)> {
+    let Ok(slot) = slots.clone().try_acquire_owned() else {
+        log::debug!("Refusing a connection: every handshake place is taken");
+        incoming.refuse();
+        return None;
+    };
+    let pending = PendingHandshake {
+        _slot: slot,
+        deadline: tokio::time::Instant::now() + limit,
+    };
+    Some((incoming, pending))
+}
+
 /// Take a new connection as far as its client's handshake message: the QUIC
 /// handshake, the stream the client opens (which stays open as the control
-/// stream), and the message on it, all within `limit`. Running out of time
+/// stream), and the message on it, all before `deadline`. Running out of time
 /// drops the connection, which closes it.
 async fn receive_handshake(
     incoming: Incoming,
-    limit: Duration,
+    deadline: tokio::time::Instant,
 ) -> VpnResult<(Connection, SendStream, RecvStream, VpnHandshake)> {
-    tokio::time::timeout(limit, async {
+    tokio::time::timeout_at(deadline, async {
         let connection = incoming
             .await
             .map_err(|e| VpnError::Signaling(format!("Failed to accept connection: {}", e)))?;
@@ -2242,8 +2318,8 @@ async fn receive_handshake(
     .await
     .map_err(|_| {
         VpnError::Signaling(format!(
-            "No handshake within {}s of a connection arriving",
-            limit.as_secs()
+            "No handshake within {}s of the connection arriving",
+            HANDSHAKE_TIMEOUT.as_secs()
         ))
     })?
 }
@@ -2428,15 +2504,25 @@ mod tests {
         assert_eq!(ip1, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(ip2, Ipv4Addr::new(10, 0, 0, 3));
 
-        // Re-allocate same client should return same IP
+        // Re-allocate same client should return same IP, as a second hold
         let ip1_again = pool.allocate(id1, 1).unwrap();
         assert_eq!(ip1, ip1_again);
 
-        // Release and reallocate
+        // One of the two holds released: the address is still the client's
         pool.release(&id1, 1);
         let id3 = random_endpoint_id();
         let ip3 = pool.allocate(id3, 1).unwrap();
-        assert_eq!(ip3, ip1); // Should reuse released IP
+        assert_ne!(ip3, ip1);
+
+        // The last hold released: the address goes to the next client
+        pool.release(&id1, 1);
+        let id4 = random_endpoint_id();
+        let ip4 = pool.allocate(id4, 1).unwrap();
+        assert_eq!(ip4, ip1); // Should reuse released IP
+
+        // Releasing with no hold left changes nothing
+        pool.release(&id1, 1);
+        assert_eq!(pool.allocate(id4, 1).unwrap(), ip1);
     }
 
     #[test]
@@ -2675,15 +2761,25 @@ mod tests {
         assert_eq!(ip1, "fd00::2".parse::<Ipv6Addr>().unwrap());
         assert_eq!(ip2, "fd00::3".parse::<Ipv6Addr>().unwrap());
 
-        // Re-allocate same client should return same IP
+        // Re-allocate same client should return same IP, as a second hold
         let ip1_again = pool.allocate(id1, 1).unwrap();
         assert_eq!(ip1, ip1_again);
 
-        // Release and reallocate
+        // One of the two holds released: the address is still the client's
         pool.release(&id1, 1);
         let id3 = random_endpoint_id();
         let ip3 = pool.allocate(id3, 1).unwrap();
-        assert_eq!(ip3, ip1); // Should reuse released IP
+        assert_ne!(ip3, ip1);
+
+        // The last hold released: the address goes to the next client
+        pool.release(&id1, 1);
+        let id4 = random_endpoint_id();
+        let ip4 = pool.allocate(id4, 1).unwrap();
+        assert_eq!(ip4, ip1); // Should reuse released IP
+
+        // Releasing with no hold left changes nothing
+        pool.release(&id1, 1);
+        assert_eq!(pool.allocate(id4, 1).unwrap(), ip1);
     }
 
     #[test]
@@ -3278,7 +3374,7 @@ mod tests {
             let acceptor = server.clone();
             let received = tokio::spawn(async move {
                 let incoming = acceptor.accept().await.expect("incoming connection");
-                receive_handshake(incoming, LIMIT).await.map(|_| ())
+                receive_handshake(incoming, tokio::time::Instant::now() + LIMIT).await.map(|_| ())
             });
 
             let conn = client
@@ -3310,5 +3406,126 @@ mod tests {
             client.close().await;
             server.close().await;
         }
+    }
+
+    /// A connection arriving while every handshake place is taken is refused
+    /// at once, and the server goes on accepting: the next one gets the place
+    /// that has come free.
+    #[tokio::test]
+    async fn test_connection_beyond_the_pending_handshakes_is_refused() {
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+        let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+        let slots = Arc::new(Semaphore::new(1));
+        // The first takes the only place. Its client's connect has not
+        // finished: the server has yet to answer it.
+        let accepting = server.clone();
+        let first_slots = slots.clone();
+        let first = tokio::spawn(async move {
+            let incoming = accepting.accept().await.expect("incoming");
+            let (incoming, pending) =
+                admit_handshake(incoming, &first_slots, PATIENCE).expect("a free place");
+            (incoming.await.expect("accept"), pending)
+        });
+        let first_conn = client
+            .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+            .await
+            .expect("first connect");
+        let (_held_conn, pending) = first.await.expect("server task");
+
+        // The second finds none, and is told so rather than left waiting.
+        let connecting = tokio::spawn({
+            let client = client.clone();
+            let addr = server.addr();
+            async move { client.connect(addr, crate::tunnel::signaling::VPN_ALPN).await }
+        });
+        let incoming = server.accept().await.expect("incoming");
+        assert!(
+            admit_handshake(incoming, &slots, PATIENCE).is_none(),
+            "admitted beyond the limit"
+        );
+        let refused = tokio::time::timeout(PATIENCE, connecting)
+            .await
+            .expect("a refused connect was left waiting")
+            .expect("client task");
+        assert!(refused.is_err(), "connected although refused");
+
+        // The place comes back with the first handshake, and is given again.
+        drop(pending);
+        let third = tokio::spawn({
+            let accepting = server.clone();
+            let slots = slots.clone();
+            async move {
+                let incoming = accepting.accept().await.expect("incoming");
+                let (incoming, pending) =
+                    admit_handshake(incoming, &slots, PATIENCE).expect("the freed place");
+                (incoming.await.expect("accept"), pending)
+            }
+        });
+        client
+            .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+            .await
+            .expect("connect once a place is free");
+        third.await.expect("server task");
+
+        drop(first_conn);
+        client.close().await;
+        server.close().await;
+    }
+
+    /// The reply to a handshake is under the handshake's deadline: a client
+    /// that lets nothing through on the stream does not hold the reply, or
+    /// its place among the pending handshakes, past it.
+    #[tokio::test]
+    async fn test_handshake_reply_gives_up_on_a_client_that_takes_nothing() {
+        const LIMIT: Duration = Duration::from_millis(300);
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+        // A client whose streams may carry nothing towards it.
+        let client = Endpoint::builder(iroh::endpoint::presets::Empty)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .stream_receive_window(0u32.into())
+                    .build(),
+            )
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+
+        let accepting = server.clone();
+        let server_slots = slots.clone();
+        let replied = tokio::spawn(async move {
+            let incoming = accepting.accept().await.expect("incoming");
+            let (incoming, pending) =
+                admit_handshake(incoming, &server_slots, LIMIT).expect("a free place");
+            let connection = incoming.await.expect("accept");
+            let (mut send, _recv) = connection.accept_bi().await.expect("accept_bi");
+            let response = VpnHandshakeResponse::rejected("x".repeat(64));
+            pending.reply(&mut send, &response).await
+        });
+
+        let conn = client
+            .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+            .await
+            .expect("connect to server");
+        let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+        send.write_all(&[0]).await.expect("open the stream");
+
+        let result = tokio::time::timeout(PATIENCE, replied)
+            .await
+            .expect("the reply was never given up on")
+            .expect("server task");
+        assert!(
+            matches!(result, Err(VpnError::Signaling(ref m)) if m.contains("Handshake reply not taken")),
+            "{result:?}"
+        );
+        assert_eq!(slots.available_permits(), 1, "the place was not given back");
+        client.close().await;
+        server.close().await;
     }
 }

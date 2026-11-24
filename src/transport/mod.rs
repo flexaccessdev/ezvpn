@@ -72,15 +72,15 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the handshake may take once a connection exists: for the server,
-/// from a connection arriving to its client's handshake message; for the
+/// from a connection arriving to its client having taken the reply; for the
 /// client, from opening the control stream to the server's answer.
 ///
 /// Neither wait ends by itself. Keep-alives hold a connection open for as long
 /// as the peer acknowledges them, so a peer that connects and then says
-/// nothing would otherwise stay connected for good. On the server that is a
-/// peer that has not authenticated, holding whatever it has sent (up to
-/// [`QUIC_WINDOW_SIZE`] of stream data and
-/// [`QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE`] of datagrams). On the client it
+/// nothing, or lets no reply through, would otherwise stay connected for
+/// good. On the server that is a peer that has not authenticated, holding
+/// whatever it has sent: the buffers allow it [`QUIC_WINDOW_SIZE`] of stream
+/// data and [`QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE`] of datagrams. On the client it
 /// stalls the reconnect loop, as a connect with no deadline would (see
 /// `CONNECT_TIMEOUT` in [`endpoint`]). A healthy handshake is one small
 /// message each way.

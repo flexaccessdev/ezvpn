@@ -635,14 +635,29 @@ connection count is incremented and before any IP is allocated.
 
 `max_clients` therefore counts authenticated sessions only, and a connection
 that has not authenticated is bounded separately. It has `HANDSHAKE_TIMEOUT`
-(10 s, `src/transport/mod.rs`) from arriving to deliver its handshake message,
-after which the server drops it, and at most `MAX_PENDING_HANDSHAKES` (64,
-`src/tunnel/server.rs`) connections are in that state at once; one arriving
-beyond them waits to be accepted. Without the deadline such a connection would
-last as long as it acknowledged the server's keep-alives, holding what it had
-sent: up to 8 MiB of stream data and 4 MiB of datagrams, so the 64 hold about
-770 MiB at most. The client bounds its side of the handshake with the same
-timeout and treats running out as a recoverable error, so a server that
+(10 s, `src/transport/mod.rs`) from arriving to deliver its handshake message
+and take the reply, one deadline for the whole exchange, after which the
+server drops it. At most `MAX_PENDING_HANDSHAKES` (64, `src/tunnel/server.rs`)
+connections are in that state at once, and one arriving beyond them is refused
+at once, for its client to retry: the server keeps accepting while every place
+is taken, because a connection it left unaccepted would wait in the QUIC
+stack's own queue (65,536 attempts, with no deadline) behind whatever had been
+abandoned there. Without the deadline a connection would last as long as it
+acknowledged the server's keep-alives, holding what it had sent. The receive
+buffers allow each 8 MiB of stream data and 4 MiB of datagrams, about 770 MiB
+for the 64. That is the buffers' own count and an estimate of the memory, not
+a ceiling on it: a queued datagram is charged its payload, and keeps the whole
+received batch it arrived in allocated.
+
+A reply that fails or runs out of time ends the connection before it becomes
+a session, and the addresses assigned for it go back to the pools. The pools
+count holders for this (`Lease`): a reconnecting client is given the address
+it already has, so its older connection and a newer handshake can hold one
+address at once, and it is free for another client only when the last of them
+has let go.
+
+The client bounds its side of the handshake with the same timeout and treats
+running out, or being refused, as a recoverable error, so a server that
 accepts a connection and never answers is retried rather than waited on.
 
 ### Client Isolation
