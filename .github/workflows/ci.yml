@@ -59,3 +59,27 @@ jobs:
       - name: Build ezvpn.dll + header (debug)
         shell: pwsh
         run: ./build-windows.ps1 -Profile debug
+
+  # The tests in scripts/miri-tests.txt under Miri: ezvpn's own unsafe code,
+  # off the network and the TUN device. Each OS compiles different unsafe
+  # (src/ffi.rs and the utun I/O on macOS, src/ffi_windows.rs and the IP Helper
+  # rows on Windows), so it runs on all three. The scripts install the pinned
+  # nightly themselves.
+  miri:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+      - name: Miri
+        if: runner.os != 'Windows'
+        run: scripts/miri.sh
+      - name: Miri
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/miri.ps1
