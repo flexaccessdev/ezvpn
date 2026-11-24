@@ -70,14 +70,19 @@ Key source in this repo:
 The app drives the tunnel with these calls (full signatures and JSON shapes in
 [`windows/ezvpn.h`](../windows/ezvpn.h)):
 
-1. `ezvpn_start(config_json, out_buf, out_len)` — parse the config, create an
-   iroh endpoint and a `VpnClient`, and spawn its reconnecting run loop on a
-   background thread. Returns an opaque handle once *started* (not yet
-   *connected*).
+1. `ezvpn_start(config_json, on_event, ctx, out_buf, out_len)` — parse the
+   config, create an iroh endpoint and a `VpnClient`, and spawn its
+   reconnecting run loop on a background thread. Returns an opaque handle once
+   *started* (not yet *connected*). `on_event` reports each state change as it
+   happens: `CONNECTED`, `RECONNECTING` (with the error), and the final
+   `ENDED` (with the reason) once the run loop stops trying — retries used up,
+   a non-recoverable error, or a lost session with auto-reconnect off.
 2. `ezvpn_status(handle, out_buf, out_len)` — snapshot the live client status
-   (state, assigned IPs, gateway, routes, bypass addresses) as JSON. Cheap
-   enough to poll for the `"connected"` state: it leaves out the connection
-   path and custom-relay health.
+   (state, assigned IPs, gateway, routes, bypass addresses, retry progress) as
+   JSON, for the live details the events don't carry (uptime, the next
+   retry's countdown). Cheap enough to poll: it leaves out the connection
+   path and custom-relay health. After `ENDED` its `state` is `"stopped"`
+   with the same reason in `stop_reason`.
 3. `ezvpn_conn_path(handle, out_buf, out_len)` — on demand (the app's
    "Connection path…" button, as on Apple): every iroh path with
    the selected one marked, plus each custom relay's `/healthz` result. Same
@@ -88,7 +93,8 @@ The app drives the tunnel with these calls (full signatures and JSON shapes in
 
 ```
 Ezvpn.App (WinUI 3, elevated)
-  create/edit profiles ──▶ ezvpn_start(json) ──▶ ezvpn.dll
+  create/edit profiles ──▶ ezvpn_start(json, on_event) ──▶ ezvpn.dll
+  state changes       ◀── on_event(CONNECTED | RECONNECTING | ENDED)
   poll status         ──▶ ezvpn_status()          (iroh connect + handshake
   "Connection path…"  ──▶ ezvpn_conn_path()         + wintun + routes + reconnect)
   disconnect          ──▶ ezvpn_stop()

@@ -69,9 +69,13 @@ pub enum VpnError {
     #[error("Connection lost: {0}")]
     ConnectionLost(String),
 
-    /// Maximum reconnection attempts exceeded.
-    #[error("Max reconnection attempts ({0}) exceeded")]
-    MaxReconnectAttemptsExceeded(NonZeroU32),
+    /// The reconnect loop used up its retries; `last_error` is what the final
+    /// attempt failed with.
+    #[error("Gave up after {attempts} reconnect attempt(s): {last_error}")]
+    MaxReconnectAttemptsExceeded {
+        attempts: NonZeroU32,
+        last_error: String,
+    },
 
     /// Server's VPN network configuration changed across a reconnect.
     #[error("Server VPN configuration changed: {0}")]

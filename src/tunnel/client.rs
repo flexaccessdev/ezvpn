@@ -1447,8 +1447,12 @@ impl VpnClient {
                     if let Some(max) = max_attempts
                         && failures > max.get()
                     {
-                        log::error!("Giving up after {max} reconnect attempt(s): {e}");
-                        return Err(VpnError::MaxReconnectAttemptsExceeded(max));
+                        let err = VpnError::MaxReconnectAttemptsExceeded {
+                            attempts: max,
+                            last_error: e.to_string(),
+                        };
+                        log::error!("{err}");
+                        return Err(err);
                     }
 
                     let delay = calculate_backoff(failures);

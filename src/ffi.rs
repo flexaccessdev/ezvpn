@@ -65,7 +65,7 @@
 //! }
 //! ```
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -74,6 +74,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::Deserialize;
 
 use crate::error::{VpnError, VpnResult};
+use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison};
 use crate::transport::endpoint::RelayConfig;
 use crate::transport::paths::connection_snapshot;
 use crate::tunnel::mobile::{MobileConfig, MobileSession, SessionEvent, SessionEvents};
@@ -566,38 +567,6 @@ pub const EZVPN_EVENT_ENDED: c_int = 3;
 /// afresh. `message` describes the change.
 pub const EZVPN_EVENT_RECONFIGURE: c_int = 4;
 
-/// C event callback for [`ezvpn_run`]: `ctx` is the caller's pointer, passed
-/// back verbatim; `event` is one of the `EZVPN_EVENT_*` codes; `message` is
-/// NUL-terminated and valid only for the duration of the call, or null.
-pub type EzvpnEventCallback = extern "C" fn(ctx: *mut c_void, event: c_int, message: *const c_char);
-
-/// The caller's callback and opaque `ctx`, moved onto the runtime threads
-/// that report events. The caller guarantees `ctx` stays valid until
-/// [`ezvpn_stop`].
-#[derive(Clone, Copy)]
-struct EventTarget {
-    callback: EzvpnEventCallback,
-    ctx: *mut c_void,
-}
-// SAFETY: the pointer is never dereferenced here, only handed back to the
-// caller's callback, whose contract covers calls from any thread.
-unsafe impl Send for EventTarget {}
-unsafe impl Sync for EventTarget {}
-
-impl EventTarget {
-    fn emit(self, event: c_int, message: Option<&str>) {
-        match message {
-            None => (self.callback)(self.ctx, event, ptr::null()),
-            Some(m) => {
-                // Our messages carry no interior NUL; fall back rather than drop
-                // the event if one ever does.
-                let msg = CString::new(m).unwrap_or_else(|_| CString::from(c"(unprintable)"));
-                (self.callback)(self.ctx, event, msg.as_ptr());
-            }
-        }
-    }
-}
-
 /// Start the tunnel data loop on `tun_fd` (the extension's `utun` fd).
 ///
 /// Spawns the loop on the embedded runtime and returns immediately: `0` on
@@ -675,14 +644,6 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
         return;
     }
     unsafe { Box::from_raw(handle) }.stop();
-}
-
-/// Lock the stop flag, recovering it from a callback that panicked (the flag
-/// itself is always valid).
-fn lock_ignoring_poison(stopped: &Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
-    stopped
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if

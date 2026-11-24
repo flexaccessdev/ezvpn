@@ -1,5 +1,5 @@
-//! Key and connection-path helpers shared by the platform FFI surfaces ([`crate::ffi`] for Apple,
-//! [`crate::ffi_windows`] for Windows).
+//! Key, connection-path and event-callback helpers shared by the platform FFI
+//! surfaces ([`crate::ffi`] for Apple, [`crate::ffi_windows`] for Windows).
 //!
 //! Both GUI apps generate and inspect client keys themselves (they have no
 //! `flexaccess-keys` CLI to hand the user), and the two FFI modules compile for
@@ -9,8 +9,53 @@
 //! Errors are returned as ready-to-write messages: every caller does nothing
 //! with them but copy them into the caller's output buffer.
 
+use std::ffi::{CString, c_char, c_int, c_void};
+use std::sync::Mutex;
+
 use crate::auth::ClientKey;
 use crate::transport::paths::{ConnPathKind, ConnectionSnapshot};
+
+/// C event callback both FFI surfaces take (`ezvpn_run` on Apple,
+/// `ezvpn_start` on Windows): `ctx` is the caller's pointer, passed back
+/// verbatim; `event` is one of that surface's `EZVPN_EVENT_*` codes; `message`
+/// is NUL-terminated and valid only for the duration of the call, or null.
+pub type EzvpnEventCallback = extern "C" fn(ctx: *mut c_void, event: c_int, message: *const c_char);
+
+/// The caller's callback and opaque `ctx`, moved onto the threads that report
+/// events. The caller guarantees `ctx` stays valid until its `ezvpn_stop`.
+#[derive(Clone, Copy)]
+pub struct EventTarget {
+    pub callback: EzvpnEventCallback,
+    pub ctx: *mut c_void,
+}
+// SAFETY: the pointer is never dereferenced here, only handed back to the
+// caller's callback, whose contract covers calls from any thread.
+unsafe impl Send for EventTarget {}
+unsafe impl Sync for EventTarget {}
+
+impl EventTarget {
+    pub fn emit(self, event: c_int, message: Option<&str>) {
+        match message {
+            None => (self.callback)(self.ctx, event, std::ptr::null()),
+            Some(m) => {
+                // Our messages carry no interior NUL; fall back rather than drop
+                // the event if one ever does.
+                let msg = CString::new(m).unwrap_or_else(|_| CString::from(c"(unprintable)"));
+                (self.callback)(self.ctx, event, msg.as_ptr());
+            }
+        }
+    }
+}
+
+/// Lock an FFI handle's stop flag, recovering it from a callback that panicked
+/// (the flag itself is always valid). Event callbacks run under this lock and
+/// skip once the flag is set, so `ezvpn_stop` (which sets it) waits out a
+/// callback in flight and none runs after it.
+pub fn lock_ignoring_poison(stopped: &Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
+    stopped
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Generate a fresh client keypair and render the key document both FFI
 /// surfaces hand back:

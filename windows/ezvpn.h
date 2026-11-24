@@ -14,10 +14,11 @@
  * Lifecycle:
  *
  *   1. ezvpn_init_logging()                       (optional; once at startup)
- *   2. ezvpn_start(configJson, buf, len) -> handle (or NULL on setup error;
- *        on error `buf` holds the error message). Returns once the client has
- *        STARTED, not once it has CONNECTED — poll ezvpn_status for that.
- *   3. ezvpn_status(handle, buf, len)             (poll for the status JSON)
+ *   2. ezvpn_start(configJson, on_event, ctx, buf, len) -> handle (or NULL on
+ *        setup error; on error `buf` holds the error message). Returns once the
+ *        client has STARTED, not once it has CONNECTED; on_event reports
+ *        CONNECTED, RECONNECTING and the final ENDED as they happen.
+ *   3. ezvpn_status(handle, buf, len)             (poll for live details)
  *      ezvpn_conn_path(handle, buf, len)          (on demand: paths + relay health)
  *   4. ezvpn_stop(handle)                          (stops the tunnel, waits for
  *        route/adapter teardown, frees the handle)
@@ -36,6 +37,32 @@ extern "C" {
 
 /* Opaque session handle. Created by ezvpn_start, freed by ezvpn_stop. */
 typedef struct EzvpnHandle EzvpnHandle;
+
+/*
+ * ezvpn_start event codes, passed to the on_event callback.
+ *
+ * RECONNECTING : a connection attempt failed, or the session was lost, and the
+ *                run loop will try again; message is the error. Poll
+ *                ezvpn_status for the attempt count and the next try's countdown.
+ * CONNECTED    : the tunnel is up (first connection or a reconnect); message
+ *                is NULL.
+ * ENDED        : final. The run loop has ended and will not try again —
+ *                retries used up ("Gave up after N reconnect attempt(s): ..."),
+ *                a non-recoverable error (e.g. rejected authentication), or a
+ *                lost session with auto_reconnect off. message is the reason, or
+ *                NULL for an end without an error. The tunnel is already torn
+ *                down; the handle must still be passed to ezvpn_stop.
+ */
+#define EZVPN_EVENT_RECONNECTING 1
+#define EZVPN_EVENT_CONNECTED    2
+#define EZVPN_EVENT_ENDED        3
+
+/*
+ * Event callback for ezvpn_start. ctx is the caller's pointer, passed back
+ * verbatim; event is an EZVPN_EVENT_* code; message is NUL-terminated and valid
+ * only for the duration of the call, or NULL. Called from library threads.
+ */
+typedef void (*ezvpn_event_cb)(void *ctx, int event, const char *message);
 
 /*
  * Initialize logging (stderr). Honors RUST_LOG, defaults to
@@ -96,17 +123,24 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
  *   the tunnel off another VPN; it moves to another direct path or the relay.
  *   A preference, not a block: with no allowed path at all, the current one
  *   is kept.
+ * on_event/ctx : optional (on_event may be NULL) state-change callback, see
+ *   EZVPN_EVENT_*. No event is delivered once ezvpn_stop has been called: it
+ *   waits for a callback already in progress, so the callback must not call
+ *   ezvpn_stop itself nor block on a thread that might — post the event to the
+ *   UI thread asynchronously. ctx must stay valid until ezvpn_stop.
  * out_buf/out_len : caller buffer. On failure receives the error message
  *   (always NUL-terminated; may be truncated to fit). Untouched contents on
  *   success are irrelevant — read status via ezvpn_status.
  *
  * Returns a non-NULL handle once setup (iroh endpoint online + single-instance
  * lock acquired) succeeds; the tunnel then runs in the background until
- * ezvpn_stop. Returns NULL on a setup failure (bad config, offline endpoint, or
- * another instance already running). A non-NULL return means STARTED, not
- * CONNECTED — poll ezvpn_status until state == "connected".
+ * ezvpn_stop, or until the run loop ends on its own (ENDED). Returns NULL on a
+ * setup failure (bad config, offline endpoint, or another instance already
+ * running). A non-NULL return means STARTED, not CONNECTED — wait for the
+ * CONNECTED event (or state == "connected" in ezvpn_status).
  */
-EzvpnHandle *ezvpn_start(const char *config_json, char *out_buf, size_t out_len);
+EzvpnHandle *ezvpn_start(const char *config_json, ezvpn_event_cb on_event, void *ctx,
+                         char *out_buf, size_t out_len);
 
 /*
  * Snapshot the live client status as JSON into out_buf. This is the serialized
@@ -115,11 +149,13 @@ EzvpnHandle *ezvpn_start(const char *config_json, char *out_buf, size_t out_len)
  *    "server_node_id":"<id>","device_id":"...","connected_since_secs":42,
  *    "mode":"dual-stack","assigned_ip":"10.0.0.2","network":"10.0.0.1/32",
  *    "gateway":"10.0.0.1","assigned_ip6":"fd00::2","network6":"fd00::1/128",
- *    "gateway6":"fd00::1","mtu":1280,"gso_negotiated":false,
+ *    "gateway6":"fd00::1","mtu":1280,
  *    "routes":["10.0.0.1/32"],"routes6":["fd00::1/128"],
  *    "connection":null,"custom_relays":[],"bypass_addrs":[]}
- * `state` is "disconnected" while connecting/reconnecting and "connected" once
- * the handshake succeeds. Per-family fields are null when unassigned. While
+ * `state` is "disconnected" while connecting/reconnecting, "connected" once
+ * the handshake succeeds, and "stopped" once the run loop has ended for good,
+ * with stop_reason the same text as the ENDED event (null otherwise, or for an
+ * end without an error). Per-family fields are null when unassigned. While
  * down, failed_attempts (consecutive failures in the current outage),
  * last_error, and next_attempt_secs (seconds until the reconnect loop tries
  * again; 0 while an attempt is in progress, null when none is pending) say how

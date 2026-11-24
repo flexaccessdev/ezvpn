@@ -139,7 +139,8 @@ pub struct ServerStatsView {
 pub struct ClientStatus {
     /// Instance name this client runs under.
     pub instance: String,
-    /// `"connected"` or `"disconnected"`.
+    /// `"connected"`; `"disconnected"` while connecting or reconnecting; or
+    /// `"stopped"` once the run loop has ended for good (see `stop_reason`).
     pub state: String,
     /// Configured server node id.
     pub server_node_id: String,
@@ -155,6 +156,10 @@ pub struct ClientStatus {
     pub next_attempt_secs: Option<u64>,
     /// What the last connection attempt failed with, while the tunnel is down.
     pub last_error: Option<String>,
+    /// Why the run loop ended, once `state` is `"stopped"`: retries used up, a
+    /// non-recoverable error, or a lost session with auto-reconnect off.
+    /// `None` while running, or for a loop that ended without an error.
+    pub stop_reason: Option<String>,
     /// `"ipv4"`, `"ipv6"`, `"dual-stack"`, or `"none"` while disconnected.
     pub mode: String,
     /// Assigned IPv4 VPN address.
@@ -232,6 +237,24 @@ pub type ConnectionProbe = Arc<dyn Fn() -> ConnectionSnapshotFuture + Send + Syn
 /// built. The returned addresses are *collected*, not necessarily *applied*.
 pub type BypassRoutesProbe = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
+/// A change in the client's connection state, reported to the observer set
+/// with [`ClientStatusHandle::set_events`] (the Windows FFI's `on_event`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientEvent {
+    /// The tunnel is up: the first connection, or a reconnect.
+    Connected,
+    /// A connection attempt failed or the session was lost; the reconnect loop
+    /// tries again. Carries the error.
+    Reconnecting(String),
+    /// The run loop has ended and will not try again (final). Carries the
+    /// reason, or `None` for an end without an error.
+    Stopped(Option<String>),
+}
+
+/// Observer of [`ClientEvent`]s, called from the thread that changed the state,
+/// after the status lock is released.
+pub type ClientEvents = Arc<dyn Fn(&ClientEvent) + Send + Sync>;
+
 /// What the reconnect loop is doing while the tunnel is down. All fields are
 /// at their defaults while connected, and before the first attempt has failed.
 #[derive(Debug, Clone, Default)]
@@ -259,6 +282,12 @@ struct ClientStateInner {
     bypass_routes_probe: Option<BypassRoutesProbe>,
     /// The reconnect loop's progress through the current outage.
     reconnect: ReconnectState,
+    /// Set once the run loop has ended for good; the reason, if any, is in
+    /// `stop_reason`.
+    stopped: bool,
+    stop_reason: Option<String>,
+    /// Observer told about every state change (see [`ClientEvent`]).
+    events: Option<ClientEvents>,
     /// Daemon log-file path (set only when started with `--daemon`).
     log_file: Option<String>,
 }
@@ -285,6 +314,9 @@ impl ClientStatusHandle {
                 connection_probe: None,
                 bypass_routes_probe: None,
                 reconnect: ReconnectState::default(),
+                stopped: false,
+                stop_reason: None,
+                events: None,
                 log_file: None,
             })),
         }
@@ -294,6 +326,26 @@ impl ClientStatusHandle {
     pub fn set_log_file(&self, path: Option<String>) {
         let mut guard = self.inner.write().expect("client status lock poisoned");
         guard.log_file = path;
+    }
+
+    /// Report every later state change to `events` (see [`ClientEvent`]).
+    pub fn set_events(&self, events: ClientEvents) {
+        let mut guard = self.inner.write().expect("client status lock poisoned");
+        guard.events = Some(events);
+    }
+
+    /// Tell the observer, if any, about `event`. Called with the lock released,
+    /// so an observer may read the status.
+    fn emit(&self, event: ClientEvent) {
+        let events = self
+            .inner
+            .read()
+            .expect("client status lock poisoned")
+            .events
+            .clone();
+        if let Some(events) = events {
+            events(&event);
+        }
     }
 
     /// Mark the client connected with the given session details. `connection`
@@ -313,6 +365,8 @@ impl ClientStatusHandle {
         guard.bypass_routes_probe = bypass;
         // Connected: the outage, if there was one, is over.
         guard.reconnect = ReconnectState::default();
+        drop(guard);
+        self.emit(ClientEvent::Connected);
     }
 
     /// Mark the client disconnected (e.g. tunnel ended, awaiting reconnect).
@@ -339,9 +393,30 @@ impl ClientStatusHandle {
         let mut guard = self.inner.write().expect("client status lock poisoned");
         guard.reconnect = ReconnectState {
             failed_attempts,
-            last_error: Some(last_error),
+            last_error: Some(last_error.clone()),
             next_attempt_at: Some(next_attempt_at),
         };
+        drop(guard);
+        self.emit(ClientEvent::Reconnecting(last_error));
+    }
+
+    /// Mark the run loop as ended for good: `state` reads `"stopped"` with
+    /// `reason` (`None` for an end without an error) instead of a
+    /// `"disconnected"` that looks like a reconnect still on its way. The
+    /// outage's failure count and last error stay for the readout; no attempt
+    /// is pending any more.
+    pub fn set_stopped(&self, reason: Option<String>) {
+        let mut guard = self.inner.write().expect("client status lock poisoned");
+        guard.connected = false;
+        guard.connected_at = None;
+        guard.info = ClientConnectedInfo::default();
+        guard.connection_probe = None;
+        guard.bypass_routes_probe = None;
+        guard.reconnect.next_attempt_at = None;
+        guard.stopped = true;
+        guard.stop_reason = reason.clone();
+        drop(guard);
+        self.emit(ClientEvent::Stopped(reason));
     }
 
     /// Build the current snapshot wrapped for the control protocol.
@@ -396,6 +471,8 @@ impl ClientStatusHandle {
             probe,
             bypass_probe,
             reconnect,
+            stopped,
+            stop_reason,
             log_file,
         ) = {
             let guard = self.inner.read().expect("client status lock poisoned");
@@ -409,6 +486,8 @@ impl ClientStatusHandle {
                 guard.connection_probe.clone(),
                 guard.bypass_routes_probe.clone(),
                 guard.reconnect.clone(),
+                guard.stopped,
+                guard.stop_reason.clone(),
                 guard.log_file.clone(),
             )
         };
@@ -426,6 +505,8 @@ impl ClientStatusHandle {
             instance,
             state: if connected {
                 "connected".into()
+            } else if stopped {
+                "stopped".into()
             } else {
                 "disconnected".into()
             },
@@ -438,6 +519,7 @@ impl ClientStatusHandle {
                     .as_secs()
             }),
             last_error: reconnect.last_error,
+            stop_reason,
             mode: mode.into(),
             assigned_ip: info.assigned_ip,
             network: info.network,
@@ -873,9 +955,17 @@ fn print_client_text(c: &ClientStatus) {
     if let Some(secs) = c.connected_since_secs {
         println!("Connected for:  {}", fmt_uptime(secs));
     }
-    // While down, say how far the retry loop has got and when it tries again,
-    // so a backoff step of minutes reads as waiting, not stuck.
-    if c.failed_attempts > 0 {
+    if c.state == "stopped" {
+        println!(
+            "Stopped:        {}",
+            c.stop_reason.as_deref().unwrap_or("run loop ended")
+        );
+        if let Some(error) = &c.last_error {
+            println!("Last error:     {error}");
+        }
+    } else if c.failed_attempts > 0 {
+        // While down, say how far the retry loop has got and when it tries
+        // again, so a backoff step of minutes reads as waiting, not stuck.
         let next = match c.next_attempt_secs {
             Some(secs) if secs > 0 => format!("next in {}", fmt_uptime(secs)),
             _ => "trying now".to_string(),
@@ -1120,6 +1210,59 @@ mod tests {
         assert_eq!(snap.failed_attempts, 0, "a connection clears the outage");
         assert!(snap.next_attempt_secs.is_none());
         assert!(snap.last_error.is_none());
+    }
+
+    /// A run loop that ended reads as `"stopped"` with its reason, not as a
+    /// `"disconnected"` reconnect still on its way, and every state change
+    /// reaches the observer.
+    #[tokio::test]
+    async fn client_handle_reports_stop_and_events() {
+        let handle = ClientStatusHandle::new("default".into(), "server-node".into(), 1);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        handle.set_events(Arc::new(move |event: &ClientEvent| {
+            sink.lock().unwrap().push(event.clone());
+        }));
+
+        handle.set_connected(
+            ClientConnectedInfo::default(),
+            Arc::new(|| {
+                Box::pin(async {
+                    ConnectionSnapshot {
+                        description: "direct".into(),
+                        paths: Vec::new(),
+                        custom_relays: Vec::new(),
+                    }
+                })
+            }),
+            None,
+        );
+        handle.set_disconnected();
+        handle.set_reconnecting(
+            2,
+            "server unreachable".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        handle.set_stopped(Some("Gave up after 2 reconnect attempt(s): boom".into()));
+
+        let snap = full_status(&handle).await;
+        assert_eq!(snap.state, "stopped");
+        assert_eq!(
+            snap.stop_reason.as_deref(),
+            Some("Gave up after 2 reconnect attempt(s): boom")
+        );
+        assert!(snap.next_attempt_secs.is_none(), "no attempt is pending");
+        assert_eq!(snap.failed_attempts, 2);
+        assert_eq!(snap.last_error.as_deref(), Some("server unreachable"));
+        assert_eq!(snap.mode, "none");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ClientEvent::Connected,
+                ClientEvent::Reconnecting("server unreachable".into()),
+                ClientEvent::Stopped(Some("Gave up after 2 reconnect attempt(s): boom".into())),
+            ]
+        );
     }
 
     // Exercises `socket_path`, which only exists on Unix; the Windows control
