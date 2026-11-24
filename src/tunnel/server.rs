@@ -80,22 +80,22 @@ impl PendingHandshake {
                 HANDSHAKE_TIMEOUT.as_secs()
             ))
         };
-        // A timeout polls what it bounds before its timer, so a write that is
-        // ready at once would go through however late it began.
-        if tokio::time::Instant::now() >= self.deadline {
-            return Err(too_late());
+        // The deadline is looked at first each time: a timeout polls what it
+        // bounds before its timer, so a write that began late, or that the
+        // stream took only after the deadline, would still go through.
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(self.deadline) => Err(too_late()),
+            written = write_message(send, &response) => written,
         }
-        tokio::time::timeout_at(self.deadline, write_message(send, &response))
-            .await
-            .map_err(|_| too_late())?
     }
 
-    /// Turn the client away with `reason`, and wait until it has the reply
+    /// Turn the client away with `response`, and wait until it has the reply
     /// or the deadline is up. The connection is dropped next, which closes it
     /// and discards what is still queued; a client that never saw the reason
     /// would take the close for a network failure and connect again.
-    async fn reject(&self, send: &mut SendStream, reason: &str) -> VpnResult<()> {
-        self.reply(send, &VpnHandshakeResponse::rejected(reason)).await?;
+    async fn reject(&self, send: &mut SendStream, response: VpnHandshakeResponse) -> VpnResult<()> {
+        self.reply(send, &response).await?;
         let _ = send.finish();
         let _ = tokio::time::timeout_at(self.deadline, send.stopped()).await;
         Ok(())
@@ -1274,7 +1274,8 @@ impl VpnServer {
         // Verify the client's public-key credential. Failures are logged with
         // the specific reason; the wire rejection stays generic.
         if !self.verify_client_auth(&handshake.auth, &remote_id) {
-            if let Err(e) = pending.reject(&mut send, "Public-key authentication failed").await {
+            let response = VpnHandshakeResponse::rejected("Public-key authentication failed");
+            if let Err(e) = pending.reject(&mut send, response).await {
                 log::debug!("Client {remote_id} was not told of its rejection: {e}");
             }
             return Err(VpnError::Signaling(
@@ -1293,7 +1294,10 @@ impl VpnServer {
         if prev_count >= self.config.max_clients {
             // We exceeded the limit - decrement and reject
             self.active_connections.fetch_sub(1, Ordering::SeqCst);
-            pending.reject(&mut send, "Server full").await?;
+            // Room comes back as clients leave, so the client is told to
+            // try again rather than to give up.
+            let response = VpnHandshakeResponse::rejected_for_now("Server full");
+            pending.reject(&mut send, response).await?;
             return Err(VpnError::IpAssignment("Server full".into()));
         }
 
@@ -1608,19 +1612,21 @@ impl VpnServer {
         // stale cleanup tasks from affecting the new connection.
         let client_key = (remote_id, device_id);
 
-        // DashMap operations are lock-free (no async needed)
-        self.clients.insert(client_key, client_state);
-
-        // Add IPv4 reverse lookup if assigned
+        // The session and its reverse routes are published as one step, under
+        // the client's entry in `clients`: two connections of the client
+        // registering at once would otherwise interleave, leaving the session
+        // of one with the routes of the other, which that other's cleanup
+        // then removes. Nothing here waits, and no route lookup holds a route
+        // while taking a `clients` entry.
+        let registration = self.clients.entry(client_key);
         let route = Route { client: client_key, session_id };
         if let Some(ip4) = assigned_ip {
             self.ip_to_endpoint.insert(ip4, route);
         }
-
-        // Add IPv6 reverse lookup if assigned
         if let Some(ip6) = assigned_ip6 {
             self.ip6_to_endpoint.insert(ip6, route);
         }
+        drop(registration.insert(client_state));
 
         // Handle client data
         let clients = self.clients.clone();
@@ -3595,7 +3601,7 @@ mod tests {
                 let connection = incoming.await.expect("accept");
                 let (mut send, _recv) = connection.accept_bi().await.expect("accept_bi");
                 // The connection is dropped as this returns, as in the server.
-                pending.reject(&mut send, "not you").await
+                pending.reject(&mut send, VpnHandshakeResponse::rejected("not you")).await
             });
 
             let conn = client

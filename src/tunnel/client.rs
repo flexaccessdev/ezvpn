@@ -858,6 +858,13 @@ async fn exchange_handshake(
         let reason = response
             .reject_reason
             .unwrap_or_else(|| "Unknown".to_string());
+        // A full server has room again once a client leaves; a refused key
+        // stays refused.
+        if response.retry {
+            return Err(VpnError::Signaling(format!(
+                "Server turned the connection away for now: {reason}"
+            )));
+        }
         return Err(VpnError::AuthenticationFailed(reason));
     }
 
@@ -2477,5 +2484,55 @@ mod tests {
         silent.await.expect("server task");
         client.close().await;
         server.close().await;
+    }
+
+    /// A server that is full is tried again; one that refuses the key is not.
+    #[tokio::test]
+    async fn test_a_full_server_is_retried_and_a_refused_key_is_not() {
+        use crate::tunnel::signaling::VpnHandshakeResponse;
+
+        for full in [true, false] {
+            let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+            let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+            let acceptor = server.clone();
+            let rejecting = tokio::spawn(async move {
+                let incoming = acceptor.accept().await.expect("incoming connection");
+                let conn = incoming.await.expect("accept connection");
+                let (mut send, _recv) = conn.accept_bi().await.expect("accept_bi");
+                let response = if full {
+                    VpnHandshakeResponse::rejected_for_now("Server full")
+                } else {
+                    VpnHandshakeResponse::rejected("Public-key authentication failed")
+                };
+                write_message(&mut send, &response.encode().unwrap()).await.expect("reply");
+                conn.closed().await;
+            });
+
+            let conn = client
+                .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+                .await
+                .expect("connect to server");
+            let key = ClientKey::generate().expect("client key");
+            let exchange = exchange_handshake(&conn, 1, &key, client.id());
+            let err = tokio::time::timeout(Duration::from_secs(5), exchange)
+                .await
+                .expect("the handshake was never answered")
+                .err()
+                .expect("a rejected handshake");
+            if full {
+                assert!(
+                    matches!(err, VpnError::Signaling(ref m) if m.contains("Server full")),
+                    "{err:?}"
+                );
+            } else {
+                assert!(matches!(err, VpnError::AuthenticationFailed(_)), "{err:?}");
+            }
+            assert_eq!(err.is_recoverable(), full, "{err:?}");
+
+            conn.close(0u32.into(), b"done");
+            rejecting.await.expect("server task");
+            client.close().await;
+            server.close().await;
+        }
     }
 }

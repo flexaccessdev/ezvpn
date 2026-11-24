@@ -652,7 +652,10 @@ received batch it arrived in allocated.
 A client that is turned away (a key that is not authorized, a full server)
 is waited on, within the same deadline, until it has the reply: the server
 drops the connection next, and a client that never saw the reason would take
-the close for a network failure and connect again. A reply that fails or runs
+the close for a network failure and connect again. The two rejections differ
+for the client: a refused key ends it, while "Server full" is marked `retry`
+in the response and goes through the reconnect loop like a lost connection,
+since room comes back as clients leave. A reply that fails or runs
 out of time ends the connection before it becomes
 a session, and the addresses assigned for it go back to the pools. The pools
 count holders for this (`Lease`): a reconnecting client is given the address
