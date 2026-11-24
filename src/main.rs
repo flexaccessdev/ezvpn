@@ -1007,10 +1007,35 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         .await
         .context("Failed to create VPN server")?;
 
-    server
-        .run(endpoint, &resolved.relay_config, &relays_left_out)
-        .await
-        .map_err(|e| anyhow::anyhow!("VPN server error: {}", e))
+    let close_endpoint = endpoint.clone();
+    let run = server.run(endpoint, &resolved.relay_config, &relays_left_out);
+    tokio::pin!(run);
+    let result = tokio::select! {
+        res = &mut run => res,
+        _ = shutdown_signal() => {
+            // Close the endpoint so every client gets a CONNECTION_CLOSE now
+            // and reconnects (or gives up) at once, instead of finding out at
+            // its heartbeat timeout. The close frames go out immediately; the
+            // timeout only caps the wait for the clients' acknowledgements.
+            log::info!("Received shutdown signal, closing client connections");
+            if tokio::time::timeout(CLOSE_TIMEOUT, close_endpoint.close())
+                .await
+                .is_err()
+            {
+                log::warn!("Endpoint close timed out after {CLOSE_TIMEOUT:?}");
+            }
+            // The closed endpoint ends the accept loop, and `run` tears the
+            // TUN tasks down; bounded in case a task is stuck.
+            match tokio::time::timeout(CLOSE_TIMEOUT, &mut run).await {
+                Ok(res) => res,
+                Err(_) => {
+                    log::warn!("Server teardown timed out after {CLOSE_TIMEOUT:?}");
+                    Ok(())
+                }
+            }
+        }
+    };
+    result.map_err(|e| anyhow::anyhow!("VPN server error: {}", e))
 }
 
 /// Run VPN client.
@@ -1144,17 +1169,18 @@ async fn run_vpn_client(
     // heartbeat timeout. The close frame goes out immediately; the timeout
     // only caps the wait for the server's acknowledgement (e.g. when the
     // network is already gone).
-    if tokio::time::timeout(CLIENT_CLOSE_TIMEOUT, endpoint.close())
+    if tokio::time::timeout(CLOSE_TIMEOUT, endpoint.close())
         .await
         .is_err()
     {
-        log::warn!("Endpoint close timed out after {CLIENT_CLOSE_TIMEOUT:?}");
+        log::warn!("Endpoint close timed out after {CLOSE_TIMEOUT:?}");
     }
     result
 }
 
-/// Upper bound on the graceful endpoint close when the client stops.
-const CLIENT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Upper bound on each graceful-shutdown step when the client or server
+/// stops: the endpoint close, and (server) the teardown after it.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(all(test, unix))]
 mod tests {

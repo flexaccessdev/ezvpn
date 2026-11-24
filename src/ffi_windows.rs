@@ -11,11 +11,17 @@
 //!
 //! 1. [`ezvpn_start`] — parse the JSON config, create an iroh endpoint and a
 //!    `VpnClient`, and spawn its reconnecting run loop on a background thread.
-//!    Returns an opaque handle. The tunnel keeps running until [`ezvpn_stop`].
+//!    Returns an opaque handle. The tunnel keeps running until [`ezvpn_stop`],
+//!    or until the run loop ends on its own (retries used up, a
+//!    non-recoverable error, or a lost session with auto-reconnect off). Its
+//!    optional `on_event` callback reports each state change as it happens —
+//!    connected, reconnecting, and the final ended — so the app learns of the
+//!    end at once rather than by polling.
 //! 2. [`ezvpn_status`] — snapshot the live client status (assigned IPs, routes,
-//!    bypass addresses) as JSON — the desktop control endpoint's
-//!    [`StatusSnapshot`], read in-process (no named pipe), minus the connection
-//!    path and custom-relay health so it is cheap to poll.
+//!    bypass addresses, retry progress) as JSON — the desktop control
+//!    endpoint's [`StatusSnapshot`], read in-process (no named pipe), minus the
+//!    connection path and custom-relay health so it is cheap to poll for the
+//!    live details (uptime, the next retry's countdown).
 //! 3. [`ezvpn_conn_path`] — on demand (the GUI's "Connection path…" dialog, as
 //!    on Apple): every iroh path plus custom-relay health. Never
 //!    polled, since it makes a `/healthz` request per custom relay.
@@ -63,18 +69,20 @@
 //! "assigned_ip":"10.0.0.2","gateway":"10.0.0.1","routes":["10.0.0.1/32"],
 //! "connection":null,"custom_relays":[],...}` — `connection` and
 //! `custom_relays` are always empty here (see [`ezvpn_conn_path`]). `state` is
-//! `"disconnected"` while connecting/reconnecting and `"connected"` once the
-//! handshake succeeds. While down, `failed_attempts` (consecutive failures in
-//! the current outage), `last_error`, and `next_attempt_secs` (seconds until
-//! the reconnect loop tries again; `0` while an attempt is in progress) say
-//! how far the retry loop has got — a backoff step can be up to 60s once a
-//! long outage has pushed it to the cap.
+//! `"disconnected"` while connecting/reconnecting, `"connected"` once the
+//! handshake succeeds, and `"stopped"` once the run loop has ended for good,
+//! with `stop_reason` saying why (the same text as the `ENDED` event). While
+//! down, `failed_attempts` (consecutive failures in the current outage),
+//! `last_error`, and `next_attempt_secs` (seconds until the reconnect loop
+//! tries again; `0` while an attempt is in progress) say how far the retry
+//! loop has got — a backoff step can be up to 60s once a long outage has
+//! pushed it to the cap.
 
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::num::NonZeroU32;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -82,7 +90,8 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 
 use crate::config::VpnClientConfig;
-use crate::control::ClientStatusHandle;
+use crate::control::{ClientEvent, ClientStatusHandle};
+use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison};
 use crate::transport::endpoint::{RelayConfig, create_client_endpoint};
 use crate::tunnel::client::VpnClient;
 
@@ -98,7 +107,25 @@ pub struct EzvpnHandle {
     shutdown: Arc<Notify>,
     /// Clone of the client's live status handle, read by [`ezvpn_status`].
     status: ClientStatusHandle,
+    /// Set by [`ezvpn_stop`] before it signals the loop; `on_event` checks it,
+    /// under the lock, before every call, so no event follows `ezvpn_stop` and
+    /// `ezvpn_stop` waits out a callback in flight.
+    stopped: Arc<Mutex<bool>>,
 }
+
+/// `on_event` code: a connection attempt failed, or the session was lost, and
+/// the run loop will try again; `message` is the error. Poll [`ezvpn_status`]
+/// for the attempt count and the countdown to the next try.
+pub const EZVPN_EVENT_RECONNECTING: c_int = 1;
+/// `on_event` code: the tunnel is up (first connection or a reconnect);
+/// `message` is null.
+pub const EZVPN_EVENT_CONNECTED: c_int = 2;
+/// `on_event` code (final): the run loop has ended and will not try again —
+/// retries used up, a non-recoverable error, or a lost session with
+/// auto-reconnect off; `message` is the reason, or null for an end without an
+/// error. The tunnel is already torn down; still pass the handle to
+/// [`ezvpn_stop`] to free it.
+pub const EZVPN_EVENT_ENDED: c_int = 3;
 
 /// Config JSON accepted by [`ezvpn_start`]. Mirror of the Apple FFI config plus
 /// the desktop-only start options (`instance`, `auto_reconnect`,
@@ -242,20 +269,30 @@ pub unsafe extern "C" fn ezvpn_client_public_key(
 ///
 /// Returns a non-null handle once setup (iroh endpoint online + client
 /// single-instance lock) succeeds; the tunnel then runs in the background until
-/// [`ezvpn_stop`]. On a setup failure returns null and writes the error message
-/// to `out_buf`.
+/// [`ezvpn_stop`] or until the run loop ends on its own. On a setup failure
+/// returns null and writes the error message to `out_buf`.
 ///
 /// This returns as soon as the client has *started* — not once it has
-/// *connected*. Poll [`ezvpn_status`] for the `"connected"` state.
+/// *connected*. `on_event`, when non-null, is called from library threads with
+/// each state change (`EZVPN_EVENT_*`); a final `ENDED` means the run loop is
+/// over. No event is delivered once [`ezvpn_stop`] has been called: it waits
+/// for a callback already in progress, so the callback must not call
+/// [`ezvpn_stop`] itself, nor block on a thread that might (post the event to
+/// the UI thread asynchronously instead). The handle must still be passed to
+/// [`ezvpn_stop`] after `ENDED`.
 ///
 /// # Safety
 /// - `config_json` must be a valid, NUL-terminated UTF-8 C string.
+/// - `ctx` must remain valid for `on_event` until [`ezvpn_stop`] is called on
+///   the returned handle, and `on_event` must be safe to call from any thread.
 /// - `out_buf` must point to at least `out_len` writable bytes (may be null only
 ///   if `out_len` is 0).
 /// - The returned pointer must be freed exactly once with [`ezvpn_stop`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ezvpn_start(
     config_json: *const c_char,
+    on_event: Option<EzvpnEventCallback>,
+    ctx: *mut c_void,
     out_buf: *mut c_char,
     out_len: usize,
 ) -> *mut EzvpnHandle {
@@ -271,7 +308,8 @@ pub unsafe extern "C" fn ezvpn_start(
         }
     };
 
-    match start_inner(json) {
+    let target = on_event.map(|callback| EventTarget { callback, ctx });
+    match start_inner(json, target) {
         Ok(handle) => Box::into_raw(Box::new(handle)),
         Err(msg) => {
             write_cstr(out_buf, out_len, &msg);
@@ -280,7 +318,7 @@ pub unsafe extern "C" fn ezvpn_start(
     }
 }
 
-fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
+fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, String> {
     let cfg: FfiWinConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
 
@@ -304,6 +342,8 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
 
     let shutdown = Arc::new(Notify::new());
     let shutdown_worker = Arc::clone(&shutdown);
+    let stopped = Arc::new(Mutex::new(false));
+    let stopped_worker = Arc::clone(&stopped);
 
     // The worker thread owns a dedicated multi-thread runtime and drives the
     // whole tunnel lifetime. Separate workers keep UDP receive/QUIC pacing from
@@ -347,8 +387,27 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
                     }
                 };
 
+                let status = client.status_handle();
+                if let Some(target) = target {
+                    status.set_events(Arc::new(move |event: &ClientEvent| {
+                        let stopped = lock_ignoring_poison(&stopped_worker);
+                        if *stopped {
+                            return;
+                        }
+                        match event {
+                            ClientEvent::Reconnecting(error) => {
+                                target.emit(EZVPN_EVENT_RECONNECTING, Some(error))
+                            }
+                            ClientEvent::Connected => target.emit(EZVPN_EVENT_CONNECTED, None),
+                            ClientEvent::Stopped(reason) => {
+                                target.emit(EZVPN_EVENT_ENDED, reason.as_deref())
+                            }
+                        }
+                    }));
+                }
+
                 // Hand the status handle back; setup is done from here on.
-                if setup_tx.send(Ok(client.status_handle())).is_err() {
+                if setup_tx.send(Ok(status.clone())).is_err() {
                     // The starter gave up (dropped the receiver); nothing to run.
                     return;
                 }
@@ -359,11 +418,21 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
                 // before this block returns and the runtime is torn down.
                 tokio::select! {
                     result = run_client(&client, &endpoint, &relay_config, auto_reconnect, max_attempts) => {
-                        if let Err(e) = result {
-                            log::error!("VPN client exited: {e}");
-                        } else {
-                            log::info!("VPN client ended");
-                        }
+                        // The loop ended on its own and has already torn the
+                        // tunnel down: say so in the status and to `on_event`,
+                        // or the app would read the last "disconnected" as a
+                        // reconnect still on its way.
+                        let reason = match result {
+                            Ok(()) => {
+                                log::info!("VPN client ended");
+                                None
+                            }
+                            Err(e) => {
+                                log::error!("VPN client exited: {e}");
+                                Some(e.to_string())
+                            }
+                        };
+                        status.set_stopped(reason);
                     }
                     _ = shutdown_worker.notified() => {
                         log::info!("Stop requested; tearing down tunnel");
@@ -380,6 +449,7 @@ fn start_inner(json: &str) -> Result<EzvpnHandle, String> {
             worker: Some(worker),
             shutdown,
             status,
+            stopped,
         }),
         Ok(Err(msg)) => {
             // Setup failed inside the worker; it has already returned.
@@ -515,10 +585,11 @@ pub unsafe extern "C" fn ezvpn_conn_path(
 
 /// Stop the tunnel and free the handle.
 ///
-/// Signals the run loop to stop and **waits** for the worker thread to finish
-/// its teardown (routes removed, wintun adapter closed, single-instance lock
-/// released) before returning, so a subsequent [`ezvpn_start`] for the same
-/// instance does not race a half-released lock. After this call `handle` is
+/// Silences `on_event` (waiting out a callback in flight), signals the run
+/// loop to stop and **waits** for the worker thread to finish its teardown
+/// (routes removed, wintun adapter closed, single-instance lock released)
+/// before returning, so a subsequent [`ezvpn_start`] for the same instance
+/// does not race a half-released lock. After this call `handle` is
 /// invalid and must not be used again. Passing null is a safe no-op.
 ///
 /// # Safety
@@ -530,6 +601,7 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
         return;
     }
     let mut handle = unsafe { Box::from_raw(handle) };
+    *lock_ignoring_poison(&handle.stopped) = true;
     handle.shutdown.notify_one();
     if let Some(worker) = handle.worker.take() {
         let _ = worker.join();
