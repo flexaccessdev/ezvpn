@@ -400,6 +400,19 @@ impl ClientStatusHandle {
         self.emit(ClientEvent::Reconnecting(last_error));
     }
 
+    /// Record the failure that made the reconnect loop give up, so the
+    /// failure count and last error describe the final attempt rather than
+    /// the one before it. No attempt is pending; reports no event (the
+    /// [`Self::set_stopped`] that follows does).
+    pub fn set_final_failure(&self, failed_attempts: u32, last_error: String) {
+        let mut guard = self.inner.write().expect("client status lock poisoned");
+        guard.reconnect = ReconnectState {
+            failed_attempts,
+            last_error: Some(last_error),
+            next_attempt_at: None,
+        };
+    }
+
     /// Mark the run loop as ended for good: `state` reads `"stopped"` with
     /// `reason` (`None` for an end without an error) instead of a
     /// `"disconnected"` that looks like a reconnect still on its way. The
@@ -1243,6 +1256,7 @@ mod tests {
             "server unreachable".into(),
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         );
+        handle.set_final_failure(3, "boom".into());
         handle.set_stopped(Some("Gave up after 2 reconnect attempt(s): boom".into()));
 
         let snap = full_status(&handle).await;
@@ -1252,8 +1266,9 @@ mod tests {
             Some("Gave up after 2 reconnect attempt(s): boom")
         );
         assert!(snap.next_attempt_secs.is_none(), "no attempt is pending");
-        assert_eq!(snap.failed_attempts, 2);
-        assert_eq!(snap.last_error.as_deref(), Some("server unreachable"));
+        // The final attempt, not the one before it.
+        assert_eq!(snap.failed_attempts, 3);
+        assert_eq!(snap.last_error.as_deref(), Some("boom"));
         assert_eq!(snap.mode, "none");
         assert_eq!(
             *seen.lock().unwrap(),

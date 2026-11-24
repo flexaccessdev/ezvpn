@@ -1447,6 +1447,7 @@ impl VpnClient {
                     if let Some(max) = max_attempts
                         && failures > max.get()
                     {
+                        self.status.set_final_failure(failures, e.to_string());
                         let err = VpnError::MaxReconnectAttemptsExceeded {
                             attempts: max,
                             last_error: e.to_string(),
