@@ -140,6 +140,11 @@ pub struct VpnHandshakeResponse {
     /// Rejection reason (if not accepted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
+    /// Whether a rejection is for something that passes (the server is full),
+    /// so that the client should connect again rather than give up as it does
+    /// when its key is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry: bool,
     /// Server's candidate iroh underlay addresses (`endpoint.addr().ip_addrs()`),
     /// delivered in the handshake so the client can install bypass routes for any
     /// a VPN route would capture *at onboarding* — without waiting for the first
@@ -184,6 +189,7 @@ impl VpnHandshakeResponse {
             network6: None,
             server_ip6: None,
             reject_reason: None,
+            retry: false,
             server_addrs: Vec::new(),
         }
     }
@@ -207,6 +213,7 @@ impl VpnHandshakeResponse {
             network6: Some(network6),
             server_ip6: Some(server_ip6),
             reject_reason: None,
+            retry: false,
             server_addrs: Vec::new(),
         }
     }
@@ -229,6 +236,7 @@ impl VpnHandshakeResponse {
             network6: Some(network6),
             server_ip6: Some(server_ip6),
             reject_reason: None,
+            retry: false,
             server_addrs: Vec::new(),
         }
     }
@@ -245,7 +253,17 @@ impl VpnHandshakeResponse {
             network6: None,
             server_ip6: None,
             reject_reason: Some(reason.into()),
+            retry: false,
             server_addrs: Vec::new(),
+        }
+    }
+
+    /// Create a rejected response for something that passes, which the client
+    /// retries (see [`Self::retry`]).
+    pub fn rejected_for_now(reason: impl Into<String>) -> Self {
+        Self {
+            retry: true,
+            ..Self::rejected(reason)
         }
     }
 
@@ -581,6 +599,7 @@ mod tests {
             network6: None,
             server_ip6: None,
             reject_reason: None,
+            retry: false,
             server_addrs: Vec::new(),
         };
 

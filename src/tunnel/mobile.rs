@@ -138,9 +138,9 @@ pub struct MobileNetworkConfig {
 /// One connected, handshaked server session: what a reconnect replaces.
 struct Link {
     connection: Connection,
-    /// Send half of the data stream (the handshake bi-stream, kept open).
+    /// Send half of the control stream (the handshake bi-stream, kept open).
     data_send: SendStream,
-    /// Receive half of the data stream.
+    /// Receive half of the control stream.
     data_recv: RecvStream,
     server_info: ServerInfo,
     /// IPv4 underlay `/32`s (relay + server addresses) overlapping a routed

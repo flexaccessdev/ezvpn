@@ -16,7 +16,7 @@ use flexaccess_iroh::endpoint::{
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
-    endpoint::{Builder as EndpointBuilder, Connection},
+    endpoint::{Builder as EndpointBuilder, Connection, Side},
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -83,14 +83,15 @@ pub fn secret_to_endpoint_id(secret: &SecretKey) -> EndpointId {
     secret.public()
 }
 
-/// The shared base builder with ezvpn's QUIC transport tuning. ezvpn runs no
-/// mDNS (the shared crate's `mdns` feature is off), and never relay-only.
-fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<EndpointBuilder> {
+/// The shared base builder with ezvpn's QUIC transport tuning for `side`.
+/// Only a server publishes its address. ezvpn runs no mDNS (the shared
+/// crate's `mdns` feature is off), and never relay-only.
+fn base_builder(relay_config: &RelayConfig, side: Side) -> Result<EndpointBuilder> {
     Ok(endpoint_builder(
         relay_config,
         EndpointOptions {
-            transport_config: build_quic_transport_config()?,
-            publish_address,
+            transport_config: build_quic_transport_config(side)?,
+            publish_address: side == Side::Server,
             relay_only: false,
         },
     ))
@@ -99,7 +100,7 @@ fn base_builder(relay_config: &RelayConfig, publish_address: bool) -> Result<End
 /// A server endpoint builder: persistent identity (published on the default
 /// relays) and the VPN ALPN.
 fn server_builder(relay_config: &RelayConfig, secret: SecretKey) -> Result<EndpointBuilder> {
-    Ok(base_builder(relay_config, true)?
+    Ok(base_builder(relay_config, Side::Server)?
         .alpns(vec![VPN_ALPN.to_vec()])
         .secret_key(secret))
 }
@@ -139,7 +140,7 @@ pub async fn create_client_endpoint(
     relay_config: &RelayConfig,
     exclude_direct_paths: &[IpNet],
 ) -> Result<Endpoint> {
-    let mut builder = base_builder(relay_config, false)?;
+    let mut builder = base_builder(relay_config, Side::Client)?;
     if !exclude_direct_paths.is_empty() {
         builder = builder.path_selector(Arc::new(ExcludingPathSelector::new(
             exclude_direct_paths.to_vec(),

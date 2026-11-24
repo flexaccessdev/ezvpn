@@ -18,7 +18,7 @@ use crate::error::{VpnError, VpnResult};
 use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
-use crate::transport::{HEARTBEAT_TIMEOUT, SERVER_ADDR_PUBLISH_INTERVAL};
+use crate::transport::{HANDSHAKE_TIMEOUT, HEARTBEAT_TIMEOUT, SERVER_ADDR_PUBLISH_INTERVAL};
 use crate::transport::endpoint::RelayConfig;
 use flexaccess_iroh::relay_failover::fail_over_home_relay;
 use crate::tunnel::signaling::{
@@ -29,19 +29,85 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
 use ipnet::{Ipv4Net, Ipv6Net};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId, RelayUrl, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot};
 
 /// Maximum number of frames drained from a channel per batch.
 const WRITE_BATCH_SIZE: usize = 256;
+
+/// How many connections may be in their handshake at once: accepted, and not
+/// yet answered. `max_clients` counts sessions, which a connection becomes
+/// only once its key has been checked. Until then this bounds how many there
+/// are and [`HANDSHAKE_TIMEOUT`] how long each lasts. A connection arriving
+/// beyond them is refused, and its client connects again: left unaccepted it
+/// would wait in the QUIC stack's own queue, which is far longer and has no
+/// deadline, behind whatever was abandoned there.
+///
+/// The receive buffers of a connection that has not authenticated are
+/// budgeted at about 12 MiB (see [`HANDSHAKE_TIMEOUT`]), about 770 MiB for
+/// this many. That is what the buffers count, not a ceiling on memory: a
+/// queued datagram is charged its payload and keeps the whole received batch
+/// it arrived in allocated. A handshake takes milliseconds, so 64 at a time
+/// seldom refuses a client, even when all reconnect after a server restart.
+const MAX_PENDING_HANDSHAKES: usize = 64;
+
+/// A connection's place among the [`MAX_PENDING_HANDSHAKES`] and the time its
+/// handshake has, from arriving to taking the server's reply. Dropping this
+/// gives the place up.
+struct PendingHandshake {
+    _slot: OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
+}
+
+impl PendingHandshake {
+    /// Write the handshake reply before the deadline. The peer decides how
+    /// much the stream may carry, so one that allows nothing would otherwise
+    /// hold the reply, and whatever the connection has reserved, for as long
+    /// as it liked.
+    async fn reply(&self, send: &mut SendStream, response: &VpnHandshakeResponse) -> VpnResult<()> {
+        let response = response.encode()?;
+        let too_late = || {
+            VpnError::Signaling(format!(
+                "Handshake reply not taken within {}s of the connection arriving",
+                HANDSHAKE_TIMEOUT.as_secs()
+            ))
+        };
+        // The clock is read before each poll of the write. A timeout polls
+        // what it bounds before its timer, and a timer is rounded up to the
+        // next millisecond, so with either alone a write that began late, or
+        // that the stream took only after the deadline, could still go
+        // through. The timer is what wakes a write that stays blocked.
+        let write = write_message(send, &response);
+        let expiry = tokio::time::sleep_until(self.deadline);
+        tokio::pin!(write, expiry);
+        std::future::poll_fn(|cx| {
+            if tokio::time::Instant::now() >= self.deadline || expiry.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(Err(too_late()));
+            }
+            write.as_mut().poll(cx)
+        })
+        .await
+    }
+
+    /// Turn the client away with `response`, and wait until it has the reply
+    /// or the deadline is up. The connection is dropped next, which closes it
+    /// and discards what is still queued; a client that never saw the reason
+    /// would take the close for a network failure and connect again.
+    async fn reject(&self, send: &mut SendStream, response: VpnHandshakeResponse) -> VpnResult<()> {
+        self.reply(send, &response).await?;
+        let _ = send.finish();
+        let _ = tokio::time::timeout_at(self.deadline, send.stopped()).await;
+        Ok(())
+    }
+}
 
 /// Per-client control-stream queue depth (`ServerAddrs` and `Pong` frames).
 const CONTROL_CHANNEL_SIZE: usize = 1024;
@@ -208,6 +274,65 @@ impl ClientDatagramReceiver {
     }
 }
 
+/// An address assigned to a client, and how many of its connections hold it.
+///
+/// A client that reconnects is given the address it already has, while its
+/// older connection may still be up or its new one may yet fail its
+/// handshake. Each connection that was assigned the address lets go of it
+/// once, in whatever order they end, and the address is free for another
+/// client only when none holds it.
+#[derive(Debug)]
+struct Lease<A> {
+    ip: A,
+    holders: usize,
+}
+
+impl<A: Copy> Lease<A> {
+    fn new(ip: A) -> Self {
+        Self { ip, holders: 1 }
+    }
+
+    /// End one hold on `key`'s address. Returns the address if that was the
+    /// last, having removed it from `in_use`.
+    fn release(in_use: &mut HashMap<(EndpointId, u64), Self>, key: &(EndpointId, u64)) -> Option<A> {
+        let lease = in_use.get_mut(key)?;
+        lease.holders -= 1;
+        if lease.holders > 0 {
+            return None;
+        }
+        in_use.remove(key).map(|lease| lease.ip)
+    }
+}
+
+/// A reverse-map entry: the client an assigned address belongs to, and the
+/// session that put the entry there. A session's cleanup removes only its own
+/// entries: a reconnect of the client is given the same address and may have
+/// put its entry there already.
+#[derive(Clone, Copy)]
+struct Route {
+    client: (EndpointId, u64),
+    session_id: u64,
+}
+
+/// The session a route leads to: its client's current one, if that is the
+/// session the address was assigned to. A newer session of the client need
+/// not have been assigned every address an older one still holds (a pool can
+/// run out, or free up, between their handshakes), and it is not sent the
+/// packets for one it was not.
+fn routed_session(
+    clients: &DashMap<(EndpointId, u64), ClientState>,
+    route: Route,
+) -> Option<(Connection, ClientDatagramQueue)> {
+    let state = clients.get(&route.client)?;
+    (state.session_id == route.session_id)
+        .then(|| (state.connection.clone(), state.datagram_tx.clone()))
+}
+
+/// Remove `session_id`'s entry for `ip`, and no other session's.
+fn remove_route<A: Eq + std::hash::Hash>(routes: &DashMap<A, Route>, ip: &A, session_id: u64) {
+    routes.remove_if(ip, |_, route| route.session_id == session_id);
+}
+
 /// Per-client context used by the data handler.
 struct ClientContext {
     assigned_ip: Option<Ipv4Addr>,
@@ -215,9 +340,9 @@ struct ClientContext {
     /// Current client's key for identifying self in spoofing checks.
     client_key: (EndpointId, u64),
     /// Reverse lookup: IPv4 address -> client key (for inter-client spoofing detection).
-    ip_to_endpoint: Arc<DashMap<Ipv4Addr, (EndpointId, u64)>>,
+    ip_to_endpoint: Arc<DashMap<Ipv4Addr, Route>>,
     /// Reverse lookup: IPv6 address -> client key (for inter-client spoofing detection).
-    ip6_to_endpoint: Arc<DashMap<Ipv6Addr, (EndpointId, u64)>>,
+    ip6_to_endpoint: Arc<DashMap<Ipv6Addr, Route>>,
 }
 
 /// Request to write an IP packet (with optional offload metadata) to the TUN writer task.
@@ -237,7 +362,7 @@ struct IpPool {
     /// Maximum IP in the range.
     max_ip: u32,
     /// IPs currently in use (mapped from (client endpoint ID, device ID)).
-    in_use: HashMap<(EndpointId, u64), Ipv4Addr>,
+    in_use: HashMap<(EndpointId, u64), Lease<Ipv4Addr>>,
     /// Released IPs available for reuse.
     released: Vec<Ipv4Addr>,
     /// Reserved IPs that should never be assigned to clients.
@@ -309,7 +434,7 @@ impl IpPool {
             return Ok(());
         }
         // O(n) scan of in_use: small in practice, avoids extra lookup map.
-        if self.in_use.values().any(|assigned| *assigned == ip) {
+        if self.in_use.values().any(|assigned| assigned.ip == ip) {
             return Err(format!("{} {} is already assigned to a client", label, ip));
         }
         self.released.retain(|released_ip| *released_ip != ip);
@@ -342,7 +467,7 @@ impl IpPool {
                 continue;
             }
             // O(n) scan of in_use: small in practice, avoids extra lookup map.
-            if self.in_use.values().any(|assigned| *assigned == ip) {
+            if self.in_use.values().any(|assigned| assigned.ip == ip) {
                 continue;
             }
             candidate = Some(ip);
@@ -367,12 +492,14 @@ impl IpPool {
         None
     }
 
-    /// Allocate an IP address for a client.
+    /// Allocate an IP address for a client. Every `Some` is one hold on the
+    /// address (see [`Lease`]) and is paired with one [`Self::release`].
     fn allocate(&mut self, endpoint_id: EndpointId, device_id: u64) -> Option<Ipv4Addr> {
         let key = (endpoint_id, device_id);
         // Check if client already has an IP
-        if let Some(&ip) = self.in_use.get(&key) {
-            return Some(ip);
+        if let Some(lease) = self.in_use.get_mut(&key) {
+            lease.holders += 1;
+            return Some(lease.ip);
         }
 
         // Try to reuse a released IP first
@@ -380,22 +507,22 @@ impl IpPool {
             if self.reserved.contains(&ip) {
                 continue;
             }
-            self.in_use.insert(key, ip);
+            self.in_use.insert(key, Lease::new(ip));
             return Some(ip);
         }
 
         // Allocate new IP if available
         if let Some(ip) = self.next_unreserved_ip() {
-            self.in_use.insert(key, ip);
+            self.in_use.insert(key, Lease::new(ip));
             Some(ip)
         } else {
             None // Pool exhausted
         }
     }
 
-    /// Release an IP address when a client disconnects.
+    /// End one hold on a client's IP address; the last one frees the address.
     fn release(&mut self, endpoint_id: &EndpointId, device_id: u64) {
-        if let Some(ip) = self.in_use.remove(&(*endpoint_id, device_id)) {
+        if let Some(ip) = Lease::release(&mut self.in_use, &(*endpoint_id, device_id)) {
             self.released.push(ip);
         }
     }
@@ -466,7 +593,7 @@ struct Ip6Pool {
     /// IPs currently in use (mapped from (client endpoint ID, device ID)).
     /// In node-id mode this exists only for duplicate detection/rejection
     /// (plus idempotent re-allocate and release).
-    in_use: HashMap<(EndpointId, u64), Ipv6Addr>,
+    in_use: HashMap<(EndpointId, u64), Lease<Ipv6Addr>>,
 }
 
 impl Ip6Pool {
@@ -558,12 +685,14 @@ impl Ip6Pool {
         self.network
     }
 
-    /// Allocate an IPv6 address for a client.
+    /// Allocate an IPv6 address for a client. Every `Some` is one hold on
+    /// the address (see [`Lease`]) and is paired with one [`Self::release`].
     fn allocate(&mut self, endpoint_id: EndpointId, device_id: u64) -> Option<Ipv6Addr> {
         let key = (endpoint_id, device_id);
         // Check if client already has an IP
-        if let Some(&ip) = self.in_use.get(&key) {
-            return Some(ip);
+        if let Some(lease) = self.in_use.get_mut(&key) {
+            lease.holders += 1;
+            return Some(lease.ip);
         }
 
         match self.alloc {
@@ -574,7 +703,7 @@ impl Ip6Pool {
             } => {
                 // Try to reuse a released IP first
                 if let Some(ip) = released.pop() {
-                    self.in_use.insert(key, ip);
+                    self.in_use.insert(key, Lease::new(ip));
                     return Some(ip);
                 }
 
@@ -582,7 +711,7 @@ impl Ip6Pool {
                 if *next_ip <= max_ip {
                     let ip = Ipv6Addr::from(*next_ip);
                     *next_ip += 1;
-                    self.in_use.insert(key, ip);
+                    self.in_use.insert(key, Lease::new(ip));
                     Some(ip)
                 } else {
                     None // Pool exhausted
@@ -596,19 +725,19 @@ impl Ip6Pool {
                 // same address; hash collisions are ~2^-64).
                 if ip == self.network.network()
                     || ip == self.server_ip
-                    || self.in_use.values().any(|&used| used == ip)
+                    || self.in_use.values().any(|used| used.ip == ip)
                 {
                     return None;
                 }
-                self.in_use.insert(key, ip);
+                self.in_use.insert(key, Lease::new(ip));
                 Some(ip)
             }
         }
     }
 
-    /// Release an IPv6 address when a client disconnects.
+    /// End one hold on a client's IPv6 address; the last one frees the address.
     fn release(&mut self, endpoint_id: &EndpointId, device_id: u64) {
-        if let Some(ip) = self.in_use.remove(&(*endpoint_id, device_id)) {
+        if let Some(ip) = Lease::release(&mut self.in_use, &(*endpoint_id, device_id)) {
             // Only sequential mode tracks released IPs for reuse; node-id mode
             // re-derives the same address on reconnect.
             if let Ip6Alloc::Sequential {
@@ -634,10 +763,10 @@ pub struct VpnServer {
     clients: Arc<DashMap<(EndpointId, u64), ClientState>>,
     /// Reverse lookup: IPv4 address -> (endpoint ID, device ID).
     /// Lock-free map for hot-path routing lookups.
-    ip_to_endpoint: Arc<DashMap<Ipv4Addr, (EndpointId, u64)>>,
+    ip_to_endpoint: Arc<DashMap<Ipv4Addr, Route>>,
     /// Reverse lookup: IPv6 address -> (endpoint ID, device ID).
     /// Lock-free map for hot-path routing lookups.
-    ip6_to_endpoint: Arc<DashMap<Ipv6Addr, (EndpointId, u64)>>,
+    ip6_to_endpoint: Arc<DashMap<Ipv6Addr, Route>>,
     /// TUN device for VPN traffic.
     tun_device: Option<TunDevice>,
     /// Server-local TUN offload/GSO status.
@@ -1065,14 +1194,34 @@ impl VpnServer {
             );
         }
 
-        while let Some(incoming) = endpoint.accept().await {
+        let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
+        loop {
+            // `accept` is ready at once while connections are queued, and
+            // nothing else in this loop waits, so a queue that stays full
+            // would keep this task from ever yielding to what runs beside it
+            // (the home-relay failover). This yields now and then.
+            tokio::task::consume_budget().await;
+            let Some(incoming) = endpoint.accept().await else {
+                break;
+            };
+            let Some((incoming, pending)) =
+                admit_handshake(incoming, &handshake_slots, HANDSHAKE_TIMEOUT)
+            else {
+                continue;
+            };
             let server = self.clone();
             let tun_write_tx = tun_write_tx.clone();
             let local_iroh_udp_ports = local_iroh_udp_ports.clone();
             let endpoint = endpoint.clone();
             tokio::spawn(async move {
                 if let Err(e) = server
-                    .handle_connection(incoming, tun_write_tx, local_iroh_udp_ports, endpoint)
+                    .handle_connection(
+                        incoming,
+                        pending,
+                        tun_write_tx,
+                        local_iroh_udp_ports,
+                        endpoint,
+                    )
                     .await
                 {
                     log::error!("Connection error: {}", e);
@@ -1123,31 +1272,19 @@ impl VpnServer {
         true
     }
 
-    /// Handle an incoming VPN connection.
+    /// Handle an incoming VPN connection. `pending` is held until the
+    /// handshake has been answered, one way or the other.
     async fn handle_connection(
         &self,
-        incoming: iroh::endpoint::Incoming,
+        incoming: Incoming,
+        pending: PendingHandshake,
         tun_write_tx: mpsc::Sender<TunWriteRequest>,
         local_iroh_udp_ports: Arc<HashSet<u16>>,
         endpoint: Endpoint,
     ) -> VpnResult<()> {
-        let connection = incoming
-            .await
-            .map_err(|e| VpnError::Signaling(format!("Failed to accept connection: {}", e)))?;
-
+        let (connection, mut send, recv, handshake) =
+            receive_handshake(incoming, pending.deadline).await?;
         let remote_id = connection.remote_id();
-        log::debug!("New VPN connection from {}", remote_id);
-
-        // Accept the handshake bi-stream; it stays open as the data stream
-        // once the handshake response is written.
-        let (mut send, mut recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| VpnError::Signaling(format!("Failed to accept stream: {}", e)))?;
-
-        // Read handshake
-        let handshake_data = read_message(&mut recv, MAX_HANDSHAKE_SIZE).await?;
-        let handshake = VpnHandshake::decode(&handshake_data)?;
 
         log::debug!(
             "Received handshake from {} for device {}",
@@ -1159,8 +1296,9 @@ impl VpnServer {
         // the specific reason; the wire rejection stays generic.
         if !self.verify_client_auth(&handshake.auth, &remote_id) {
             let response = VpnHandshakeResponse::rejected("Public-key authentication failed");
-            write_message(&mut send, &response.encode()?).await?;
-            let _ = send.finish();
+            if let Err(e) = pending.reject(&mut send, response).await {
+                log::debug!("Client {remote_id} was not told of its rejection: {e}");
+            }
             return Err(VpnError::Signaling(
                 "Public-key authentication failed".into(),
             ));
@@ -1177,15 +1315,17 @@ impl VpnServer {
         if prev_count >= self.config.max_clients {
             // We exceeded the limit - decrement and reject
             self.active_connections.fetch_sub(1, Ordering::SeqCst);
-            let response = VpnHandshakeResponse::rejected("Server full");
-            write_message(&mut send, &response.encode()?).await?;
-            let _ = send.finish();
+            // Room comes back as clients leave, so the client is told to
+            // try again rather than to give up.
+            let response = VpnHandshakeResponse::rejected_for_now("Server full");
+            pending.reject(&mut send, response).await?;
             return Err(VpnError::IpAssignment("Server full".into()));
         }
 
         // From this point on, we must decrement active_connections on any error
         let result = self
             .handle_connection_inner(
+                pending,
                 send,
                 recv,
                 remote_id,
@@ -1206,10 +1346,12 @@ impl VpnServer {
     /// Inner connection handler - separated to ensure atomic counter cleanup.
     ///
     /// `send`/`recv` are the handshake bi-stream halves; after the handshake
-    /// response is written they carry the length-prefixed data frames.
+    /// response is written they are the control stream (heartbeats and
+    /// server-address publications). `pending` ends with that response.
     #[allow(clippy::too_many_arguments)]
     async fn handle_connection_inner(
         &self,
+        pending: PendingHandshake,
         mut send: SendStream,
         recv: RecvStream,
         remote_id: EndpointId,
@@ -1324,8 +1466,15 @@ impl VpnServer {
             self.config.network6,
         ));
 
-        // The stream stays open past the response: it now carries data frames.
-        write_message(&mut send, &response.encode()?).await?;
+        // The stream stays open past the response, as the control stream. A
+        // client that does not take the response never becomes a session, so
+        // what was assigned to it goes back to the pools here.
+        if let Err(e) = pending.reply(&mut send, &response).await {
+            self.release_addresses(remote_id, device_id, assigned_ip.is_some(), assigned_ip6.is_some())
+                .await;
+            return Err(e);
+        }
+        drop(pending);
 
         // Log connection based on what was assigned
         match (assigned_ip, assigned_ip6) {
@@ -1484,23 +1633,24 @@ impl VpnServer {
         // stale cleanup tasks from affecting the new connection.
         let client_key = (remote_id, device_id);
 
-        // DashMap operations are lock-free (no async needed)
-        self.clients.insert(client_key, client_state);
-
-        // Add IPv4 reverse lookup if assigned
+        // The session and its reverse routes are published as one step, under
+        // the client's entry in `clients`: two connections of the client
+        // registering at once would otherwise interleave, leaving the session
+        // of one with the routes of the other, which that other's cleanup
+        // then removes. Nothing here waits, and no route lookup holds a route
+        // while taking a `clients` entry.
+        let registration = self.clients.entry(client_key);
+        let route = Route { client: client_key, session_id };
         if let Some(ip4) = assigned_ip {
-            self.ip_to_endpoint.insert(ip4, (remote_id, device_id));
+            self.ip_to_endpoint.insert(ip4, route);
         }
-
-        // Add IPv6 reverse lookup if assigned
         if let Some(ip6) = assigned_ip6 {
-            self.ip6_to_endpoint.insert(ip6, (remote_id, device_id));
+            self.ip6_to_endpoint.insert(ip6, route);
         }
+        drop(registration.insert(client_state));
 
         // Handle client data
         let clients = self.clients.clone();
-        let ip_pool = self.ip_pool.clone();
-        let ip6_pool = self.ip6_pool.clone();
         let ip_to_endpoint = self.ip_to_endpoint.clone();
         let ip6_to_endpoint = self.ip6_to_endpoint.clone();
 
@@ -1534,50 +1684,38 @@ impl VpnServer {
 
         log::info!("Client {} disconnected", remote_id);
 
-        // Cleanup - use session_id to detect stale cleanup from rapid reconnection.
-        // Check-before-remove: verify session_id matches before removing anything.
-        // If a newer connection replaced us, do nothing - that connection owns the resources.
-        // DashMap remove_if atomically checks and removes if the predicate holds.
-        let removed = clients.remove_if(&client_key, |_, state| state.session_id == session_id);
-
-        let (endpoint_to_release, release_ipv4, release_ipv6) =
-            if let Some((_, client_state)) = removed {
-                // Remove IPv4 mapping if it points to us
-                if let Some(ip4) = assigned_ip {
-                    ip_to_endpoint
-                        .remove_if(&ip4, |_, (ep, dev)| *ep == remote_id && *dev == device_id);
-                }
-
-                // Remove IPv6 mapping if it points to us
-                if let Some(ip6) = assigned_ip6 {
-                    ip6_to_endpoint.remove_if(&ip6, |_, (ep6, dev6)| {
-                        *ep6 == remote_id && *dev6 == device_id
-                    });
-                }
-
-                (
-                    Some((remote_id, device_id)),
-                    client_state.assigned_ip.is_some(),
-                    client_state.assigned_ip6.is_some(),
-                )
-            } else {
-                // Session_id didn't match or client already gone - do nothing
-                (None, false, false)
-            };
-
-        if let Some((endpoint_id, dev_id)) = endpoint_to_release {
-            // Release IPv4 if allocated for this session
-            if release_ipv4 && let Some(ref ip_pool) = ip_pool {
-                ip_pool.write().await.release(&endpoint_id, dev_id);
-            }
-
-            // Release IPv6 if allocated for this session
-            if release_ipv6 && let Some(ref ip6_pool) = ip6_pool {
-                ip6_pool.write().await.release(&endpoint_id, dev_id);
-            }
+        // Cleanup - use session_id to detect stale cleanup from rapid reconnection:
+        // each removal below takes an entry only if this session put it there.
+        // A newer connection of the client has its own entries under the same
+        // keys, the reverse routes included (it is given the same addresses),
+        // and may put them there at any point during this cleanup.
+        clients.remove_if(&client_key, |_, state| state.session_id == session_id);
+        if let Some(ip4) = assigned_ip {
+            remove_route(&ip_to_endpoint, &ip4, session_id);
+        }
+        if let Some(ip6) = assigned_ip6 {
+            remove_route(&ip6_to_endpoint, &ip6, session_id);
         }
 
+        // Each connection holds the addresses its own handshake was assigned,
+        // so this one's hold ends here even when a newer connection of the
+        // client has taken the session over: the addresses stay assigned
+        // until the last holder lets go.
+        self.release_addresses(remote_id, device_id, assigned_ip.is_some(), assigned_ip6.is_some())
+            .await;
+
         result
+    }
+
+    /// End one connection's hold on the addresses its handshake was assigned
+    /// (`v4`, `v6`: which families it was assigned one in).
+    async fn release_addresses(&self, endpoint_id: EndpointId, device_id: u64, v4: bool, v6: bool) {
+        if v4 && let Some(ref ip_pool) = self.ip_pool {
+            ip_pool.write().await.release(&endpoint_id, device_id);
+        }
+        if v6 && let Some(ref ip6_pool) = self.ip6_pool {
+            ip6_pool.write().await.release(&endpoint_id, device_id);
+        }
     }
 
     /// Enqueue a TUN write request to be processed by the dedicated TUN writer task.
@@ -1662,11 +1800,11 @@ impl VpnServer {
         }
     }
 
-    /// Handle client data stream.
+    /// Handle a client's inbound data.
     ///
-    /// This function reads inbound frames from the client's data stream and
-    /// routes their IP packets to the TUN writer. It exits when either:
-    /// - The client disconnects (stream read errors / connection closes)
+    /// This function reads the client's datagrams and routes their IP
+    /// packets to the TUN writer. It exits when either:
+    /// - The client disconnects (datagram read errors / connection closes)
     /// - The writer task fails (error received via writer_error_rx)
     ///
     /// TUN writes are sent through the `tun_write_tx` channel to a dedicated writer task,
@@ -1720,7 +1858,7 @@ impl VpnServer {
                         Some(PacketIp::V4(src_ip)) => {
                             // Check if this IP belongs to another client
                             match ctx.ip_to_endpoint.get(&src_ip) {
-                                Some(ref owner) if *owner.value() == ctx.client_key => true, // Our own assigned IP
+                                Some(ref owner) if owner.client == ctx.client_key => true, // Our own assigned IP
                                 Some(_) => {
                                     // IP belongs to another client - actual spoofing
                                     log::warn!(
@@ -1744,7 +1882,7 @@ impl VpnServer {
                             } else {
                                 // Check if this IP belongs to another client
                                 match ctx.ip6_to_endpoint.get(&src_ip) {
-                                    Some(ref owner) if *owner.value() == ctx.client_key => true, // Our own assigned IP
+                                    Some(ref owner) if owner.client == ctx.client_key => true, // Our own assigned IP
                                     Some(_) => {
                                         // IP belongs to another client - actual spoofing
                                         log::warn!(
@@ -1906,7 +2044,7 @@ impl VpnServer {
 
             // Extract destination IP from packet (IPv4 or IPv6)
             // DashMap lookups are lock-free - no async await needed
-            let (endpoint_id, device_id) = match extract_dest_ip(packet_ref) {
+            let route = match extract_dest_ip(packet_ref) {
                 Some(PacketIp::V4(dest_ip)) => {
                     match self.ip_to_endpoint.get(&dest_ip).map(|r| *r) {
                         Some(res) => res,
@@ -1916,8 +2054,7 @@ impl VpnServer {
                         }
                     }
                 }
-                Some(PacketIp::V6(dest_ip)) => match self.ip6_to_endpoint.get(&dest_ip).map(|r| *r)
-                {
+                Some(PacketIp::V6(dest_ip)) => match self.ip6_to_endpoint.get(&dest_ip).map(|r| *r) {
                     Some(res) => res,
                     None => {
                         self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
@@ -1932,16 +2069,11 @@ impl VpnServer {
                 }
             };
 
-            let client_key = (endpoint_id, device_id);
-
             // Look up the destination client's connection (lock-free DashMap
             // read) and send the packet as unreliable datagram(s).
-            let (connection, datagram_tx) = match self.clients.get(&client_key) {
-                Some(c) => (c.connection.clone(), c.datagram_tx.clone()),
-                None => {
-                    self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+            let Some((connection, datagram_tx)) = routed_session(&self.clients, route) else {
+                self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
+                continue;
             };
 
             Self::queue_client_datagrams(
@@ -2144,7 +2276,7 @@ fn ip_in_overlay(ip: IpAddr, overlay_v4: Option<Ipv4Net>, overlay_v6: Option<Ipv
 }
 
 /// Publish the server's current candidate underlay addresses to one client over
-/// the data stream.
+/// the control stream.
 ///
 /// Returns `Err(())` only when the client's writer receiver is gone (the
 /// connection is being torn down), which tells the caller to stop publishing.
@@ -2190,11 +2322,57 @@ async fn publish_server_addrs(
     }
 }
 
-/// Periodically publish the server's candidate iroh underlay addresses to one
-/// client (see [`publish_server_addrs`]): once immediately, then every
-/// [`SERVER_ADDR_PUBLISH_INTERVAL`] for loss tolerance, and promptly whenever
-/// the local address set changes ([`Endpoint::watch_addr`]). Ends when the
-/// connection closes or the client's writer is gone.
+/// Give a connection that has just arrived a place among the pending
+/// handshakes, with `limit` to finish in, or refuse it if every place is
+/// taken. Accepting goes on either way: see [`MAX_PENDING_HANDSHAKES`].
+fn admit_handshake(
+    incoming: Incoming,
+    slots: &Arc<Semaphore>,
+    limit: Duration,
+) -> Option<(Incoming, PendingHandshake)> {
+    let Ok(slot) = slots.clone().try_acquire_owned() else {
+        log::debug!("Refusing a connection: every handshake place is taken");
+        incoming.refuse();
+        return None;
+    };
+    let pending = PendingHandshake {
+        _slot: slot,
+        deadline: tokio::time::Instant::now() + limit,
+    };
+    Some((incoming, pending))
+}
+
+/// Take a new connection as far as its client's handshake message: the QUIC
+/// handshake, the stream the client opens (which stays open as the control
+/// stream), and the message on it, all before `deadline`. Running out of time
+/// drops the connection, which closes it.
+async fn receive_handshake(
+    incoming: Incoming,
+    deadline: tokio::time::Instant,
+) -> VpnResult<(Connection, SendStream, RecvStream, VpnHandshake)> {
+    tokio::time::timeout_at(deadline, async {
+        let connection = incoming
+            .await
+            .map_err(|e| VpnError::Signaling(format!("Failed to accept connection: {}", e)))?;
+        log::debug!("New VPN connection from {}", connection.remote_id());
+
+        let (send, mut recv) = connection
+            .accept_bi()
+            .await
+            .map_err(|e| VpnError::Signaling(format!("Failed to accept stream: {}", e)))?;
+        let handshake_data = read_message(&mut recv, MAX_HANDSHAKE_SIZE).await?;
+        let handshake = VpnHandshake::decode(&handshake_data)?;
+        Ok((connection, send, recv, handshake))
+    })
+    .await
+    .map_err(|_| {
+        VpnError::Signaling(format!(
+            "No handshake within {}s of the connection arriving",
+            HANDSHAKE_TIMEOUT.as_secs()
+        ))
+    })?
+}
+
 /// Read the client's control stream: echo each heartbeat `Ping` as a `Pong`
 /// (queued on the control writer), and close the connection once no `Ping` has
 /// arrived for [`HEARTBEAT_TIMEOUT`] — other frames do not extend the deadline.
@@ -2244,6 +2422,11 @@ async fn run_heartbeat_responder(
     }
 }
 
+/// Periodically publish the server's candidate iroh underlay addresses to one
+/// client (see [`publish_server_addrs`]): once immediately, then every
+/// [`SERVER_ADDR_PUBLISH_INTERVAL`] for loss tolerance, and promptly whenever
+/// the local address set changes ([`Endpoint::watch_addr`]). Ends when the
+/// connection closes or the client's writer is gone.
 async fn run_server_addr_publisher(
     endpoint: Endpoint,
     connection: Connection,
@@ -2370,15 +2553,25 @@ mod tests {
         assert_eq!(ip1, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(ip2, Ipv4Addr::new(10, 0, 0, 3));
 
-        // Re-allocate same client should return same IP
+        // Re-allocate same client should return same IP, as a second hold
         let ip1_again = pool.allocate(id1, 1).unwrap();
         assert_eq!(ip1, ip1_again);
 
-        // Release and reallocate
+        // One of the two holds released: the address is still the client's
         pool.release(&id1, 1);
         let id3 = random_endpoint_id();
         let ip3 = pool.allocate(id3, 1).unwrap();
-        assert_eq!(ip3, ip1); // Should reuse released IP
+        assert_ne!(ip3, ip1);
+
+        // The last hold released: the address goes to the next client
+        pool.release(&id1, 1);
+        let id4 = random_endpoint_id();
+        let ip4 = pool.allocate(id4, 1).unwrap();
+        assert_eq!(ip4, ip1); // Should reuse released IP
+
+        // Releasing with no hold left changes nothing
+        pool.release(&id1, 1);
+        assert_eq!(pool.allocate(id4, 1).unwrap(), ip1);
     }
 
     #[test]
@@ -2617,15 +2810,25 @@ mod tests {
         assert_eq!(ip1, "fd00::2".parse::<Ipv6Addr>().unwrap());
         assert_eq!(ip2, "fd00::3".parse::<Ipv6Addr>().unwrap());
 
-        // Re-allocate same client should return same IP
+        // Re-allocate same client should return same IP, as a second hold
         let ip1_again = pool.allocate(id1, 1).unwrap();
         assert_eq!(ip1, ip1_again);
 
-        // Release and reallocate
+        // One of the two holds released: the address is still the client's
         pool.release(&id1, 1);
         let id3 = random_endpoint_id();
         let ip3 = pool.allocate(id3, 1).unwrap();
-        assert_eq!(ip3, ip1); // Should reuse released IP
+        assert_ne!(ip3, ip1);
+
+        // The last hold released: the address goes to the next client
+        pool.release(&id1, 1);
+        let id4 = random_endpoint_id();
+        let ip4 = pool.allocate(id4, 1).unwrap();
+        assert_eq!(ip4, ip1); // Should reuse released IP
+
+        // Releasing with no hold left changes nothing
+        pool.release(&id1, 1);
+        assert_eq!(pool.allocate(id4, 1).unwrap(), ip1);
     }
 
     #[test]
@@ -3192,5 +3395,297 @@ mod tests {
 
         // With no overlay configured, nothing is excluded.
         assert!(!ip_in_overlay("10.99.0.1".parse().unwrap(), None, None));
+    }
+
+    /// A loopback endpoint configured as a tunnel's `side` is, with no relays.
+    async fn loopback_endpoint(side: iroh::endpoint::Side) -> Endpoint {
+        Endpoint::builder(iroh::endpoint::presets::Empty)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .transport_config(crate::transport::build_quic_transport_config(side).unwrap())
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .alpns(vec![crate::tunnel::signaling::VPN_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// A connection whose client sends no handshake is dropped when the limit
+    /// is up, whether the client opened no stream or stopped partway into its
+    /// message.
+    #[tokio::test]
+    async fn test_connection_without_handshake_is_dropped() {
+        const LIMIT: Duration = Duration::from_millis(300);
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        for partial_message in [false, true] {
+            let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+            let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+            let acceptor = server.clone();
+            let received = tokio::spawn(async move {
+                let incoming = acceptor.accept().await.expect("incoming connection");
+                receive_handshake(incoming, tokio::time::Instant::now() + LIMIT).await.map(|_| ())
+            });
+
+            let conn = client
+                .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+                .await
+                .expect("connect to server");
+            // Three of the four bytes of a length prefix.
+            let _stream = if partial_message {
+                let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+                send.write_all(&[0, 0, 0]).await.expect("write partial prefix");
+                Some((send, recv))
+            } else {
+                None
+            };
+
+            let result = tokio::time::timeout(PATIENCE, received)
+                .await
+                .expect("the wait for a handshake never ended")
+                .expect("server task");
+            assert!(
+                matches!(result, Err(VpnError::Signaling(ref m)) if m.contains("No handshake within")),
+                "partial_message={partial_message}: {result:?}"
+            );
+            // `server` is still held here, so what closes the connection is
+            // the server dropping it, not its endpoint going away.
+            tokio::time::timeout(PATIENCE, conn.closed())
+                .await
+                .expect("the server kept a connection that sent no handshake");
+            client.close().await;
+            server.close().await;
+        }
+    }
+
+    /// A connection arriving while every handshake place is taken is refused
+    /// at once, and the server goes on accepting: the next one gets the place
+    /// that has come free.
+    #[tokio::test]
+    async fn test_connection_beyond_the_pending_handshakes_is_refused() {
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+        let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+        let slots = Arc::new(Semaphore::new(1));
+        // The first takes the only place. Its client's connect has not
+        // finished: the server has yet to answer it.
+        let accepting = server.clone();
+        let first_slots = slots.clone();
+        let first = tokio::spawn(async move {
+            let incoming = accepting.accept().await.expect("incoming");
+            let (incoming, pending) =
+                admit_handshake(incoming, &first_slots, PATIENCE).expect("a free place");
+            (incoming.await.expect("accept"), pending)
+        });
+        let first_conn = client
+            .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+            .await
+            .expect("first connect");
+        let (_held_conn, pending) = first.await.expect("server task");
+
+        // The second finds none, and is told so rather than left waiting.
+        let connecting = tokio::spawn({
+            let client = client.clone();
+            let addr = server.addr();
+            async move { client.connect(addr, crate::tunnel::signaling::VPN_ALPN).await }
+        });
+        let incoming = server.accept().await.expect("incoming");
+        assert!(
+            admit_handshake(incoming, &slots, PATIENCE).is_none(),
+            "admitted beyond the limit"
+        );
+        let refused = tokio::time::timeout(PATIENCE, connecting)
+            .await
+            .expect("a refused connect was left waiting")
+            .expect("client task");
+        assert!(refused.is_err(), "connected although refused");
+
+        // The place comes back with the first handshake, and is given again.
+        drop(pending);
+        let third = tokio::spawn({
+            let accepting = server.clone();
+            let slots = slots.clone();
+            async move {
+                let incoming = accepting.accept().await.expect("incoming");
+                let (incoming, pending) =
+                    admit_handshake(incoming, &slots, PATIENCE).expect("the freed place");
+                (incoming.await.expect("accept"), pending)
+            }
+        });
+        client
+            .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+            .await
+            .expect("connect once a place is free");
+        third.await.expect("server task");
+
+        drop(first_conn);
+        client.close().await;
+        server.close().await;
+    }
+
+    /// The reply to a handshake is under the handshake's deadline: a client
+    /// that lets nothing through on the stream does not hold the reply, or
+    /// its place among the pending handshakes, past it.
+    #[tokio::test]
+    async fn test_handshake_reply_gives_up_on_a_client_that_takes_nothing() {
+        const LIMIT: Duration = Duration::from_millis(300);
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+        // A client whose streams may carry nothing towards it.
+        let client = Endpoint::builder(iroh::endpoint::presets::Empty)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .stream_receive_window(0u32.into())
+                    .build(),
+            )
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .bind()
+            .await
+            .unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+
+        let accepting = server.clone();
+        let server_slots = slots.clone();
+        let replied = tokio::spawn(async move {
+            let incoming = accepting.accept().await.expect("incoming");
+            let (incoming, pending) =
+                admit_handshake(incoming, &server_slots, LIMIT).expect("a free place");
+            let connection = incoming.await.expect("accept");
+            let (mut send, _recv) = connection.accept_bi().await.expect("accept_bi");
+            let response = VpnHandshakeResponse::rejected("x".repeat(64));
+            pending.reply(&mut send, &response).await
+        });
+
+        let conn = client
+            .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+            .await
+            .expect("connect to server");
+        let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+        send.write_all(&[0]).await.expect("open the stream");
+
+        let result = tokio::time::timeout(PATIENCE, replied)
+            .await
+            .expect("the reply was never given up on")
+            .expect("server task");
+        assert!(
+            matches!(result, Err(VpnError::Signaling(ref m)) if m.contains("Handshake reply not taken")),
+            "{result:?}"
+        );
+        assert_eq!(slots.available_permits(), 1, "the place was not given back");
+        client.close().await;
+        server.close().await;
+    }
+
+    /// A session's cleanup leaves the reverse route a reconnect of the same
+    /// client has already put under the same address.
+    #[test]
+    fn test_route_cleanup_leaves_a_newer_sessions_route() {
+        let client = (random_endpoint_id(), 1);
+        let ip = Ipv4Addr::new(10, 0, 0, 2);
+        let routes: DashMap<Ipv4Addr, Route> = DashMap::new();
+
+        routes.insert(ip, Route { client, session_id: 1 });
+        // The reconnect is given the same address and replaces the entry.
+        routes.insert(ip, Route { client, session_id: 2 });
+        remove_route(&routes, &ip, 1);
+        assert_eq!(routes.get(&ip).map(|r| r.session_id), Some(2));
+
+        remove_route(&routes, &ip, 2);
+        assert!(routes.get(&ip).is_none());
+    }
+
+    /// A client that is turned away has the reason before the server lets the
+    /// connection go, and a reply begun after the deadline is not written.
+    #[tokio::test]
+    async fn test_rejection_reaches_the_client_and_a_late_reply_is_not_sent() {
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        for late in [false, true] {
+            let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+            let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+            let slots = Arc::new(Semaphore::new(1));
+
+            let accepting = server.clone();
+            let rejected = tokio::spawn(async move {
+                let incoming = accepting.accept().await.expect("incoming");
+                let (incoming, mut pending) =
+                    admit_handshake(incoming, &slots, PATIENCE).expect("a free place");
+                let connection = incoming.await.expect("accept");
+                let (mut send, _recv) = connection.accept_bi().await.expect("accept_bi");
+                if late {
+                    // Only just past: a timer alone is not yet due, since
+                    // timers are rounded up to the next millisecond.
+                    pending.deadline = tokio::time::Instant::now();
+                }
+                // The connection is dropped as this returns, as in the server.
+                pending.reject(&mut send, VpnHandshakeResponse::rejected("not you")).await
+            });
+
+            let conn = client
+                .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+                .await
+                .expect("connect to server");
+            let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+            send.write_all(&[0]).await.expect("open the stream");
+            let read = tokio::time::timeout(PATIENCE, read_message(&mut recv, MAX_HANDSHAKE_SIZE))
+                .await
+                .expect("the client was left waiting");
+            let result = rejected.await.expect("server task");
+
+            if late {
+                assert!(
+                    matches!(result, Err(VpnError::Signaling(ref m)) if m.contains("Handshake reply not taken")),
+                    "{result:?}"
+                );
+                assert!(read.is_err(), "a reply was written after the deadline");
+            } else {
+                result.expect("reject");
+                let response = VpnHandshakeResponse::decode(&read.expect("the rejection was lost"))
+                    .expect("decode");
+                assert!(!response.accepted);
+                assert_eq!(response.reject_reason.as_deref(), Some("not you"));
+            }
+            client.close().await;
+            server.close().await;
+        }
+    }
+
+    /// A route leads to its client's session only while that is the session
+    /// the address was assigned to.
+    #[tokio::test]
+    async fn test_route_of_another_session_is_not_followed() {
+        let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+        let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+        let (connected, incoming) = tokio::join!(
+            client.connect(server.addr(), crate::tunnel::signaling::VPN_ALPN),
+            async { server.accept().await.expect("incoming").await }
+        );
+        let _client_conn = connected.expect("connect");
+        let connection = incoming.expect("accept");
+
+        let key = (connection.remote_id(), 1);
+        let clients = DashMap::new();
+        let (datagram_tx, _datagram_rx) = ClientDatagramQueue::new();
+        clients.insert(
+            key,
+            ClientState {
+                session_id: 2,
+                assigned_ip: None,
+                assigned_ip6: Some("fd00::2".parse().unwrap()),
+                connection,
+                datagram_tx,
+            },
+        );
+
+        // An address the older session 1 still holds, and session 2 was not given.
+        assert!(routed_session(&clients, Route { client: key, session_id: 1 }).is_none());
+        assert!(routed_session(&clients, Route { client: key, session_id: 2 }).is_some());
+        let stranger = (random_endpoint_id(), 1);
+        assert!(routed_session(&clients, Route { client: stranger, session_id: 2 }).is_none());
+
+        client.close().await;
+        server.close().await;
     }
 }

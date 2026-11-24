@@ -23,7 +23,7 @@ use crate::tunnel::stream::{
     read_frame, write_frames, DATAGRAM_SEND_BATCH, DatagramSendOutcome, prepare_ip_datagrams,
     send_datagram_batch,
 };
-use crate::transport::{HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
+use crate::transport::{HANDSHAKE_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
 use crate::net::device::{
     BypassRouteGuard, Route6Guard, RouteGuard, TunConfig, TunDevice, UnderlayGateway,
     add_bypass_route, add_routes, add_routes6_with_src, query_default_gateway,
@@ -63,9 +63,9 @@ const WRITE_BATCH_SIZE: usize = 256;
 
 /// Channel buffer size for inbound packets queued to the TUN writer task.
 ///
-/// Decouples frame receipt from TUN write syscalls so the inbound reader
-/// keeps draining the data stream while the writer task issues per-packet TUN
-/// writes.
+/// Decouples datagram receipt from TUN write syscalls so the inbound reader
+/// keeps draining the connection's datagrams while the writer task issues
+/// per-packet TUN writes.
 const INBOUND_TUN_CHANNEL_SIZE: usize = 512;
 
 /// Channel buffer size for server-published candidate-address sets handed from
@@ -318,14 +318,14 @@ impl VpnClient {
     pub async fn connect(&self, endpoint: &Endpoint, relay_config: &RelayConfig) -> VpnResult<()> {
         let endpoint_addr = self.resolve_server_addr(relay_config)?;
 
-        // Client and server both build the identical fixed transport config
-        // (see crate::transport), so nothing is negotiated or upgraded here.
+        // Client and server each build their fixed transport config (see
+        // crate::transport), so nothing is negotiated or upgraded here.
         let connection = connect_with_timeout(endpoint, endpoint_addr).await?;
 
         log::info!("Connected to server, performing handshake...");
 
         // Perform handshake on the first bi-stream; it stays open as the
-        // reliable data stream afterwards.
+        // control stream afterwards.
         let (server_info, data_send, data_recv) =
             self.perform_handshake(&connection, endpoint.id()).await?;
 
@@ -571,7 +571,7 @@ impl VpnClient {
                 None
             };
 
-        // Run the VPN packet loop (tunneled over the reliable data stream).
+        // Run the VPN packet loop (IP packets as QUIC datagrams).
         // Hand the still-armed guard to `run_tunnel`, which disarms it only
         // after its own setup can no longer return early (past
         // `tun_device.split()`); until then the guard keeps aborting the bypass
@@ -638,7 +638,7 @@ impl VpnClient {
     }
 
     /// Perform VPN handshake with the server, returning the assigned network
-    /// parameters and the bi-stream that now carries the data frames.
+    /// parameters and the bi-stream, which stays open as the control stream.
     async fn perform_handshake(
         &self,
         connection: &iroh::endpoint::Connection,
@@ -785,7 +785,8 @@ impl VpnClient {
 
 /// Perform the VPN handshake on `connection` and return the server-assigned
 /// network parameters plus the stream halves of the handshake bi-stream, which
-/// stays open as the reliable data stream.
+/// stays open as the control stream. The exchange is bounded by
+/// [`HANDSHAKE_TIMEOUT`].
 ///
 /// Shared by the desktop [`VpnClient`] and the iOS connect path
 /// ([`crate::tunnel::mobile`]): both open a bi-stream, send a [`VpnHandshake`]
@@ -799,8 +800,38 @@ pub(crate) async fn perform_handshake(
     client_key: &ClientKey,
     own_id: EndpointId,
 ) -> VpnResult<(ServerInfo, SendStream, RecvStream)> {
+    handshake_within(
+        HANDSHAKE_TIMEOUT,
+        exchange_handshake(connection, device_id, client_key, own_id),
+    )
+    .await
+}
+
+/// Give a handshake `exchange` up after `limit`, as a recoverable error: the
+/// caller drops the connection and the reconnect loop tries again. Without
+/// it a server that accepts a connection and never answers keeps the client
+/// waiting for as long as the connection's keep-alives are acknowledged.
+async fn handshake_within<T>(
+    limit: Duration,
+    exchange: impl Future<Output = VpnResult<T>>,
+) -> VpnResult<T> {
+    tokio::time::timeout(limit, exchange).await.map_err(|_| {
+        VpnError::Signaling(format!(
+            "Timed out waiting for the server's handshake response after {}s",
+            limit.as_secs()
+        ))
+    })?
+}
+
+/// The handshake itself: what [`perform_handshake`] bounds.
+async fn exchange_handshake(
+    connection: &Connection,
+    device_id: u64,
+    client_key: &ClientKey,
+    own_id: EndpointId,
+) -> VpnResult<(ServerInfo, SendStream, RecvStream)> {
     // Open the bidirectional stream used for the handshake and, once the
-    // response is in, all data frames.
+    // response is in, as the control stream.
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -827,6 +858,13 @@ pub(crate) async fn perform_handshake(
         let reason = response
             .reject_reason
             .unwrap_or_else(|| "Unknown".to_string());
+        // A full server has room again once a client leaves; a refused key
+        // stays refused.
+        if response.retry {
+            return Err(VpnError::Signaling(format!(
+                "Server turned the connection away for now: {reason}"
+            )));
+        }
         return Err(VpnError::AuthenticationFailed(reason));
     }
 
@@ -2395,5 +2433,106 @@ mod tests {
         changed.server_ip = Some("10.0.0.254".parse().unwrap());
         let err = check_params_against(&established, &changed).expect_err("must reject");
         assert!(matches!(err, VpnError::ServerConfigChanged(_)));
+    }
+
+    /// A loopback endpoint configured as a tunnel's `side` is, with no relays.
+    async fn loopback_endpoint(side: iroh::endpoint::Side) -> Endpoint {
+        Endpoint::builder(iroh::endpoint::presets::Empty)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .transport_config(crate::transport::build_quic_transport_config(side).unwrap())
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .alpns(vec![crate::tunnel::signaling::VPN_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// A server that takes the connection and never answers the handshake is
+    /// given up on when the limit is up, with an error the reconnect loop
+    /// retries.
+    #[tokio::test]
+    async fn test_handshake_gives_up_on_a_silent_server() {
+        const LIMIT: Duration = Duration::from_millis(300);
+
+        let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+        let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+        let acceptor = server.clone();
+        let silent = tokio::spawn(async move {
+            let incoming = acceptor.accept().await.expect("incoming connection");
+            let conn = incoming.await.expect("accept connection");
+            let _stream = conn.accept_bi().await;
+            conn.closed().await;
+        });
+
+        let conn = client
+            .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+            .await
+            .expect("connect to server");
+        let key = ClientKey::generate().expect("client key");
+        let exchange = exchange_handshake(&conn, 1, &key, client.id());
+        let result = tokio::time::timeout(Duration::from_secs(5), handshake_within(LIMIT, exchange))
+            .await
+            .expect("the handshake waited past its limit");
+        let err = result.err().expect("a handshake the server never answered");
+        assert!(
+            matches!(err, VpnError::Signaling(ref m) if m.contains("Timed out waiting")),
+            "{err:?}"
+        );
+        assert!(err.is_recoverable());
+
+        conn.close(0u32.into(), b"done");
+        silent.await.expect("server task");
+        client.close().await;
+        server.close().await;
+    }
+
+    /// A server that is full is tried again; one that refuses the key is not.
+    #[tokio::test]
+    async fn test_a_full_server_is_retried_and_a_refused_key_is_not() {
+        use crate::tunnel::signaling::VpnHandshakeResponse;
+
+        for full in [true, false] {
+            let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+            let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+            let acceptor = server.clone();
+            let rejecting = tokio::spawn(async move {
+                let incoming = acceptor.accept().await.expect("incoming connection");
+                let conn = incoming.await.expect("accept connection");
+                let (mut send, _recv) = conn.accept_bi().await.expect("accept_bi");
+                let response = if full {
+                    VpnHandshakeResponse::rejected_for_now("Server full")
+                } else {
+                    VpnHandshakeResponse::rejected("Public-key authentication failed")
+                };
+                write_message(&mut send, &response.encode().unwrap()).await.expect("reply");
+                conn.closed().await;
+            });
+
+            let conn = client
+                .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+                .await
+                .expect("connect to server");
+            let key = ClientKey::generate().expect("client key");
+            let exchange = exchange_handshake(&conn, 1, &key, client.id());
+            let err = tokio::time::timeout(Duration::from_secs(5), exchange)
+                .await
+                .expect("the handshake was never answered")
+                .err()
+                .expect("a rejected handshake");
+            if full {
+                assert!(
+                    matches!(err, VpnError::Signaling(ref m) if m.contains("Server full")),
+                    "{err:?}"
+                );
+            } else {
+                assert!(matches!(err, VpnError::AuthenticationFailed(_)), "{err:?}");
+            }
+            assert_eq!(err.is_recoverable(), full, "{err:?}");
+
+            conn.close(0u32.into(), b"done");
+            rejecting.await.expect("server task");
+            client.close().await;
+            server.close().await;
+        }
     }
 }
