@@ -373,8 +373,7 @@ pub fn build_quic_transport_config(side: Side) -> Result<QuicTransportConfig> {
     // advertises to the peer that we cannot receive them).
     transport_config =
         transport_config.datagram_receive_buffer_size(Some(QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE));
-    transport_config =
-        transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_SIZE);
+    transport_config = transport_config.datagram_send_buffer_size(QUIC_DATAGRAM_SEND_BUFFER_SIZE);
 
     Ok(transport_config.build())
 }

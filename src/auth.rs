@@ -89,7 +89,11 @@ mod tests {
         // (flextunnel shares the key format and transcript) is not an ezvpn
         // credential.
         let foreign = key.sign_endpoint_id(b"flextunnel-client-auth-v1", &id);
-        assert!(!verify_endpoint_id_signature(&key.public_key(), &id, &foreign));
+        assert!(!verify_endpoint_id_signature(
+            &key.public_key(),
+            &id,
+            &foreign
+        ));
     }
 
     #[test]

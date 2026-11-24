@@ -323,10 +323,7 @@ pub fn validate_instance_name(name: &str) -> VpnResult<()> {
             "Instance name must be at most {MAX_INSTANCE_NAME_LEN} characters"
         )));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(VpnError::config(
             "Instance name may only contain ASCII letters, digits, and underscores",
         ));
@@ -392,9 +389,8 @@ impl VpnLock {
         let path = Self::lock_path(role, instance);
 
         // Ensure the runtime directory (the lock file's parent) exists.
-        ensure_runtime_dir().map_err(|e| {
-            VpnError::config_with_source("Failed to create runtime directory", e)
-        })?;
+        ensure_runtime_dir()
+            .map_err(|e| VpnError::config_with_source("Failed to create runtime directory", e))?;
 
         // Open or create the lock file (do not truncate before acquiring lock)
         let mut file = OpenOptions::new()

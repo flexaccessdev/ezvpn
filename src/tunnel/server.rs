@@ -5,28 +5,28 @@
 //! tunnels for each connected client. IP packets are framed and sent
 //! directly over the encrypted iroh QUIC connection.
 
-use crate::net::buffer::uninitialized_vec;
 use crate::config::{Ip6Strategy, VPN_MTU, VpnServerConfig, validate_ip6_strategy};
+use crate::control::{ClientEntry, ServerStatsView, ServerStatus, StatusSnapshot};
+use crate::error::{VpnError, VpnResult};
+use crate::net::buffer::uninitialized_vec;
+use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
+use crate::runtime::{LockRole, VpnLock};
+use crate::transport::endpoint::RelayConfig;
+use crate::transport::paths::{format_connection_paths, watch_connection_paths};
+use crate::transport::{HANDSHAKE_TIMEOUT, HEARTBEAT_TIMEOUT, SERVER_ADDR_PUBLISH_INTERVAL};
+use crate::tunnel::offload::VirtioNetHdr;
+use crate::tunnel::signaling::{
+    ClientAuthPayload, DataMessageType, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake,
+    VpnHandshakeResponse, read_message, write_message,
+};
 use crate::tunnel::stream::{
     DATAGRAM_READ_BATCH, DatagramSendOutcome, FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify,
     encode_heartbeat_frame, encode_server_addrs_frame, prepare_ip_datagrams, read_frame,
     send_datagram_batch, write_frames,
 };
-use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
-use crate::control::{ClientEntry, ServerStatsView, ServerStatus, StatusSnapshot};
-use crate::error::{VpnError, VpnResult};
-use crate::runtime::{LockRole, VpnLock};
-use crate::tunnel::offload::VirtioNetHdr;
-use crate::transport::paths::{format_connection_paths, watch_connection_paths};
-use crate::transport::{HANDSHAKE_TIMEOUT, HEARTBEAT_TIMEOUT, SERVER_ADDR_PUBLISH_INTERVAL};
-use crate::transport::endpoint::RelayConfig;
-use flexaccess_iroh::relay_failover::fail_over_home_relay;
-use crate::tunnel::signaling::{
-    ClientAuthPayload, DataMessageType, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
-    read_message, write_message,
-};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
+use flexaccess_iroh::relay_failover::fail_over_home_relay;
 use futures::StreamExt;
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
@@ -34,8 +34,8 @@ use iroh::{Endpoint, EndpointId, RelayUrl, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot};
@@ -252,10 +252,12 @@ impl ClientDatagramQueue {
             self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
             return Err(mpsc::error::TrySendError::Full(datagram));
         }
-        self.tx.send(datagram).map_err(|mpsc::error::SendError(datagram)| {
-            self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
-            mpsc::error::TrySendError::Closed(datagram)
-        })
+        self.tx
+            .send(datagram)
+            .map_err(|mpsc::error::SendError(datagram)| {
+                self.queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+                mpsc::error::TrySendError::Closed(datagram)
+            })
     }
 }
 
@@ -294,7 +296,10 @@ impl<A: Copy> Lease<A> {
 
     /// End one hold on `key`'s address. Returns the address if that was the
     /// last, having removed it from `in_use`.
-    fn release(in_use: &mut HashMap<(EndpointId, u64), Self>, key: &(EndpointId, u64)) -> Option<A> {
+    fn release(
+        in_use: &mut HashMap<(EndpointId, u64), Self>,
+        key: &(EndpointId, u64),
+    ) -> Option<A> {
         let lease = in_use.get_mut(key)?;
         lease.holders -= 1;
         if lease.holders > 0 {
@@ -1365,7 +1370,11 @@ impl VpnServer {
         // The tunnel MTU is the fixed protocol constant VPN_MTU. Each IP packet
         // maps to one unreliable QUIC datagram; a packet exceeding the live
         // datagram size is dropped rather than fragmented (the inner flow adapts).
-        log::debug!("Client {} handshake accepted (fixed MTU={})", remote_id, VPN_MTU);
+        log::debug!(
+            "Client {} handshake accepted (fixed MTU={})",
+            remote_id,
+            VPN_MTU
+        );
         // Allocate IPv4 for client (if server has IPv4 configured)
         let assigned_ip = if let Some(ref ip_pool) = self.ip_pool {
             let mut pool = ip_pool.write().await;
@@ -1438,7 +1447,11 @@ impl VpnServer {
             // IPv4-only
             (Some(ip4), None) => {
                 let ip_pool = self.ip_pool.as_ref().unwrap().read().await;
-                VpnHandshakeResponse::accepted(ip4, host_net4(ip_pool.server_ip()), ip_pool.server_ip())
+                VpnHandshakeResponse::accepted(
+                    ip4,
+                    host_net4(ip_pool.server_ip()),
+                    ip_pool.server_ip(),
+                )
             }
             // IPv6-only
             (None, Some(ip6)) => {
@@ -1470,8 +1483,13 @@ impl VpnServer {
         // client that does not take the response never becomes a session, so
         // what was assigned to it goes back to the pools here.
         if let Err(e) = pending.reply(&mut send, &response).await {
-            self.release_addresses(remote_id, device_id, assigned_ip.is_some(), assigned_ip6.is_some())
-                .await;
+            self.release_addresses(
+                remote_id,
+                device_id,
+                assigned_ip.is_some(),
+                assigned_ip6.is_some(),
+            )
+            .await;
             return Err(e);
         }
         drop(pending);
@@ -1567,7 +1585,8 @@ impl VpnServer {
                 if let Err(reason) = write_frames(&mut send, &mut batch).await {
                     log::warn!(
                         "Failed to write control frames to {}: {}",
-                        writer_client_id, reason
+                        writer_client_id,
+                        reason
                     );
                     break Some(reason.to_string());
                 }
@@ -1640,7 +1659,10 @@ impl VpnServer {
         // then removes. Nothing here waits, and no route lookup holds a route
         // while taking a `clients` entry.
         let registration = self.clients.entry(client_key);
-        let route = Route { client: client_key, session_id };
+        let route = Route {
+            client: client_key,
+            session_id,
+        };
         if let Some(ip4) = assigned_ip {
             self.ip_to_endpoint.insert(ip4, route);
         }
@@ -1701,8 +1723,13 @@ impl VpnServer {
         // so this one's hold ends here even when a newer connection of the
         // client has taken the session over: the addresses stay assigned
         // until the last holder lets go.
-        self.release_addresses(remote_id, device_id, assigned_ip.is_some(), assigned_ip6.is_some())
-            .await;
+        self.release_addresses(
+            remote_id,
+            device_id,
+            assigned_ip.is_some(),
+            assigned_ip6.is_some(),
+        )
+        .await;
 
         result
     }
@@ -1875,7 +1902,8 @@ impl VpnServer {
                             // Silently drop link-local packets (fe80::/10) - these are normal
                             // OS traffic (neighbor discovery, etc.) that shouldn't be forwarded
                             let src_bytes = src_ip.octets();
-                            let is_link_local = src_bytes[0] == 0xfe && (src_bytes[1] & 0xc0) == 0x80;
+                            let is_link_local =
+                                src_bytes[0] == 0xfe && (src_bytes[1] & 0xc0) == 0x80;
                             if is_link_local {
                                 // Link-local IPv6 packets are dropped (can't route across VPN)
                                 false
@@ -2054,7 +2082,8 @@ impl VpnServer {
                         }
                     }
                 }
-                Some(PacketIp::V6(dest_ip)) => match self.ip6_to_endpoint.get(&dest_ip).map(|r| *r) {
+                Some(PacketIp::V6(dest_ip)) => match self.ip6_to_endpoint.get(&dest_ip).map(|r| *r)
+                {
                     Some(res) => res,
                     None => {
                         self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
@@ -2388,27 +2417,32 @@ async fn run_heartbeat_responder(
     let mut frame_buf = vec![0u8; MAX_FRAME_BODY];
     let mut deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
     loop {
-        let body_len = match tokio::time::timeout_at(deadline, read_frame(&mut recv, &mut frame_buf)).await {
-            Ok(Ok(Some(len))) => len,
-            Ok(Ok(None)) => {
-                log::debug!("Client {label} finished its control stream; closing its connection");
-                connection.close(0u32.into(), b"control stream finished");
-                return;
-            }
-            Ok(Err(e)) => {
-                log::debug!("Client {label} control stream read ended: {e}; closing its connection");
-                connection.close(0u32.into(), b"control stream error");
-                return;
-            }
-            Err(_) => {
-                log::warn!(
-                    "Client {label} sent no heartbeat in {}s; closing its connection",
-                    HEARTBEAT_TIMEOUT.as_secs()
-                );
-                connection.close(0u32.into(), b"heartbeat timeout");
-                return;
-            }
-        };
+        let body_len =
+            match tokio::time::timeout_at(deadline, read_frame(&mut recv, &mut frame_buf)).await {
+                Ok(Ok(Some(len))) => len,
+                Ok(Ok(None)) => {
+                    log::debug!(
+                        "Client {label} finished its control stream; closing its connection"
+                    );
+                    connection.close(0u32.into(), b"control stream finished");
+                    return;
+                }
+                Ok(Err(e)) => {
+                    log::debug!(
+                        "Client {label} control stream read ended: {e}; closing its connection"
+                    );
+                    connection.close(0u32.into(), b"control stream error");
+                    return;
+                }
+                Err(_) => {
+                    log::warn!(
+                        "Client {label} sent no heartbeat in {}s; closing its connection",
+                        HEARTBEAT_TIMEOUT.as_secs()
+                    );
+                    connection.close(0u32.into(), b"heartbeat timeout");
+                    return;
+                }
+            };
         match classify(&frame_buf[..body_len]) {
             Ok(Frame::Ping(seq)) => {
                 deadline = tokio::time::Instant::now() + HEARTBEAT_TIMEOUT;
@@ -3423,7 +3457,9 @@ mod tests {
             let acceptor = server.clone();
             let received = tokio::spawn(async move {
                 let incoming = acceptor.accept().await.expect("incoming connection");
-                receive_handshake(incoming, tokio::time::Instant::now() + LIMIT).await.map(|_| ())
+                receive_handshake(incoming, tokio::time::Instant::now() + LIMIT)
+                    .await
+                    .map(|_| ())
             });
 
             let conn = client
@@ -3433,7 +3469,9 @@ mod tests {
             // Three of the four bytes of a length prefix.
             let _stream = if partial_message {
                 let (mut send, recv) = conn.open_bi().await.expect("open_bi");
-                send.write_all(&[0, 0, 0]).await.expect("write partial prefix");
+                send.write_all(&[0, 0, 0])
+                    .await
+                    .expect("write partial prefix");
                 Some((send, recv))
             } else {
                 None
@@ -3487,7 +3525,11 @@ mod tests {
         let connecting = tokio::spawn({
             let client = client.clone();
             let addr = server.addr();
-            async move { client.connect(addr, crate::tunnel::signaling::VPN_ALPN).await }
+            async move {
+                client
+                    .connect(addr, crate::tunnel::signaling::VPN_ALPN)
+                    .await
+            }
         });
         let incoming = server.accept().await.expect("incoming");
         assert!(
@@ -3586,9 +3628,21 @@ mod tests {
         let ip = Ipv4Addr::new(10, 0, 0, 2);
         let routes: DashMap<Ipv4Addr, Route> = DashMap::new();
 
-        routes.insert(ip, Route { client, session_id: 1 });
+        routes.insert(
+            ip,
+            Route {
+                client,
+                session_id: 1,
+            },
+        );
         // The reconnect is given the same address and replaces the entry.
-        routes.insert(ip, Route { client, session_id: 2 });
+        routes.insert(
+            ip,
+            Route {
+                client,
+                session_id: 2,
+            },
+        );
         remove_route(&routes, &ip, 1);
         assert_eq!(routes.get(&ip).map(|r| r.session_id), Some(2));
 
@@ -3620,7 +3674,9 @@ mod tests {
                     pending.deadline = tokio::time::Instant::now();
                 }
                 // The connection is dropped as this returns, as in the server.
-                pending.reject(&mut send, VpnHandshakeResponse::rejected("not you")).await
+                pending
+                    .reject(&mut send, VpnHandshakeResponse::rejected("not you"))
+                    .await
             });
 
             let conn = client
@@ -3680,10 +3736,37 @@ mod tests {
         );
 
         // An address the older session 1 still holds, and session 2 was not given.
-        assert!(routed_session(&clients, Route { client: key, session_id: 1 }).is_none());
-        assert!(routed_session(&clients, Route { client: key, session_id: 2 }).is_some());
+        assert!(
+            routed_session(
+                &clients,
+                Route {
+                    client: key,
+                    session_id: 1
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            routed_session(
+                &clients,
+                Route {
+                    client: key,
+                    session_id: 2
+                }
+            )
+            .is_some()
+        );
         let stranger = (random_endpoint_id(), 1);
-        assert!(routed_session(&clients, Route { client: stranger, session_id: 2 }).is_none());
+        assert!(
+            routed_session(
+                &clients,
+                Route {
+                    client: stranger,
+                    session_id: 2
+                }
+            )
+            .is_none()
+        );
 
         client.close().await;
         server.close().await;

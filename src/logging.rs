@@ -36,7 +36,10 @@ const RELAY_RATE_LIMIT_NOTICE: &str = "The relay rate-limits this endpoint's rel
 fn is_relay_rate_limit_warning(record: &Record) -> bool {
     record.level() == Level::Warn
         && record.target() == RELAY_ACTOR_TARGET
-        && record.args().to_string().starts_with(RELAY_RATE_LIMIT_PREFIX)
+        && record
+            .args()
+            .to_string()
+            .starts_with(RELAY_RATE_LIMIT_PREFIX)
 }
 
 struct Logger {
@@ -129,7 +132,12 @@ mod tests {
 
     #[test]
     fn module_paths_are_shown_only_with_debug_logging() {
-        let max_level = |filters: &str| env_logger::Builder::new().parse_filters(filters).build().filter();
+        let max_level = |filters: &str| {
+            env_logger::Builder::new()
+                .parse_filters(filters)
+                .build()
+                .filter()
+        };
         assert!(!shows_target(max_level(DEFAULT_LOG_FILTER)));
         assert!(!shows_target(max_level("warn")));
         assert!(shows_target(max_level("debug")));
@@ -184,7 +192,9 @@ mod tests {
             &Record::builder()
                 .level(Level::Warn)
                 .target(RELAY_ACTOR_TARGET)
-                .args(format_args!("{RELAY_RATE_LIMIT_PREFIX}; outbound relay traffic is throttled"))
+                .args(format_args!(
+                    "{RELAY_RATE_LIMIT_PREFIX}; outbound relay traffic is throttled"
+                ))
                 .build(),
         );
         let written = sink.0.lock().unwrap().clone();

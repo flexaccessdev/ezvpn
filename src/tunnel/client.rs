@@ -16,33 +16,33 @@ use crate::net::buffer::uninitialized_vec;
 // Not mobile-gated: `perform_handshake` is the shared connect path, used by the
 // mobile session too.
 use crate::auth::ClientKey;
+use crate::config::VPN_MTU;
 #[cfg(not(target_os = "ios"))]
 use crate::config::VpnClientConfig;
-use crate::tunnel::stream::{
-    DATAGRAM_READ_BATCH, FRAME_ARENA_CHUNK, Frame, MAX_FRAME_BODY, classify, encode_heartbeat_frame,
-    read_frame, write_frames, DATAGRAM_SEND_BATCH, DatagramSendOutcome, prepare_ip_datagrams,
-    send_datagram_batch,
-};
-use crate::transport::{HANDSHAKE_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
+#[cfg(not(target_os = "ios"))]
+use crate::control::{ClientConnectedInfo, ClientStatusHandle};
+use crate::error::{VpnError, VpnResult};
 use crate::net::device::{
     BypassRouteGuard, Route6Guard, RouteGuard, TunConfig, TunDevice, UnderlayGateway,
     add_bypass_route, add_routes, add_routes6_with_src, query_default_gateway,
 };
 #[cfg(not(target_os = "ios"))]
-use crate::control::{ClientConnectedInfo, ClientStatusHandle};
-#[cfg(not(target_os = "ios"))]
 use crate::net::local_networks::{has_refusable_routes, local_networks, overlap_error};
-use crate::error::{VpnError, VpnResult};
 #[cfg(not(target_os = "ios"))]
 use crate::runtime::{LockRole, VpnLock};
-use crate::tunnel::offload::VirtioNetHdr;
+use crate::transport::endpoint::{RelayConfig, connect_with_timeout};
 use crate::transport::paths::watch_connection_paths;
-use crate::config::VPN_MTU;
+use crate::transport::{HANDSHAKE_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT};
+use crate::tunnel::offload::VirtioNetHdr;
 use crate::tunnel::signaling::{
-    ClientAuthPayload, DataMessageType, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake, VpnHandshakeResponse,
-    read_message, write_message,
+    ClientAuthPayload, DataMessageType, MAX_HANDSHAKE_SIZE, ServerAddrsMsg, VpnHandshake,
+    VpnHandshakeResponse, read_message, write_message,
 };
-use crate::transport::endpoint::{connect_with_timeout, RelayConfig};
+use crate::tunnel::stream::{
+    DATAGRAM_READ_BATCH, DATAGRAM_SEND_BATCH, DatagramSendOutcome, FRAME_ARENA_CHUNK, Frame,
+    MAX_FRAME_BODY, classify, encode_heartbeat_frame, prepare_ip_datagrams, read_frame,
+    send_datagram_batch, write_frames,
+};
 use bytes::{Bytes, BytesMut};
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -89,7 +89,10 @@ pub(crate) struct InboundTunWrite {
 /// the lock-free `try_send` fast path and only `.await`s when the channel is
 /// full (backpressure), avoiding a guaranteed task wake-up per received packet.
 /// Returns `false` if the channel is closed.
-pub(crate) async fn enqueue_inbound_tun_write(tx: &mpsc::Sender<InboundTunWrite>, req: InboundTunWrite) -> bool {
+pub(crate) async fn enqueue_inbound_tun_write(
+    tx: &mpsc::Sender<InboundTunWrite>,
+    req: InboundTunWrite,
+) -> bool {
     match tx.try_send(req) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(req)) => tx.send(req).await.is_ok(),
@@ -193,7 +196,8 @@ impl NetworkParams {
 impl std::fmt::Display for NetworkParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn opt<T: std::fmt::Display>(v: &Option<T>) -> String {
-            v.as_ref().map_or_else(|| "none".to_string(), |x| x.to_string())
+            v.as_ref()
+                .map_or_else(|| "none".to_string(), |x| x.to_string())
         }
         write!(
             f,
@@ -226,7 +230,9 @@ fn check_params_against(
     info: &ServerInfo,
 ) -> VpnResult<()> {
     let params = NetworkParams::from_server_info(info);
-    let mut baseline = established.lock().expect("established_params mutex poisoned");
+    let mut baseline = established
+        .lock()
+        .expect("established_params mutex poisoned");
 
     let Some(prev) = baseline.as_ref() else {
         // First successful handshake: record the baseline.
@@ -274,8 +280,11 @@ impl VpnClient {
         let device_id: u64 = rand::rng().random();
         log::info!("Generated device ID: {:016x}", device_id);
 
-        let status =
-            ClientStatusHandle::new(instance.to_string(), config.server_node_id.clone(), device_id);
+        let status = ClientStatusHandle::new(
+            instance.to_string(),
+            config.server_node_id.clone(),
+            device_id,
+        );
 
         Ok(Self {
             config,
@@ -885,18 +894,21 @@ async fn exchange_handshake(
 
     // Extract IPv6 info (optional, for IPv6-only or dual-stack)
     // All three IPv6 fields must be present together or all absent for consistency
-    let (assigned_ip6, network6, server_ip6) =
-        match (response.assigned_ip6, response.network6, response.server_ip6) {
-            (Some(ip), Some(net), Some(gw)) => (Some(ip), Some(net), Some(gw)),
-            (None, None, None) => (None, None, None),
-            _ => {
-                return Err(VpnError::Signaling(
-                    "Server response has incomplete IPv6 configuration: \
+    let (assigned_ip6, network6, server_ip6) = match (
+        response.assigned_ip6,
+        response.network6,
+        response.server_ip6,
+    ) {
+        (Some(ip), Some(net), Some(gw)) => (Some(ip), Some(net), Some(gw)),
+        (None, None, None) => (None, None, None),
+        _ => {
+            return Err(VpnError::Signaling(
+                "Server response has incomplete IPv6 configuration: \
                      assigned_ip6, network6, and server_ip6 must all be present or all absent"
-                        .into(),
-                ));
-            }
-        };
+                    .into(),
+            ));
+        }
+    };
 
     // At least one of IPv4 or IPv6 must be provided
     if assigned_ip.is_none() && assigned_ip6.is_none() {
@@ -1649,7 +1661,10 @@ async fn capture_underlay_gateway(is_ipv6: bool) -> Option<UnderlayGateway> {
     let family = if is_ipv6 { "IPv6" } else { "IPv4" };
     match query_default_gateway(is_ipv6).await {
         Ok(gw) => {
-            log::debug!("Captured {} underlay default gateway for bypass fallback", family);
+            log::debug!(
+                "Captured {} underlay default gateway for bypass fallback",
+                family
+            );
             Some(gw)
         }
         Err(e) => {
@@ -1802,10 +1817,12 @@ pub(crate) async fn collect_relay_ips(
     let relay_map = relay_config.relay_mode().relay_map();
     // Resolve relays concurrently so startup isn't serialized across the whole
     // (default) relay map.
-    let resolved = futures::future::join_all(relay_map.urls::<Vec<_>>().into_iter().map(|url| async move {
-        let result = resolve_relay_url(endpoint, &url).await;
-        (url, result)
-    }))
+    let resolved = futures::future::join_all(relay_map.urls::<Vec<_>>().into_iter().map(
+        |url| async move {
+            let result = resolve_relay_url(endpoint, &url).await;
+            (url, result)
+        },
+    ))
     .await;
     for (url, result) in resolved {
         match result {
@@ -2094,10 +2111,14 @@ mod tests {
         .iter()
         .map(|s| s.parse().unwrap())
         .collect();
-        let routes4: Vec<Ipv4Net> =
-            vec!["192.168.0.0/16".parse().unwrap(), "44.230.20.0/24".parse().unwrap()];
-        let routes6: Vec<Ipv6Net> =
-            vec!["fd12::/16".parse().unwrap(), "2606:4700::/32".parse().unwrap()];
+        let routes4: Vec<Ipv4Net> = vec![
+            "192.168.0.0/16".parse().unwrap(),
+            "44.230.20.0/24".parse().unwrap(),
+        ];
+        let routes6: Vec<Ipv6Net> = vec![
+            "fd12::/16".parse().unwrap(),
+            "2606:4700::/32".parse().unwrap(),
+        ];
 
         let (v4, v6) = overlapping_underlay_excludes(&server_addrs, &routes4, &routes6);
         assert_eq!(v4, vec!["44.230.20.120/32".to_string()]);
@@ -2110,11 +2131,15 @@ mod tests {
         // GUA v6 must be carved out (the transport uses them), but the server's
         // LAN address stays tunneled or it would blackhole LAN destinations
         // that share it (e.g. a DNS server on the VPN host).
-        let server_addrs: Vec<IpAddr> =
-            ["10.22.33.10", "44.230.20.120", "2600:1f14:abc::1", "fd12::5"]
-                .iter()
-                .map(|s| s.parse().unwrap())
-                .collect();
+        let server_addrs: Vec<IpAddr> = [
+            "10.22.33.10",
+            "44.230.20.120",
+            "2600:1f14:abc::1",
+            "fd12::5",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
         let routes4: Vec<Ipv4Net> = vec!["0.0.0.0/0".parse().unwrap()];
         let routes6: Vec<Ipv6Net> = vec!["::/0".parse().unwrap()];
 
@@ -2125,8 +2150,10 @@ mod tests {
 
     #[test]
     fn overlapping_excludes_empty_when_no_routes_or_no_overlap() {
-        let server_addrs: Vec<IpAddr> =
-            ["192.168.1.5", "fd12::5"].iter().map(|s| s.parse().unwrap()).collect();
+        let server_addrs: Vec<IpAddr> = ["192.168.1.5", "fd12::5"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
 
         // No routes at all.
         assert_eq!(
@@ -2235,7 +2262,10 @@ mod tests {
         ]))
         .await;
 
-        assert!(mgr.active_routes.is_empty(), "private-scope address bypassed");
+        assert!(
+            mgr.active_routes.is_empty(),
+            "private-scope address bypassed"
+        );
         assert!(
             mgr.collected.lock().unwrap().is_empty(),
             "private-scope address recorded as intended bypass"
@@ -2470,9 +2500,10 @@ mod tests {
             .expect("connect to server");
         let key = ClientKey::generate().expect("client key");
         let exchange = exchange_handshake(&conn, 1, &key, client.id());
-        let result = tokio::time::timeout(Duration::from_secs(5), handshake_within(LIMIT, exchange))
-            .await
-            .expect("the handshake waited past its limit");
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), handshake_within(LIMIT, exchange))
+                .await
+                .expect("the handshake waited past its limit");
         let err = result.err().expect("a handshake the server never answered");
         assert!(
             matches!(err, VpnError::Signaling(ref m) if m.contains("Timed out waiting")),
@@ -2504,7 +2535,9 @@ mod tests {
                 } else {
                     VpnHandshakeResponse::rejected("Public-key authentication failed")
                 };
-                write_message(&mut send, &response.encode().unwrap()).await.expect("reply");
+                write_message(&mut send, &response.encode().unwrap())
+                    .await
+                    .expect("reply");
                 conn.closed().await;
             });
 

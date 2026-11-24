@@ -121,8 +121,12 @@ pub fn overlap_error(
 /// not full-tunnel-exempt). When false the mid-session watcher has nothing
 /// that could ever conflict and need not run.
 pub fn has_refusable_routes(routes: &[Ipv4Net], routes6: &[Ipv6Net]) -> bool {
-    routes.iter().any(|r| r.prefix_len() > EXEMPT_MAX_PREFIX_LEN)
-        || routes6.iter().any(|r| r.prefix_len() > EXEMPT_MAX_PREFIX_LEN)
+    routes
+        .iter()
+        .any(|r| r.prefix_len() > EXEMPT_MAX_PREFIX_LEN)
+        || routes6
+            .iter()
+            .any(|r| r.prefix_len() > EXEMPT_MAX_PREFIX_LEN)
 }
 
 /// Two prefixes overlap iff one contains the other's network address.
@@ -170,8 +174,7 @@ mod tests {
 
     #[test]
     fn test_ipv4_conflict() {
-        let (route, local) =
-            split_tunnel_conflict(&v4(&["192.168.0.0/16"]), &[], &home()).unwrap();
+        let (route, local) = split_tunnel_conflict(&v4(&["192.168.0.0/16"]), &[], &home()).unwrap();
         assert_eq!(route.to_string(), "192.168.0.0/16");
         assert_eq!(local.net.to_string(), "192.168.1.0/24");
         assert_eq!(local.interface, "en0");

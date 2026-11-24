@@ -32,10 +32,10 @@ use ezvpn::config::file_config::{
 };
 use ezvpn::runtime::LockRole;
 use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
-use flexaccess_iroh::endpoint::CreatedEndpoint;
 use ezvpn::transport::{
     CongestionConfig, CongestionControl, parse_congestion_initial_window, set_congestion_config,
 };
+use flexaccess_iroh::endpoint::CreatedEndpoint;
 // Runtime config types (different from the TOML config types in config::file_config)
 use ezvpn::config::{VpnClientConfig, VpnServerConfig};
 use ezvpn::tunnel::{VpnClient, VpnServer};
@@ -824,7 +824,10 @@ async fn stop_client(instance: &str, json: bool) -> Result<()> {
     };
 
     // Confirm an instance is actually serving before signaling a PID.
-    if control::query_status(LockRole::Client, instance).await?.is_none() {
+    if control::query_status(LockRole::Client, instance)
+        .await?
+        .is_none()
+    {
         if json {
             return report(None, "not_running");
         }
@@ -848,7 +851,10 @@ async fn stop_client(instance: &str, json: bool) -> Result<()> {
     // Best-effort: wait briefly for the process to exit.
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if control::query_status(LockRole::Client, instance).await?.is_none() {
+        if control::query_status(LockRole::Client, instance)
+            .await?
+            .is_none()
+        {
             if json {
                 return report(Some(pid), "stopped");
             }
@@ -899,8 +905,7 @@ async fn show_list(role: LockRole, json: bool) -> Result<()> {
 
 /// Shown when the server has no client keys to authorize against — either no
 /// `authorized_keys_file` was configured, or the configured file held none.
-const NO_AUTHORIZED_KEYS_HELP: &str =
-    "VPN server requires at least one authorized client public key.\n\
+const NO_AUTHORIZED_KEYS_HELP: &str = "VPN server requires at least one authorized client public key.\n\
      Each client generates a keypair with: flexaccess-keys generate-auth-key -o <FILE>\n\
      Put each key's authorized-key entry (one `ed25519-pub:...` per line, from \
      `flexaccess-keys show-auth-key --private-key-file <FILE>`) in a file and set \
@@ -985,10 +990,12 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // for VPN traffic; relays are only the automatic fallback when a direct
     // connection fails. A single endpoint serves both relay modes; internet
     // discovery follows the mode (on for default relays, off for custom).
-    let CreatedEndpoint { endpoint, relays_left_out } =
-        create_server_endpoint(&resolved.relay_config, secret_key)
-            .await
-            .context("Failed to create iroh endpoint")?;
+    let CreatedEndpoint {
+        endpoint,
+        relays_left_out,
+    } = create_server_endpoint(&resolved.relay_config, secret_key)
+        .await
+        .context("Failed to create iroh endpoint")?;
 
     log::info!(
         "Clients connect with: ezvpn client start --server-node-id {} --auth-key-file <KEY FILE>",
@@ -1090,15 +1097,14 @@ async fn run_vpn_client(
     // Spawn the status control-socket listener. It outlives individual
     // connections (e.g. across reconnects); the guard stops it when we return.
     let status_handle = client.status_handle();
-    let _status_listener =
-        control::spawn_status_listener(LockRole::Client, instance, move || {
-            let status_handle = status_handle.clone();
-            async move { status_handle.snapshot().await }
-        });
+    let _status_listener = control::spawn_status_listener(LockRole::Client, instance, move || {
+        let status_handle = status_handle.clone();
+        async move { status_handle.snapshot().await }
+    });
     match &_status_listener {
-        Ok(_) => log::debug!(
-            "Status control socket ready (ezvpn client status --instance {instance})"
-        ),
+        Ok(_) => {
+            log::debug!("Status control socket ready (ezvpn client status --instance {instance})")
+        }
         Err(e) => log::warn!("Status control socket unavailable: {e}"),
     }
     let _status_listener = _status_listener.ok();
@@ -1164,13 +1170,22 @@ mod tests {
         assert_eq!(parse_log_max_bytes(Some(OsStr::new("  4096 "))), 4096);
         // Unset, empty, zero, and unparsable all fall back to the default.
         assert_eq!(parse_log_max_bytes(None), DAEMON_LOG_MAX_BYTES);
-        assert_eq!(parse_log_max_bytes(Some(OsStr::new(""))), DAEMON_LOG_MAX_BYTES);
-        assert_eq!(parse_log_max_bytes(Some(OsStr::new("0"))), DAEMON_LOG_MAX_BYTES);
+        assert_eq!(
+            parse_log_max_bytes(Some(OsStr::new(""))),
+            DAEMON_LOG_MAX_BYTES
+        );
+        assert_eq!(
+            parse_log_max_bytes(Some(OsStr::new("0"))),
+            DAEMON_LOG_MAX_BYTES
+        );
         assert_eq!(
             parse_log_max_bytes(Some(OsStr::new("not-a-number"))),
             DAEMON_LOG_MAX_BYTES
         );
-        assert_eq!(parse_log_max_bytes(Some(OsStr::new("-5"))), DAEMON_LOG_MAX_BYTES);
+        assert_eq!(
+            parse_log_max_bytes(Some(OsStr::new("-5"))),
+            DAEMON_LOG_MAX_BYTES
+        );
     }
 
     #[test]
@@ -1232,8 +1247,7 @@ mod tests {
         reader.join().unwrap();
 
         let active = std::fs::metadata(&log_path).expect("active log exists");
-        let backup =
-            std::fs::metadata(rotated_log_path(&log_path)).expect("rotated backup exists");
+        let backup = std::fs::metadata(rotated_log_path(&log_path)).expect("rotated backup exists");
         // Each file is bounded by the cap plus at most one buffer chunk.
         let bound = max_bytes + 16 * 1024;
         assert!(active.len() <= bound, "active {} too big", active.len());
@@ -1260,7 +1274,9 @@ mod tests {
 
         let reader = {
             let path = log_path.clone();
-            std::thread::spawn(move || drain_to_capped_log(std::fs::File::from(read_end), &path, 1024))
+            std::thread::spawn(move || {
+                drain_to_capped_log(std::fs::File::from(read_end), &path, 1024)
+            })
         };
 
         // More than the pipe buffer: if the writer had returned, these writes

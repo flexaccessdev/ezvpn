@@ -1168,7 +1168,10 @@ mod tests {
         let mut payload = Vec::new();
         for segment in segments {
             assert_tcp_checksum_valid(segment);
-            assert!(segment.len() <= header_len + gso_size, "segment exceeds MSS");
+            assert!(
+                segment.len() <= header_len + gso_size,
+                "segment exceeds MSS"
+            );
             let seq = u32::from_be_bytes(segment[24..28].try_into().unwrap());
             assert_eq!(seq, 10_000 + payload.len() as u32, "sequence gap");
             payload.extend_from_slice(&segment[header_len..]);
@@ -1701,9 +1704,4 @@ mod tests {
         assert!(assemble_tcp_gso_superframe(&mut out, &single).is_err());
         assert!(assemble_tcp_gso_superframe(&mut out, &[]).is_err());
     }
-
-
-
-
-
 }

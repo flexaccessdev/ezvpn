@@ -663,8 +663,14 @@ mod tests {
         let back: u8 = msg_type.into();
         assert_eq!(back, 0x01);
 
-        assert_eq!(DataMessageType::from_byte(0x02), Some(DataMessageType::Ping));
-        assert_eq!(DataMessageType::from_byte(0x03), Some(DataMessageType::Pong));
+        assert_eq!(
+            DataMessageType::from_byte(0x02),
+            Some(DataMessageType::Ping)
+        );
+        assert_eq!(
+            DataMessageType::from_byte(0x03),
+            Some(DataMessageType::Pong)
+        );
         assert_eq!(DataMessageType::Ping.as_byte(), 0x02);
         assert_eq!(DataMessageType::Pong.as_byte(), 0x03);
     }

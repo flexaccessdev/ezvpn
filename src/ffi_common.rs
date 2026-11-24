@@ -93,7 +93,10 @@ mod tests {
         assert_eq!(doc["custom_relays"][0]["error"], "timeout");
 
         let empty: serde_json::Value = serde_json::from_str(&conn_path_json(None)).unwrap();
-        assert_eq!(empty, serde_json::json!({ "paths": [], "custom_relays": [] }));
+        assert_eq!(
+            empty,
+            serde_json::json!({ "paths": [], "custom_relays": [] })
+        );
     }
 
     #[test]
