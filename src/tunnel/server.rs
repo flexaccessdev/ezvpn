@@ -18,7 +18,7 @@ use crate::error::{VpnError, VpnResult};
 use crate::runtime::{LockRole, VpnLock};
 use crate::tunnel::offload::VirtioNetHdr;
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
-use crate::transport::{HEARTBEAT_TIMEOUT, SERVER_ADDR_PUBLISH_INTERVAL};
+use crate::transport::{HANDSHAKE_TIMEOUT, HEARTBEAT_TIMEOUT, SERVER_ADDR_PUBLISH_INTERVAL};
 use crate::transport::endpoint::RelayConfig;
 use flexaccess_iroh::relay_failover::fail_over_home_relay;
 use crate::tunnel::signaling::{
@@ -29,19 +29,31 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
 use ipnet::{Ipv4Net, Ipv6Net};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId, RelayUrl, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::ReadBuf;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, oneshot};
 
 /// Maximum number of frames drained from a channel per batch.
 const WRITE_BATCH_SIZE: usize = 256;
+
+/// How many connections may be in their handshake at once: accepted, and not
+/// yet authenticated. `max_clients` counts sessions, which a connection
+/// becomes only once its key has been checked. Until then this bounds how
+/// many there are and [`HANDSHAKE_TIMEOUT`] how long each lasts; a connection
+/// arriving beyond them waits to be accepted.
+///
+/// A connection can be made to hold about 12 MiB before it has authenticated
+/// (see [`HANDSHAKE_TIMEOUT`]), so this many hold about 770 MiB at most. A
+/// handshake takes milliseconds, so 64 at a time does not slow clients that
+/// all reconnect after a server restart.
+const MAX_PENDING_HANDSHAKES: usize = 64;
 
 /// Per-client control-stream queue depth (`ServerAddrs` and `Pong` frames).
 const CONTROL_CHANNEL_SIZE: usize = 1024;
@@ -1065,14 +1077,32 @@ impl VpnServer {
             );
         }
 
-        while let Some(incoming) = endpoint.accept().await {
+        let handshake_slots = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
+        loop {
+            // Taken before accepting, so connections beyond the limit wait
+            // here rather than each getting a task. The semaphore lives for
+            // this loop and is never closed.
+            let handshake_slot = handshake_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("handshake semaphore is never closed");
+            let Some(incoming) = endpoint.accept().await else {
+                break;
+            };
             let server = self.clone();
             let tun_write_tx = tun_write_tx.clone();
             let local_iroh_udp_ports = local_iroh_udp_ports.clone();
             let endpoint = endpoint.clone();
             tokio::spawn(async move {
                 if let Err(e) = server
-                    .handle_connection(incoming, tun_write_tx, local_iroh_udp_ports, endpoint)
+                    .handle_connection(
+                        incoming,
+                        handshake_slot,
+                        tun_write_tx,
+                        local_iroh_udp_ports,
+                        endpoint,
+                    )
                     .await
                 {
                     log::error!("Connection error: {}", e);
@@ -1123,31 +1153,19 @@ impl VpnServer {
         true
     }
 
-    /// Handle an incoming VPN connection.
+    /// Handle an incoming VPN connection. `handshake_slot` is its place among
+    /// the [`MAX_PENDING_HANDSHAKES`], given up once it has authenticated.
     async fn handle_connection(
         &self,
-        incoming: iroh::endpoint::Incoming,
+        incoming: Incoming,
+        handshake_slot: OwnedSemaphorePermit,
         tun_write_tx: mpsc::Sender<TunWriteRequest>,
         local_iroh_udp_ports: Arc<HashSet<u16>>,
         endpoint: Endpoint,
     ) -> VpnResult<()> {
-        let connection = incoming
-            .await
-            .map_err(|e| VpnError::Signaling(format!("Failed to accept connection: {}", e)))?;
-
+        let (connection, mut send, recv, handshake) =
+            receive_handshake(incoming, HANDSHAKE_TIMEOUT).await?;
         let remote_id = connection.remote_id();
-        log::debug!("New VPN connection from {}", remote_id);
-
-        // Accept the handshake bi-stream; it stays open as the data stream
-        // once the handshake response is written.
-        let (mut send, mut recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| VpnError::Signaling(format!("Failed to accept stream: {}", e)))?;
-
-        // Read handshake
-        let handshake_data = read_message(&mut recv, MAX_HANDSHAKE_SIZE).await?;
-        let handshake = VpnHandshake::decode(&handshake_data)?;
 
         log::debug!(
             "Received handshake from {} for device {}",
@@ -1158,14 +1176,22 @@ impl VpnServer {
         // Verify the client's public-key credential. Failures are logged with
         // the specific reason; the wire rejection stays generic.
         if !self.verify_client_auth(&handshake.auth, &remote_id) {
-            let response = VpnHandshakeResponse::rejected("Public-key authentication failed");
-            write_message(&mut send, &response.encode()?).await?;
+            // Bounded like the handshake: this peer decides how much the
+            // stream may carry, and one that allows nothing would hold the
+            // reply, and its handshake slot, for as long as it liked.
+            let response = VpnHandshakeResponse::rejected("Public-key authentication failed").encode()?;
+            if let Ok(written) =
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, write_message(&mut send, &response)).await
+            {
+                written?;
+            }
             let _ = send.finish();
             return Err(VpnError::Signaling(
                 "Public-key authentication failed".into(),
             ));
         }
         log::debug!("Client {} authenticated", remote_id);
+        drop(handshake_slot);
 
         // Monitor and report connection path changes (e.g., relay -> direct)
         let _path_watcher =
@@ -1206,7 +1232,8 @@ impl VpnServer {
     /// Inner connection handler - separated to ensure atomic counter cleanup.
     ///
     /// `send`/`recv` are the handshake bi-stream halves; after the handshake
-    /// response is written they carry the length-prefixed data frames.
+    /// response is written they are the control stream (heartbeats and
+    /// server-address publications).
     #[allow(clippy::too_many_arguments)]
     async fn handle_connection_inner(
         &self,
@@ -1324,7 +1351,7 @@ impl VpnServer {
             self.config.network6,
         ));
 
-        // The stream stays open past the response: it now carries data frames.
+        // The stream stays open past the response, as the control stream.
         write_message(&mut send, &response.encode()?).await?;
 
         // Log connection based on what was assigned
@@ -1662,11 +1689,11 @@ impl VpnServer {
         }
     }
 
-    /// Handle client data stream.
+    /// Handle a client's inbound data.
     ///
-    /// This function reads inbound frames from the client's data stream and
-    /// routes their IP packets to the TUN writer. It exits when either:
-    /// - The client disconnects (stream read errors / connection closes)
+    /// This function reads the client's datagrams and routes their IP
+    /// packets to the TUN writer. It exits when either:
+    /// - The client disconnects (datagram read errors / connection closes)
     /// - The writer task fails (error received via writer_error_rx)
     ///
     /// TUN writes are sent through the `tun_write_tx` channel to a dedicated writer task,
@@ -2144,7 +2171,7 @@ fn ip_in_overlay(ip: IpAddr, overlay_v4: Option<Ipv4Net>, overlay_v6: Option<Ipv
 }
 
 /// Publish the server's current candidate underlay addresses to one client over
-/// the data stream.
+/// the control stream.
 ///
 /// Returns `Err(())` only when the client's writer receiver is gone (the
 /// connection is being torn down), which tells the caller to stop publishing.
@@ -2190,11 +2217,37 @@ async fn publish_server_addrs(
     }
 }
 
-/// Periodically publish the server's candidate iroh underlay addresses to one
-/// client (see [`publish_server_addrs`]): once immediately, then every
-/// [`SERVER_ADDR_PUBLISH_INTERVAL`] for loss tolerance, and promptly whenever
-/// the local address set changes ([`Endpoint::watch_addr`]). Ends when the
-/// connection closes or the client's writer is gone.
+/// Take a new connection as far as its client's handshake message: the QUIC
+/// handshake, the stream the client opens (which stays open as the control
+/// stream), and the message on it, all within `limit`. Running out of time
+/// drops the connection, which closes it.
+async fn receive_handshake(
+    incoming: Incoming,
+    limit: Duration,
+) -> VpnResult<(Connection, SendStream, RecvStream, VpnHandshake)> {
+    tokio::time::timeout(limit, async {
+        let connection = incoming
+            .await
+            .map_err(|e| VpnError::Signaling(format!("Failed to accept connection: {}", e)))?;
+        log::debug!("New VPN connection from {}", connection.remote_id());
+
+        let (send, mut recv) = connection
+            .accept_bi()
+            .await
+            .map_err(|e| VpnError::Signaling(format!("Failed to accept stream: {}", e)))?;
+        let handshake_data = read_message(&mut recv, MAX_HANDSHAKE_SIZE).await?;
+        let handshake = VpnHandshake::decode(&handshake_data)?;
+        Ok((connection, send, recv, handshake))
+    })
+    .await
+    .map_err(|_| {
+        VpnError::Signaling(format!(
+            "No handshake within {}s of a connection arriving",
+            limit.as_secs()
+        ))
+    })?
+}
+
 /// Read the client's control stream: echo each heartbeat `Ping` as a `Pong`
 /// (queued on the control writer), and close the connection once no `Ping` has
 /// arrived for [`HEARTBEAT_TIMEOUT`] — other frames do not extend the deadline.
@@ -2244,6 +2297,11 @@ async fn run_heartbeat_responder(
     }
 }
 
+/// Periodically publish the server's candidate iroh underlay addresses to one
+/// client (see [`publish_server_addrs`]): once immediately, then every
+/// [`SERVER_ADDR_PUBLISH_INTERVAL`] for loss tolerance, and promptly whenever
+/// the local address set changes ([`Endpoint::watch_addr`]). Ends when the
+/// connection closes or the client's writer is gone.
 async fn run_server_addr_publisher(
     endpoint: Endpoint,
     connection: Connection,
@@ -3192,5 +3250,65 @@ mod tests {
 
         // With no overlay configured, nothing is excluded.
         assert!(!ip_in_overlay("10.99.0.1".parse().unwrap(), None, None));
+    }
+
+    /// A loopback endpoint configured as a tunnel's `side` is, with no relays.
+    async fn loopback_endpoint(side: iroh::endpoint::Side) -> Endpoint {
+        Endpoint::builder(iroh::endpoint::presets::Empty)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .transport_config(crate::transport::build_quic_transport_config(side).unwrap())
+            .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .alpns(vec![crate::tunnel::signaling::VPN_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// A connection whose client sends no handshake is dropped when the limit
+    /// is up, whether the client opened no stream or stopped partway into its
+    /// message.
+    #[tokio::test]
+    async fn test_connection_without_handshake_is_dropped() {
+        const LIMIT: Duration = Duration::from_millis(300);
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        for partial_message in [false, true] {
+            let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+            let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+            let acceptor = server.clone();
+            let received = tokio::spawn(async move {
+                let incoming = acceptor.accept().await.expect("incoming connection");
+                receive_handshake(incoming, LIMIT).await.map(|_| ())
+            });
+
+            let conn = client
+                .connect(server.addr(), crate::tunnel::signaling::VPN_ALPN)
+                .await
+                .expect("connect to server");
+            // Three of the four bytes of a length prefix.
+            let _stream = if partial_message {
+                let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+                send.write_all(&[0, 0, 0]).await.expect("write partial prefix");
+                Some((send, recv))
+            } else {
+                None
+            };
+
+            let result = tokio::time::timeout(PATIENCE, received)
+                .await
+                .expect("the wait for a handshake never ended")
+                .expect("server task");
+            assert!(
+                matches!(result, Err(VpnError::Signaling(ref m)) if m.contains("No handshake within")),
+                "partial_message={partial_message}: {result:?}"
+            );
+            // `server` is still held here, so what closes the connection is
+            // the server dropping it, not its endpoint going away.
+            tokio::time::timeout(PATIENCE, conn.closed())
+                .await
+                .expect("the server kept a connection that sent no handshake");
+            client.close().await;
+            server.close().await;
+        }
     }
 }

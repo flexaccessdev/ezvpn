@@ -55,8 +55,9 @@ pub const FRAME_LEN_PREFIX: usize = 4;
 
 /// Maximum control-frame body size (the length the prefix may carry).
 ///
-/// The control channel only carries `ServerAddrs` JSON, which is small, but the
-/// cap is kept generous (and the receive buffer sized to it once). A peer
+/// The control channel only carries `ServerAddrs` JSON and heartbeats, which
+/// are small, but the cap is kept generous (and the receive buffer sized to
+/// it once). A peer
 /// announcing a larger frame is violating the protocol, and since stream framing
 /// cannot resynchronize past a corrupt length, the connection is torn down.
 pub const MAX_FRAME_BODY: usize = 2 + VIRTIO_NET_HDR_LEN + u16::MAX as usize;

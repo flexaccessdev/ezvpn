@@ -1,8 +1,9 @@
 //! QUIC transport configuration shared by client and server endpoint setup.
 //!
 //! All transport settings are fixed constants, WireGuard/Tailscale-style:
-//! there are no tuning knobs, nothing is negotiated, and both sides build the
-//! identical config from [`build_quic_transport_config`].
+//! there are no tuning knobs, nothing is negotiated, and both sides build
+//! their config from [`build_quic_transport_config`], alike but for the
+//! streams each grants the other.
 //!
 //! The single exception is congestion control, which the CLI can override with
 //! `--congestion-control` and `--congestion-initial-window` (see
@@ -17,7 +18,7 @@ pub mod path_selector;
 pub mod paths;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, VarInt};
+use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, Side, VarInt};
 use noq_proto::congestion::{Bbr3Config, ControllerFactory, CubicConfig, NewRenoConfig};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -70,8 +71,23 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// late reply on a lossy path never trips it.
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the handshake may take once a connection exists: for the server,
+/// from a connection arriving to its client's handshake message; for the
+/// client, from opening the control stream to the server's answer.
+///
+/// Neither wait ends by itself. Keep-alives hold a connection open for as long
+/// as the peer acknowledges them, so a peer that connects and then says
+/// nothing would otherwise stay connected for good. On the server that is a
+/// peer that has not authenticated, holding whatever it has sent (up to
+/// [`QUIC_WINDOW_SIZE`] of stream data and
+/// [`QUIC_DATAGRAM_RECEIVE_BUFFER_SIZE`] of datagrams). On the client it
+/// stalls the reconnect loop, as a connect with no deadline would (see
+/// `CONNECT_TIMEOUT` in [`endpoint`]). A healthy handshake is one small
+/// message each way.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Interval at which the server re-publishes its candidate iroh underlay
-/// addresses to each connected client (on the data stream).
+/// addresses to each connected client (on the control stream).
 ///
 /// The server also publishes once immediately on connect and promptly whenever
 /// `Endpoint::watch_addr()` reports a change; this interval is the recovery
@@ -284,15 +300,21 @@ pub fn congestion_config() -> CongestionConfig {
     *CONGESTION_CONFIG.get_or_init(CongestionConfig::default)
 }
 
-/// Build the fixed QUIC transport config used by both client and server.
+/// Build the fixed QUIC transport config for one side of a tunnel.
 ///
 /// Every setting is a constant: Cubic congestion control, 8 MB windows, the
-/// keep-alive/idle timers above, and the protocol-minimum initial MTU. Both
-/// sides applying the identical config means nothing has to be negotiated. The
+/// keep-alive/idle timers above, and an initial MTU that fits a full inner
+/// packet ([`QUIC_INITIAL_MTU`]), so nothing has to be negotiated. The
 /// congestion controller is the one setting the CLI can change (see
 /// [`set_congestion_config`]); it is sender-local, so it stays outside the
 /// protocol even when the two ends differ.
-pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
+///
+/// What differs by `side` is the streams a peer is granted, which are the one
+/// a tunnel uses and no others: a client opens the control stream to its
+/// server, so a server grants one bidirectional stream and a client none, and
+/// neither grants unidirectional ones. QUIC's default is 100 of each kind
+/// from either end.
+pub fn build_quic_transport_config(side: Side) -> Result<QuicTransportConfig> {
     // Configure transport with keep-alive and idle timeout.
     // See QUIC_KEEP_ALIVE_INTERVAL and QUIC_IDLE_TIMEOUT constants for rationale.
     let mut transport_config = QuicTransportConfig::builder();
@@ -320,6 +342,14 @@ pub fn build_quic_transport_config() -> Result<QuicTransportConfig> {
     transport_config = transport_config.receive_window(QUIC_WINDOW_SIZE.into());
     transport_config = transport_config.stream_receive_window(QUIC_WINDOW_SIZE.into());
     transport_config = transport_config.send_window(QUIC_WINDOW_SIZE.into());
+
+    // Streams the peer may open: the control stream, from client to server.
+    let peer_bidi_streams = match side {
+        Side::Server => 1u32,
+        Side::Client => 0u32,
+    };
+    transport_config = transport_config.max_concurrent_bidi_streams(peer_bidi_streams.into());
+    transport_config = transport_config.max_concurrent_uni_streams(0u32.into());
 
     // Start large enough for the fixed inner MTU (see QUIC_INITIAL_MTU).
     // Discovery config and min_mtu keep their defaults, including downward

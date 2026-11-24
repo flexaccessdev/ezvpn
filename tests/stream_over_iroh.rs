@@ -16,7 +16,10 @@ use ezvpn::tunnel::stream::{
     DatagramSendOutcome, Frame, MAX_FRAME_BODY, classify, encode_server_addrs_frame, read_frame,
     prepare_ip_datagrams, send_datagram_batch, write_frames,
 };
-use iroh::{Endpoint, RelayMode, endpoint::presets};
+use iroh::{
+    Endpoint, RelayMode,
+    endpoint::{Side, presets},
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -48,10 +51,10 @@ async fn send_ip_packet(
     outcome
 }
 
-async fn bind_endpoint() -> Endpoint {
+async fn bind_endpoint(side: Side) -> Endpoint {
     Endpoint::builder(presets::Empty)
         .relay_mode(RelayMode::Disabled)
-        .transport_config(build_quic_transport_config().expect("transport config"))
+        .transport_config(build_quic_transport_config(side).expect("transport config"))
         .crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .alpns(vec![TEST_ALPN.to_vec()])
         .bind()
@@ -63,8 +66,8 @@ async fn bind_endpoint() -> Endpoint {
 /// intact; a packet larger than the live datagram size is dropped, not sent.
 #[tokio::test]
 async fn ip_packets_roundtrip_as_datagrams() {
-    let server = bind_endpoint().await;
-    let client = bind_endpoint().await;
+    let server = bind_endpoint(Side::Server).await;
+    let client = bind_endpoint(Side::Client).await;
     let server_addr = server.addr();
 
     // Echo server: accept one connection, echo every datagram back verbatim
@@ -148,8 +151,8 @@ async fn datagram_backpressure_preserves_queued_packets() {
     const PACKET_COUNT: u32 = 512;
     const PACKET_SIZE: usize = 900;
 
-    let server = bind_endpoint().await;
-    let client = bind_endpoint().await;
+    let server = bind_endpoint(Side::Server).await;
+    let client = bind_endpoint(Side::Client).await;
     let server_addr = server.addr();
 
     let accept_task = spawn_sequence_receiver(server, PACKET_COUNT);
@@ -193,8 +196,8 @@ async fn datagram_batch_waits_instead_of_evicting() {
     const PACKET_COUNT: u32 = 1024;
     const PACKET_SIZE: usize = 900;
 
-    let server = bind_endpoint().await;
-    let client = bind_endpoint().await;
+    let server = bind_endpoint(Side::Server).await;
+    let client = bind_endpoint(Side::Client).await;
     let server_addr = server.addr();
     let accept_task = spawn_sequence_receiver(server, PACKET_COUNT);
 
@@ -300,8 +303,8 @@ async fn check_sequences_flowed(accept_task: JoinHandle<Vec<u32>>, sent: u32, pa
 /// A `ServerAddrs` control frame round-trips over the reliable stream.
 #[tokio::test]
 async fn server_addrs_frame_roundtrips_over_stream() {
-    let server = bind_endpoint().await;
-    let client = bind_endpoint().await;
+    let server = bind_endpoint(Side::Server).await;
+    let client = bind_endpoint(Side::Client).await;
     let server_addr = server.addr();
 
     let addrs_msg = ServerAddrsMsg::new(vec!["203.0.113.9".parse().expect("addr")]);
@@ -354,5 +357,51 @@ async fn server_addrs_frame_roundtrips_over_stream() {
 
     conn.close(0u32.into(), b"done");
     accept_task.await.expect("server task");
+    client.close().await;
+}
+
+/// A peer may open the control stream and nothing else: a client opens one
+/// bidirectional stream to its server at once, where a second one, a
+/// unidirectional stream from either end, or any stream from the server,
+/// waits.
+#[tokio::test]
+async fn a_peer_is_granted_only_the_control_stream() {
+    const WAIT: Duration = Duration::from_millis(500);
+
+    let server = bind_endpoint(Side::Server).await;
+    let client = bind_endpoint(Side::Client).await;
+    let server_addr = server.addr();
+
+    let from_server = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("incoming connection");
+        let conn = incoming.await.expect("accept connection");
+        let bi = matches!(tokio::time::timeout(WAIT, conn.open_bi()).await, Ok(Ok(_)));
+        let uni = matches!(tokio::time::timeout(WAIT, conn.open_uni()).await, Ok(Ok(_)));
+        conn.closed().await;
+        (bi, uni)
+    });
+
+    let conn = client
+        .connect(server_addr, TEST_ALPN)
+        .await
+        .expect("connect to server");
+    let _control = tokio::time::timeout(Duration::from_secs(10), conn.open_bi())
+        .await
+        .expect("the control stream waited")
+        .expect("open_bi");
+    let second = tokio::time::timeout(WAIT, conn.open_bi()).await;
+    assert!(second.is_err(), "the client opened a second bidirectional stream");
+    let uni = tokio::time::timeout(WAIT, conn.open_uni()).await;
+    assert!(uni.is_err(), "the client opened a unidirectional stream");
+
+    // Past both of the server's waits before the connection goes.
+    tokio::time::sleep(WAIT).await;
+    conn.close(0u32.into(), b"done");
+    let (bi, uni) = tokio::time::timeout(Duration::from_secs(10), from_server)
+        .await
+        .expect("server task ended")
+        .expect("server task");
+    assert!(!bi, "the server opened a bidirectional stream");
+    assert!(!uni, "the server opened a unidirectional stream");
     client.close().await;
 }
