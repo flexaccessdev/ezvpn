@@ -50,10 +50,12 @@ impl EventTarget {
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if
 /// the full string fit, `false` if it was truncated or the buffer was unusable.
 ///
-/// The caller passes on its own FFI contract: `buf` points to at least `len`
-/// writable bytes, or is null.
+/// # Safety
+/// Unless `buf` is null or `len` is 0 (then nothing is written), `buf` must be
+/// valid for writes of `len` bytes, and those bytes must not overlap `s`. The
+/// FFI exports pass on their own `out_buf`/`out_len` contract.
 #[cfg(any(test, target_os = "ios", target_os = "macos", target_os = "windows"))]
-pub(crate) fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
+pub(crate) unsafe fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
     if buf.is_null() || len == 0 {
         return false;
     }
@@ -223,23 +225,23 @@ mod tests {
         const FILL: c_char = 0x55;
 
         let mut exact = vec![FILL; 7];
-        assert!(write_cstr(exact.as_mut_ptr(), exact.len(), "abcdef"));
+        assert!(unsafe { write_cstr(exact.as_mut_ptr(), exact.len(), "abcdef") });
         assert_eq!(cstr(&exact), "abcdef");
 
         let mut short = vec![FILL; 7];
-        assert!(!write_cstr(short.as_mut_ptr(), short.len(), "abcdefg"));
+        assert!(!unsafe { write_cstr(short.as_mut_ptr(), short.len(), "abcdefg") });
         assert_eq!(cstr(&short), "abcdef");
 
         let mut nul_only = vec![FILL; 1];
-        assert!(!write_cstr(nul_only.as_mut_ptr(), nul_only.len(), "abc"));
+        assert!(!unsafe { write_cstr(nul_only.as_mut_ptr(), nul_only.len(), "abc") });
         assert_eq!(nul_only[0], 0);
-        assert!(write_cstr(nul_only.as_mut_ptr(), nul_only.len(), ""));
+        assert!(unsafe { write_cstr(nul_only.as_mut_ptr(), nul_only.len(), "") });
 
         // Unusable buffers are left alone.
         let mut untouched = vec![FILL; 4];
-        assert!(!write_cstr(untouched.as_mut_ptr(), 0, "abc"));
+        assert!(!unsafe { write_cstr(untouched.as_mut_ptr(), 0, "abc") });
         assert_eq!(untouched, vec![FILL; 4]);
-        assert!(!write_cstr(std::ptr::null_mut(), 8, "abc"));
+        assert!(!unsafe { write_cstr(std::ptr::null_mut(), 8, "abc") });
     }
 
     type Seen = Mutex<Vec<(c_int, Option<String>)>>;
