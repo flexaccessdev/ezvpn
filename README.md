@@ -12,9 +12,13 @@ first ping through the tunnel: [flexaccess.dev/ezvpn#demo](https://flexaccess.de
 
 > [!WARNING]
 > While `ezvpn` remains in the `0.0.x` series, there is no backward
-> compatibility between versions. Keep clients and servers on the same release,
-> refresh configs from the current examples, and regenerate the server identity
-> key as a fallback if the upgraded deployment still cannot connect. Regenerating
+> compatibility between protocol versions. A client and a server work together
+> when they speak the same protocol version (`VPN_PROTOCOL_VERSION` in
+> `src/tunnel/signaling.rs`, also the number in the `ezvpn/<n>` ALPN), whatever
+> their release numbers; the release number itself is never compared. When an
+> upgrade bumps the protocol version, upgrade both sides, refresh configs from
+> the current examples, and regenerate the server identity key as a fallback if
+> the upgraded deployment still cannot connect. Regenerating
 > the key changes the server `EndpointId`, so update every client profile with the
 > new ID.
 
