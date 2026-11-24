@@ -80,14 +80,21 @@ impl PendingHandshake {
                 HANDSHAKE_TIMEOUT.as_secs()
             ))
         };
-        // The deadline is looked at first each time: a timeout polls what it
-        // bounds before its timer, so a write that began late, or that the
-        // stream took only after the deadline, would still go through.
-        tokio::select! {
-            biased;
-            () = tokio::time::sleep_until(self.deadline) => Err(too_late()),
-            written = write_message(send, &response) => written,
-        }
+        // The clock is read before each poll of the write. A timeout polls
+        // what it bounds before its timer, and a timer is rounded up to the
+        // next millisecond, so with either alone a write that began late, or
+        // that the stream took only after the deadline, could still go
+        // through. The timer is what wakes a write that stays blocked.
+        let write = write_message(send, &response);
+        let expiry = tokio::time::sleep_until(self.deadline);
+        tokio::pin!(write, expiry);
+        std::future::poll_fn(|cx| {
+            if tokio::time::Instant::now() >= self.deadline || expiry.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(Err(too_late()));
+            }
+            write.as_mut().poll(cx)
+        })
+        .await
     }
 
     /// Turn the client away with `response`, and wait until it has the reply
@@ -305,6 +312,20 @@ impl<A: Copy> Lease<A> {
 struct Route {
     client: (EndpointId, u64),
     session_id: u64,
+}
+
+/// The session a route leads to: its client's current one, if that is the
+/// session the address was assigned to. A newer session of the client need
+/// not have been assigned every address an older one still holds (a pool can
+/// run out, or free up, between their handshakes), and it is not sent the
+/// packets for one it was not.
+fn routed_session(
+    clients: &DashMap<(EndpointId, u64), ClientState>,
+    route: Route,
+) -> Option<(Connection, ClientDatagramQueue)> {
+    let state = clients.get(&route.client)?;
+    (state.session_id == route.session_id)
+        .then(|| (state.connection.clone(), state.datagram_tx.clone()))
 }
 
 /// Remove `session_id`'s entry for `ip`, and no other session's.
@@ -2023,9 +2044,9 @@ impl VpnServer {
 
             // Extract destination IP from packet (IPv4 or IPv6)
             // DashMap lookups are lock-free - no async await needed
-            let (endpoint_id, device_id) = match extract_dest_ip(packet_ref) {
+            let route = match extract_dest_ip(packet_ref) {
                 Some(PacketIp::V4(dest_ip)) => {
-                    match self.ip_to_endpoint.get(&dest_ip).map(|r| r.client) {
+                    match self.ip_to_endpoint.get(&dest_ip).map(|r| *r) {
                         Some(res) => res,
                         None => {
                             self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
@@ -2033,8 +2054,7 @@ impl VpnServer {
                         }
                     }
                 }
-                Some(PacketIp::V6(dest_ip)) => match self.ip6_to_endpoint.get(&dest_ip).map(|r| r.client)
-                {
+                Some(PacketIp::V6(dest_ip)) => match self.ip6_to_endpoint.get(&dest_ip).map(|r| *r) {
                     Some(res) => res,
                     None => {
                         self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
@@ -2049,16 +2069,11 @@ impl VpnServer {
                 }
             };
 
-            let client_key = (endpoint_id, device_id);
-
             // Look up the destination client's connection (lock-free DashMap
             // read) and send the packet as unreliable datagram(s).
-            let (connection, datagram_tx) = match self.clients.get(&client_key) {
-                Some(c) => (c.connection.clone(), c.datagram_tx.clone()),
-                None => {
-                    self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+            let Some((connection, datagram_tx)) = routed_session(&self.clients, route) else {
+                self.stats.packets_no_route.fetch_add(1, Ordering::Relaxed);
+                continue;
             };
 
             Self::queue_client_datagrams(
@@ -3591,15 +3606,19 @@ mod tests {
             let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
             let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
             let slots = Arc::new(Semaphore::new(1));
-            let limit = if late { Duration::ZERO } else { PATIENCE };
 
             let accepting = server.clone();
             let rejected = tokio::spawn(async move {
                 let incoming = accepting.accept().await.expect("incoming");
-                let (incoming, pending) =
-                    admit_handshake(incoming, &slots, limit).expect("a free place");
+                let (incoming, mut pending) =
+                    admit_handshake(incoming, &slots, PATIENCE).expect("a free place");
                 let connection = incoming.await.expect("accept");
                 let (mut send, _recv) = connection.accept_bi().await.expect("accept_bi");
+                if late {
+                    // Only just past: a timer alone is not yet due, since
+                    // timers are rounded up to the next millisecond.
+                    pending.deadline = tokio::time::Instant::now();
+                }
                 // The connection is dropped as this returns, as in the server.
                 pending.reject(&mut send, VpnHandshakeResponse::rejected("not you")).await
             });
@@ -3631,5 +3650,42 @@ mod tests {
             client.close().await;
             server.close().await;
         }
+    }
+
+    /// A route leads to its client's session only while that is the session
+    /// the address was assigned to.
+    #[tokio::test]
+    async fn test_route_of_another_session_is_not_followed() {
+        let server = loopback_endpoint(iroh::endpoint::Side::Server).await;
+        let client = loopback_endpoint(iroh::endpoint::Side::Client).await;
+        let (connected, incoming) = tokio::join!(
+            client.connect(server.addr(), crate::tunnel::signaling::VPN_ALPN),
+            async { server.accept().await.expect("incoming").await }
+        );
+        let _client_conn = connected.expect("connect");
+        let connection = incoming.expect("accept");
+
+        let key = (connection.remote_id(), 1);
+        let clients = DashMap::new();
+        let (datagram_tx, _datagram_rx) = ClientDatagramQueue::new();
+        clients.insert(
+            key,
+            ClientState {
+                session_id: 2,
+                assigned_ip: None,
+                assigned_ip6: Some("fd00::2".parse().unwrap()),
+                connection,
+                datagram_tx,
+            },
+        );
+
+        // An address the older session 1 still holds, and session 2 was not given.
+        assert!(routed_session(&clients, Route { client: key, session_id: 1 }).is_none());
+        assert!(routed_session(&clients, Route { client: key, session_id: 2 }).is_some());
+        let stranger = (random_endpoint_id(), 1);
+        assert!(routed_session(&clients, Route { client: stranger, session_id: 2 }).is_none());
+
+        client.close().await;
+        server.close().await;
     }
 }
