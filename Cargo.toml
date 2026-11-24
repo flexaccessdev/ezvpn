@@ -108,7 +108,7 @@ panic = "abort"
 # Forked from iroh v1.5.0. Preserves established-path transport backpressure so
 # noq retains and retries the transmit instead of treating a local discard as
 # successful, and wraps the noq fork's `try_send_many_datagrams`.
-iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send-backpressure-1.5.0" }
+iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-1.5.0" }
 # Forked from noq v1.5.0. Stamps each received batch as it is read rather than
 # once per endpoint-driver poll, and makes BBRv3 skip a non-positive RTT
 # sample: a stale receive timestamp read as a zero RTT, which the 10 s min-RTT
@@ -128,9 +128,9 @@ iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-send
 # syscalls, and packs up to 32 datagrams into one GSO send where upstream
 # stops at 10 (see docs/Architecture.md, "Throughput Design"). All three
 # crates come from the fork so the graph holds a single `noq-udp`.
-noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
-noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
-noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rtt-sample-fixes-1.5.0" }
+noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-1.5.0" }
+noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-1.5.0" }
+noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-1.5.0" }
 # Forked from netwatch v0.20.2 (n0-computer/net-tools). Sizes iroh's UDP
 # socket buffers with SO_RCVBUFFORCE/SO_SNDBUFFORCE when the process holds
 # CAP_NET_ADMIN (the VPN runs as root), so Linux's default
@@ -144,4 +144,4 @@ noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-rt
 # multi-queue NIC with XPS an unconnected socket's queue follows the sending
 # thread's CPU, which reorders the tunnel's packets (see docs/Architecture.md,
 # "Throughput Design").
-netwatch = { git = "https://github.com/flexaccessdev/net-tools.git", branch = "ezvpn-bufforce-0.20.2" }
+netwatch = { git = "https://github.com/flexaccessdev/net-tools.git", branch = "ezvpn-0.20.2" }

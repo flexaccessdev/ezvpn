@@ -37,7 +37,9 @@ files) belong in `src/transport/` and `src/auth.rs`. ezvpn depends on forks of
 iroh, noq (noq, noq-proto, noq-udp) and netwatch, all under the
 `flexaccessdev` org (clones in `../iroh`, `../noq`, `../net-tools`),
 one `ezvpn-*` branch each
-on top of the upstream release. They are applied through `[patch.crates-io]` in
+on top of the upstream release and named for it: `ezvpn-1.5.0` in iroh and in
+noq, `ezvpn-0.20.2` in net-tools. When upstream releases, rebase onto it as a
+new branch named for that release. They are applied through `[patch.crates-io]` in
 `Cargo.toml` rather than as git dependencies, so that every crate in the graph,
 the shared crate's `iroh` included, resolves to them. Fix transport-stack bugs
 on those branches and bump `Cargo.lock` here; the `Cargo.toml` comments say what
