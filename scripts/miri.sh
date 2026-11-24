@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 toolchain="${MIRI_TOOLCHAIN:-nightly-2026-10-31}"
-rustup component add --toolchain "$toolchain" miri rust-src >/dev/null
+rustup toolchain install "$toolchain" --profile minimal --component miri,rust-src >/dev/null
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation}"
 # sha2 picks the CPU's SHA instructions at runtime, whose intrinsics Miri does
 # not implement on aarch64; its portable backend computes the same digests.

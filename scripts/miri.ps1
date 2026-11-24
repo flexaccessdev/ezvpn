@@ -14,13 +14,16 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $repo
 
 $toolchain = if ($env:MIRI_TOOLCHAIN) { $env:MIRI_TOOLCHAIN } else { 'nightly-2026-10-31' }
-& rustup component add --toolchain $toolchain miri rust-src *> $null
-if ($LASTEXITCODE -ne 0) { throw "rustup could not add miri to $toolchain" }
+& rustup toolchain install $toolchain --profile minimal --component miri,rust-src *> $null
+if ($LASTEXITCODE -ne 0) { throw "rustup could not install $toolchain with miri" }
 
 $lib = Get-Content (Join-Path $PSScriptRoot 'miri-tests.txt') |
     Where-Object { $_ -match '^lib\s+(\S+)' } | ForEach-Object { $Matches[1] }
 
-$build = Join-Path $repo 'target\miri-windows'
+# Under the caller's CARGO_TARGET_DIR when it sets one (the CI VM's is a
+# restored build cache), else the repo's target dir.
+$base = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repo 'target' }
+$build = Join-Path $base 'miri-windows'
 New-Item -ItemType Directory -Force -Path $build | Out-Null
 $used = (Get-PSDrive -PSProvider FileSystem).Name
 $letter = [char[]]'MNOPQRSTUVWXYZ' | Where-Object { "$_" -notin $used } | Select-Object -First 1

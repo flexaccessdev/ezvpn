@@ -1,13 +1,15 @@
 # The Windows jobs from .github/workflows/ci.yml, in the same order, with the
 # same flags: `windows` (clippy, which compiles the Windows-gated
-# src/ffi_windows.rs) and `verify-windows-dll` (build-windows.ps1 -Profile
-# debug). When this file and that workflow disagree, the workflow is right and
-# this is stale — it exists to say what CI will say before CI is asked.
+# src/ffi_windows.rs), `verify-windows-dll` (build-windows.ps1 -Profile debug)
+# and the Windows leg of `miri` (scripts/miri.ps1). When this file and that
+# workflow disagree, the workflow is right and this is stale — it exists to say
+# what CI will say before CI is asked.
 #
 # This runs natively on whatever Windows machine it is invoked on: the CI VM
 # (see ci\windows\remote.ps1, which hands it a CARGO_TARGET_DIR restored from
 # devtools' restic build cache) or a dev box. It installs nothing beyond what
-# build-windows.ps1 does (a missing rustup target).
+# build-windows.ps1 does (a missing rustup target) and what scripts/miri.ps1
+# does (its pinned nightly with Miri).
 #
 # A non-zero exit from a native command is not an error to PowerShell on its
 # own, whatever $ErrorActionPreference says, so every step checks
@@ -41,6 +43,8 @@ if ($env:CARGO_TARGET_DIR) { Write-Host "   CARGO_TARGET_DIR=$env:CARGO_TARGET_D
 
 Invoke-Step 'Clippy' { & cargo clippy --all-targets -- -D warnings }
 Invoke-Step 'Build ezvpn.dll + header (debug)' { & .\build-windows.ps1 -Profile debug }
+# A child pwsh, so the script's CARGO_TARGET_DIR/RUSTFLAGS stay out of this one.
+Invoke-Step 'Miri' { & pwsh -NoProfile -File .\scripts\miri.ps1 }
 
 Write-Host ''
 Write-Host 'all steps passed'
