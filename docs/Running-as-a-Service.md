@@ -262,29 +262,31 @@ secret_file = "/usr/local/etc/ezvpn/vpn-server.key"
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/sh</string>
+        <string>/bin/bash</string>
         <string>-c</string>
-        <!-- 2>&1 | sed | logger: every line goes to unified logging, prefixed -->
-        <string>/usr/local/bin/ezvpn server start -c /usr/local/etc/ezvpn/vpn_server.toml 2&gt;&amp;1 | /usr/bin/sed -l 's/^/ezvpn-server: /' | /usr/bin/logger</string>
+        <!-- exec: launchd's job (and its SIGTERM) is ezvpn itself; its output
+             goes through sed | logger into unified logging, prefixed -->
+        <string>exec /usr/local/bin/ezvpn server start -c /usr/local/etc/ezvpn/vpn_server.toml &gt; &gt;(/usr/bin/sed -l 's/^/ezvpn-server: /' | /usr/bin/logger) 2&gt;&amp;1</string>
     </array>
 
     <key>RunAtLoad</key><true/>
 
-    <!-- the shell's exit status is logger's, not ezvpn's: always restart -->
+    <!-- a server stays up: restart it whenever it exits -->
     <key>KeepAlive</key><true/>
 </dict>
 </plist>
 ```
 
-The job is a shell pipeline rather than `ezvpn` itself, so that the server's
-output goes to macOS unified logging instead of a file that nothing rotates
-(see [Logs](#logs)). Two things follow from the pipeline:
-
-- `KeepAlive` is a plain `true`. launchd sees the exit status of the shell,
-  which is `logger`'s and is `0` even when `ezvpn` crashed, so the
-  `SuccessfulExit` form used for the client would never restart it.
-- launchd signals the shell, not `ezvpn`. That is fine for the server, which
-  has no shutdown work to do.
+The shell sends the server's output to macOS unified logging instead of a
+file that nothing rotates (see [Logs](#logs)), but it `exec`s `ezvpn` rather
+than running it in a pipeline: the logging pipe is a bash process
+substitution, so the job's process is `ezvpn` itself. That matters for
+`launchctl bootout` (and `kickstart -k`): launchd's `SIGTERM` reaches `ezvpn`,
+which closes every client connection before exiting, so the clients notice at
+once and reconnect instead of waiting out their heartbeat timeout. In a plain
+`ezvpn … | sed | logger` pipeline the signal would go to the shell, and
+`ezvpn` would be killed without telling anyone. It needs `/bin/bash`; `/bin/sh`
+has no process substitution.
 
 Install and manage:
 
@@ -330,8 +332,8 @@ P='process == "logger" AND eventMessage BEGINSWITH "ezvpn-server: "'
 
 The client plists write to a file instead. The client is launched directly so
 that `launchctl bootout` delivers its `SIGTERM` to `ezvpn`, which then shuts
-the tunnel down cleanly; behind a shell pipeline the signal would go to the
-shell. With the default logging the file grows slowly (startup, connects and
+the tunnel down cleanly; behind a plain shell pipeline the signal would go to
+the shell. With the default logging the file grows slowly (startup, connects and
 disconnects, warnings). It is opened in append mode, so it can be emptied in
 place without restarting the job:
 
