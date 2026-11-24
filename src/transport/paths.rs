@@ -62,7 +62,11 @@ pub fn format_connection_paths(paths: &PathList<'_>) -> String {
         .iter()
         .map(|path| {
             let rtt = path.rtt();
-            let sel = if path.is_selected() { " (selected)" } else { "" };
+            let sel = if path.is_selected() {
+                " (selected)"
+            } else {
+                ""
+            };
             match path.remote_addr() {
                 TransportAddr::Ip(addr) => format!("Direct {}{} (rtt {:.0?})", addr, sel, rtt),
                 TransportAddr::Relay(url) => format!("Relay {}{} (rtt {:.0?})", url, sel, rtt),
@@ -126,9 +130,10 @@ fn connection_paths_from(paths: &PathList<'_>) -> Vec<ConnPath> {
             let rtt = path.rtt();
             let selected = path.is_selected();
             let (kind, display) = match path.remote_addr() {
-                TransportAddr::Ip(addr) => {
-                    (ConnPathKind::Direct, format!("Direct {addr} (rtt {rtt:.0?})"))
-                }
+                TransportAddr::Ip(addr) => (
+                    ConnPathKind::Direct,
+                    format!("Direct {addr} (rtt {rtt:.0?})"),
+                ),
                 TransportAddr::Relay(url) => {
                     (ConnPathKind::Relay, format!("Relay {url} (rtt {rtt:.0?})"))
                 }
@@ -170,7 +175,13 @@ pub async fn connection_snapshot(
 fn paths_key(paths: &PathList<'_>) -> (bool, Vec<String>) {
     let all = paths
         .iter()
-        .map(|p| format!("{:?}{}", p.remote_addr(), if p.is_selected() { "*" } else { "" }))
+        .map(|p| {
+            format!(
+                "{:?}{}",
+                p.remote_addr(),
+                if p.is_selected() { "*" } else { "" }
+            )
+        })
         .collect();
     (paths.is_empty(), all)
 }

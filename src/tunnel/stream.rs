@@ -240,9 +240,11 @@ pub fn classify(body: &[u8]) -> VpnResult<Frame<'_>> {
     match DataMessageType::from_byte(type_byte) {
         Some(DataMessageType::ServerAddrs) => Ok(Frame::ServerAddrs(rest)),
         Some(kind @ (DataMessageType::Ping | DataMessageType::Pong)) => {
-            let seq = <[u8; 8]>::try_from(rest).map(u64::from_be_bytes).map_err(|_| {
-                VpnError::Signaling(format!("Heartbeat frame body of {} bytes", body.len()))
-            })?;
+            let seq = <[u8; 8]>::try_from(rest)
+                .map(u64::from_be_bytes)
+                .map_err(|_| {
+                    VpnError::Signaling(format!("Heartbeat frame body of {} bytes", body.len()))
+                })?;
             Ok(if kind == DataMessageType::Ping {
                 Frame::Ping(seq)
             } else {
@@ -279,7 +281,10 @@ pub fn encode_server_addrs_frame(buf: &mut BytesMut, msg: &ServerAddrsMsg) -> Vp
 /// Encode a heartbeat frame (`kind` is [`DataMessageType::Ping`] or
 /// [`DataMessageType::Pong`]). Layout: `[len: u32 BE] [type] [seq: u64 BE]`.
 pub fn encode_heartbeat_frame(kind: DataMessageType, seq: u64) -> Bytes {
-    debug_assert!(matches!(kind, DataMessageType::Ping | DataMessageType::Pong));
+    debug_assert!(matches!(
+        kind,
+        DataMessageType::Ping | DataMessageType::Pong
+    ));
     let mut buf = BytesMut::with_capacity(FRAME_LEN_PREFIX + HEARTBEAT_BODY_LEN);
     buf.put_u32(HEARTBEAT_BODY_LEN as u32);
     buf.put_u8(kind.as_byte());
@@ -393,11 +398,17 @@ mod tests {
         let ping = encode_heartbeat_frame(DataMessageType::Ping, 7);
         let (len, body) = split_frame(&ping);
         assert_eq!(len, HEARTBEAT_BODY_LEN);
-        assert!(matches!(classify(body).expect("classify ping"), Frame::Ping(7)));
+        assert!(matches!(
+            classify(body).expect("classify ping"),
+            Frame::Ping(7)
+        ));
 
         let pong = encode_heartbeat_frame(DataMessageType::Pong, u64::MAX);
         let (_, body) = split_frame(&pong);
-        assert!(matches!(classify(body).expect("classify pong"), Frame::Pong(u64::MAX)));
+        assert!(matches!(
+            classify(body).expect("classify pong"),
+            Frame::Pong(u64::MAX)
+        ));
     }
 
     #[test]

@@ -13,8 +13,8 @@ use ezvpn::config::VPN_MTU;
 use ezvpn::transport::{QUIC_DATAGRAM_SEND_BUFFER_SIZE, build_quic_transport_config};
 use ezvpn::tunnel::signaling::ServerAddrsMsg;
 use ezvpn::tunnel::stream::{
-    DatagramSendOutcome, Frame, MAX_FRAME_BODY, classify, encode_server_addrs_frame, read_frame,
-    prepare_ip_datagrams, send_datagram_batch, write_frames,
+    DatagramSendOutcome, Frame, MAX_FRAME_BODY, classify, encode_server_addrs_frame,
+    prepare_ip_datagrams, read_frame, send_datagram_batch, write_frames,
 };
 use iroh::{
     Endpoint, RelayMode,
@@ -99,7 +99,8 @@ async fn ip_packets_roundtrip_as_datagrams() {
     // A full-MTU packet must not be dropped while path discovery warms up.
     let mut full_mtu = vec![0u8; VPN_MTU as usize];
     full_mtu[0] = 0x45;
-    let outcome = send_ip_packet(&conn, &mut arena, &mut seg_scratch, &mut pending, &full_mtu).await;
+    let outcome =
+        send_ip_packet(&conn, &mut arena, &mut seg_scratch, &mut pending, &full_mtu).await;
     assert_eq!(outcome.sent, 1, "full-MTU packet is sent immediately");
     assert_eq!(outcome.dropped_too_large, 0);
     let echoed = conn.read_datagram().await.expect("read full-MTU echo");
@@ -173,7 +174,8 @@ async fn datagram_backpressure_preserves_queued_packets() {
             let mut packet = vec![0u8; PACKET_SIZE];
             packet[0] = 0x45;
             packet[1..5].copy_from_slice(&sequence.to_be_bytes());
-            let outcome = send_ip_packet(&conn, &mut arena, &mut seg_scratch, &mut pending, &packet).await;
+            let outcome =
+                send_ip_packet(&conn, &mut arena, &mut seg_scratch, &mut pending, &packet).await;
             assert_eq!(outcome.sent, 1, "packet {sequence} queued");
             assert_eq!(outcome.dropped_other, 0, "packet {sequence} not evicted");
         }
@@ -228,7 +230,11 @@ async fn datagram_batch_waits_instead_of_evicting() {
     .await
     .expect("sender completed before timeout")
     .expect("no terminal send error");
-    assert_eq!(outcome.sent, u64::from(PACKET_COUNT), "every datagram queued");
+    assert_eq!(
+        outcome.sent,
+        u64::from(PACKET_COUNT),
+        "every datagram queued"
+    );
     assert_eq!(outcome.dropped_other, 0, "none evicted");
     assert_eq!(outcome.dropped_too_large, 0);
 
@@ -325,7 +331,9 @@ async fn server_addrs_frame_roundtrips_over_stream() {
         framed.extend_from_slice(&(len as u32).to_be_bytes());
         framed.extend_from_slice(&buf[..len]);
         let mut echo = vec![framed.freeze()];
-        write_frames(&mut send, &mut echo).await.expect("echo frame");
+        write_frames(&mut send, &mut echo)
+            .await
+            .expect("echo frame");
         send.finish().expect("finish echo stream");
         conn.closed().await;
     });
@@ -339,7 +347,9 @@ async fn server_addrs_frame_roundtrips_over_stream() {
     let mut arena = BytesMut::new();
     encode_server_addrs_frame(&mut arena, &addrs_msg).expect("encode addrs");
     let mut pending = vec![arena.freeze()];
-    write_frames(&mut send, &mut pending).await.expect("write frame");
+    write_frames(&mut send, &mut pending)
+        .await
+        .expect("write frame");
     send.finish().expect("finish send half");
 
     // Read the echoed frame back — confirms the server received and framed it.
@@ -350,7 +360,10 @@ async fn server_addrs_frame_roundtrips_over_stream() {
         .expect("echo present");
     match classify(&buf[..len]).expect("classify") {
         Frame::ServerAddrs(body) => {
-            assert_eq!(ServerAddrsMsg::decode(body).expect("decode addrs"), addrs_msg);
+            assert_eq!(
+                ServerAddrsMsg::decode(body).expect("decode addrs"),
+                addrs_msg
+            );
         }
         other => panic!("unexpected frame {other:?}"),
     }
@@ -390,7 +403,10 @@ async fn a_peer_is_granted_only_the_control_stream() {
         .expect("the control stream waited")
         .expect("open_bi");
     let second = tokio::time::timeout(WAIT, conn.open_bi()).await;
-    assert!(second.is_err(), "the client opened a second bidirectional stream");
+    assert!(
+        second.is_err(),
+        "the client opened a second bidirectional stream"
+    );
     let uni = tokio::time::timeout(WAIT, conn.open_uni()).await;
     assert!(uni.is_err(), "the client opened a unidirectional stream");
 

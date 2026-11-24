@@ -54,13 +54,13 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(target_vendor = "apple")]
 use std::io;
-use std::time::Duration;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use std::os::fd::AsRawFd;
 #[cfg(target_vendor = "apple")]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 #[cfg(target_vendor = "apple")]
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(target_vendor = "apple")]
 use tokio::io::Interest;
 #[cfg(target_vendor = "apple")]
@@ -440,8 +440,7 @@ impl TunDevice {
 
 /// Actionable message shown when TUN creation is denied for lack of privileges.
 #[cfg(target_os = "linux")]
-const TUN_PERMISSION_HELP: &str =
-    "insufficient privileges to create a TUN device: run as root (e.g. via sudo) or grant \
+const TUN_PERMISSION_HELP: &str = "insufficient privileges to create a TUN device: run as root (e.g. via sudo) or grant \
      CAP_NET_ADMIN to the binary (sudo setcap cap_net_admin+ep <path-to-ezvpn>)";
 #[cfg(target_os = "macos")]
 const TUN_PERMISSION_HELP: &str =
@@ -694,7 +693,10 @@ fn set_utun_max_pending_packets(fd: &OwnedFd) {
 /// [`UTUN_SOCKET_BUFFER_SIZE`]; a failure only logs, leaving the defaults.
 #[cfg(target_vendor = "apple")]
 fn set_utun_socket_buffers(fd: &OwnedFd) {
-    for (name, option) in [("SO_RCVBUF", libc::SO_RCVBUF), ("SO_SNDBUF", libc::SO_SNDBUF)] {
+    for (name, option) in [
+        ("SO_RCVBUF", libc::SO_RCVBUF),
+        ("SO_SNDBUF", libc::SO_SNDBUF),
+    ] {
         let size = UTUN_SOCKET_BUFFER_SIZE;
         // SAFETY: `fd` is open for the call's duration and `size` is a live
         // c_int whose exact length is passed.
@@ -1156,9 +1158,7 @@ mod windows_routes {
     use super::RouteAddOutcome;
     use std::io;
     use std::net::IpAddr;
-    use windows_sys::Win32::Foundation::{
-        ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         ConvertInterfaceAliasToLuid, CreateIpForwardEntry2, DeleteIpForwardEntry2,
         MIB_IPFORWARD_ROW2,
@@ -1217,11 +1217,7 @@ mod windows_routes {
     }
 
     /// Add an on-link route through the interface.
-    pub fn add_route(
-        tun_name: &str,
-        dest: IpAddr,
-        prefix_len: u8,
-    ) -> io::Result<RouteAddOutcome> {
+    pub fn add_route(tun_name: &str, dest: IpAddr, prefix_len: u8) -> io::Result<RouteAddOutcome> {
         let row = forward_row(interface_luid(tun_name)?, dest, prefix_len);
         match unsafe { CreateIpForwardEntry2(&row) } {
             NO_ERROR => Ok(RouteAddOutcome::Added),
@@ -1277,10 +1273,7 @@ mod windows_routes {
             unsafe {
                 assert_eq!(row.DestinationPrefix.PrefixLength, 8);
                 assert_eq!(row.DestinationPrefix.Prefix.Ipv6.sin6_family, AF_INET6);
-                assert_eq!(
-                    row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte[0],
-                    0xfd
-                );
+                assert_eq!(row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte[0], 0xfd);
                 assert_eq!(row.NextHop.Ipv6.sin6_family, AF_INET6);
                 assert_eq!(row.NextHop.Ipv6.sin6_addr.u.Byte, [0u8; 16]);
             }
@@ -1745,7 +1738,11 @@ async fn add_route_generic<R: Route>(tun_name: &str, route: &R) -> VpnResult<Rou
                 Ok(RouteAddOutcome::Added)
             }
             Ok(RouteAddOutcome::AlreadyExisted) => {
-                log::warn!("{} {} already exists (treating as success)", R::LABEL, route);
+                log::warn!(
+                    "{} {} already exists (treating as success)",
+                    R::LABEL,
+                    route
+                );
                 Ok(RouteAddOutcome::AlreadyExisted)
             }
             Err(e) => Err(VpnError::tun_device(format!(
@@ -1924,7 +1921,10 @@ fn expand_default_route6(route: Ipv6Net) -> Vec<Ipv6Net> {
 /// Returns a `RouteGuard` that automatically removes the routes when dropped.
 /// If any route fails to add, previously added routes are rolled back.
 pub async fn add_routes(tun_name: &str, routes: &[Ipv4Net]) -> VpnResult<RouteGuard> {
-    let routes: Vec<Ipv4Net> = routes.iter().flat_map(|r| expand_default_route4(*r)).collect();
+    let routes: Vec<Ipv4Net> = routes
+        .iter()
+        .flat_map(|r| expand_default_route4(*r))
+        .collect();
     let mut added: Vec<Ipv4Net> = Vec::with_capacity(routes.len());
 
     for route in &routes {
@@ -2248,7 +2248,10 @@ pub async fn add_routes6_with_src(
     routes: &[Ipv6Net],
     src: Ipv6Addr,
 ) -> VpnResult<Route6Guard> {
-    let routes: Vec<Ipv6Net> = routes.iter().flat_map(|r| expand_default_route6(*r)).collect();
+    let routes: Vec<Ipv6Net> = routes
+        .iter()
+        .flat_map(|r| expand_default_route6(*r))
+        .collect();
     let mut added: Vec<Ipv6Net> = Vec::with_capacity(routes.len());
 
     for route in &routes {
@@ -3475,8 +3478,12 @@ mod tests {
     #[test]
     fn resolve_bypass_keeps_usable_route() {
         // A normal route via a physical interface with a gateway is used as-is.
-        let out = resolve_bypass_route_info(test_route_info("en0", Some("10.0.0.1")), Some("utun8"), None)
-            .expect("usable route must be accepted");
+        let out = resolve_bypass_route_info(
+            test_route_info("en0", Some("10.0.0.1")),
+            Some("utun8"),
+            None,
+        )
+        .expect("usable route must be accepted");
         assert_eq!(out.device, "en0");
         assert_eq!(out.gateway, Some("10.0.0.1".parse().unwrap()));
     }
@@ -3486,8 +3493,12 @@ mod tests {
         // Route resolved through the VPN tunnel -> re-pinned via the captured
         // underlay gateway (the direct-path-after-routes case).
         let fb = test_underlay("en0", Some("10.0.0.1"));
-        let out = resolve_bypass_route_info(test_route_info("utun8", Some("10.99.0.1")), Some("utun8"), Some(&fb))
-            .expect("tunnel route must re-pin via fallback");
+        let out = resolve_bypass_route_info(
+            test_route_info("utun8", Some("10.99.0.1")),
+            Some("utun8"),
+            Some(&fb),
+        )
+        .expect("tunnel route must re-pin via fallback");
         assert_eq!(out.device, "en0");
         assert_eq!(out.gateway, Some("10.0.0.1".parse().unwrap()));
     }
@@ -3495,8 +3506,12 @@ mod tests {
     #[test]
     fn resolve_bypass_refuses_tunnel_route_without_fallback() {
         assert!(
-            resolve_bypass_route_info(test_route_info("utun8", Some("10.99.0.1")), Some("utun8"), None)
-                .is_err()
+            resolve_bypass_route_info(
+                test_route_info("utun8", Some("10.99.0.1")),
+                Some("utun8"),
+                None
+            )
+            .is_err()
         );
     }
 
@@ -3517,11 +3532,14 @@ mod tests {
     #[test]
     fn resolve_bypass_refuses_gateway_missing_without_usable_fallback() {
         // No fallback at all.
-        assert!(resolve_bypass_route_info(test_route_info("en8", None), Some("utun8"), None).is_err());
+        assert!(
+            resolve_bypass_route_info(test_route_info("en8", None), Some("utun8"), None).is_err()
+        );
         // A fallback that itself has no gateway is not usable.
         let fb = test_underlay("en8", None);
         assert!(
-            resolve_bypass_route_info(test_route_info("en8", None), Some("utun8"), Some(&fb)).is_err()
+            resolve_bypass_route_info(test_route_info("en8", None), Some("utun8"), Some(&fb))
+                .is_err()
         );
     }
 

@@ -270,7 +270,8 @@ impl VpnClientConfig {
 
         if let Some(ref routes6) = self.network.routes6 {
             for route6 in routes6 {
-                validate_ipv6_cidr(route6).with_context(|| route6_context(route6, Some("network")))?;
+                validate_ipv6_cidr(route6)
+                    .with_context(|| route6_context(route6, Some("network")))?;
             }
         }
 
@@ -389,10 +390,7 @@ impl ResolvedVpnServerConfig {
                 iroh.relay_urls.as_deref().unwrap_or_default(),
                 iroh.relay_auth_token.clone(),
             )?,
-            authorized_keys_file: auth
-                .authorized_keys_file
-                .as_deref()
-                .map(expand_tilde),
+            authorized_keys_file: auth.authorized_keys_file.as_deref().map(expand_tilde),
         })
     }
 }
@@ -829,10 +827,8 @@ relay_auth_token = "shared-secret"
     /// server with no key source must never come up.
     #[test]
     fn test_server_missing_authorized_keys_file_rejected() {
-        let toml_str = server_toml("").replace(
-            "[auth]\nauthorized_keys_file = \"./authorized_keys\"\n",
-            "",
-        );
+        let toml_str =
+            server_toml("").replace("[auth]\nauthorized_keys_file = \"./authorized_keys\"\n", "");
         let config: VpnServerConfig = toml::from_str(&toml_str).unwrap();
         let err = ResolvedVpnServerConfig::from_config(&config)
             .expect_err("missing authorized_keys_file must be rejected");
@@ -883,7 +879,10 @@ auth_key = "ed25519-sec:AAAA"
         )
         .err()
         .expect("inline auth_key must be rejected in TOML");
-        assert!(err.to_string().contains("auth_key"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("auth_key"),
+            "unexpected error: {err}"
+        );
     }
 
     /// A typo in a top-level key must be rejected, not silently ignored.

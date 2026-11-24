@@ -433,9 +433,10 @@ impl ClientStatusHandle {
             device_id,
             connected_since_secs: connected_at.map(|t| t.elapsed().as_secs()),
             failed_attempts: reconnect.failed_attempts,
-            next_attempt_secs: reconnect
-                .next_attempt_at
-                .map(|at| at.saturating_duration_since(std::time::Instant::now()).as_secs()),
+            next_attempt_secs: reconnect.next_attempt_at.map(|at| {
+                at.saturating_duration_since(std::time::Instant::now())
+                    .as_secs()
+            }),
             last_error: reconnect.last_error,
             mode: mode.into(),
             assigned_ip: info.assigned_ip,
@@ -679,26 +680,22 @@ pub async fn list_instances(role: LockRole) -> VpnResult<Vec<InstanceInfo>> {
 #[cfg(unix)]
 async fn read_snapshot_bytes(role: LockRole, instance: &str) -> VpnResult<Option<Vec<u8>>> {
     let path = socket_path(role, instance);
-    let stream = match tokio::time::timeout(
-        QUERY_TIMEOUT,
-        tokio::net::UnixStream::connect(&path),
-    )
-    .await
-    {
-        Err(_) => return Err(VpnError::config("Timed out connecting to control socket")),
-        Ok(Err(e)) if is_not_running(&e) => return Ok(None),
-        // Not folded into `is_not_running`: an instance IS running here, so
-        // reporting "not running" would be wrong — surface the error instead.
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(VpnError::config_with_source(
-                "Permission denied connecting to the control socket \
+    let stream =
+        match tokio::time::timeout(QUERY_TIMEOUT, tokio::net::UnixStream::connect(&path)).await {
+            Err(_) => return Err(VpnError::config("Timed out connecting to control socket")),
+            Ok(Err(e)) if is_not_running(&e) => return Ok(None),
+            // Not folded into `is_not_running`: an instance IS running here, so
+            // reporting "not running" would be wrong — surface the error instead.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(VpnError::config_with_source(
+                    "Permission denied connecting to the control socket \
                  (daemon started by an older ezvpn version? restart it, or retry with sudo)",
-                e,
-            ));
-        }
-        Ok(Err(e)) => return Err(VpnError::Network(e)),
-        Ok(Ok(s)) => s,
-    };
+                    e,
+                ));
+            }
+            Ok(Err(e)) => return Err(VpnError::Network(e)),
+            Ok(Ok(s)) => s,
+        };
     read_all(stream).await.map(Some)
 }
 
@@ -739,10 +736,7 @@ where
 /// Whether a connection error means "no instance is running".
 fn is_not_running(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
-    matches!(
-        e.kind(),
-        ErrorKind::NotFound | ErrorKind::ConnectionRefused
-    )
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused)
 }
 
 // ---------------------------------------------------------------------------
@@ -853,7 +847,10 @@ fn print_server_text(s: &ServerStatus) {
     }
     let st = &s.stats;
     println!("\nPacket stats:");
-    println!("  tun_read={}  to_clients={}  from_clients={}", st.tun_packets_read, st.packets_to_clients, st.packets_from_clients);
+    println!(
+        "  tun_read={}  to_clients={}  from_clients={}",
+        st.tun_packets_read, st.packets_to_clients, st.packets_from_clients
+    );
     println!(
         "  no_route={}  unknown_version={}  dropped_full={}",
         st.packets_no_route, st.packets_unknown_version, st.packets_dropped_full
@@ -884,7 +881,10 @@ fn print_client_text(c: &ClientStatus) {
             _ => "trying now".to_string(),
         };
         let plural = if c.failed_attempts == 1 { "" } else { "s" };
-        println!("Reconnecting:   {} failed attempt{plural}, {next}", c.failed_attempts);
+        println!(
+            "Reconnecting:   {} failed attempt{plural}, {next}",
+            c.failed_attempts
+        );
         if let Some(error) = &c.last_error {
             println!("Last error:     {error}");
         }
@@ -928,12 +928,8 @@ fn print_client_text(c: &ClientStatus) {
             println!("Bypass addrs:   (none collected)");
         } else {
             println!("Bypass addrs:   {}", c.bypass_addrs.join(", "));
-            println!(
-                "                (collected, not necessarily applied successfully;"
-            );
-            println!(
-                "                 verify with the OS routing table, e.g. netstat -nr)"
-            );
+            println!("                (collected, not necessarily applied successfully;");
+            println!("                 verify with the OS routing table, e.g. netstat -nr)");
         }
     }
 }
@@ -1046,7 +1042,10 @@ mod tests {
         assert_eq!(snap.assigned_ip.as_deref(), Some("10.0.0.2"));
         assert_eq!(snap.mtu, Some(1280));
         assert_eq!(snap.routes, vec!["0.0.0.0/0".to_string()]);
-        assert_eq!(snap.connection.as_deref(), Some("relay https://relay.example"));
+        assert_eq!(
+            snap.connection.as_deref(),
+            Some("relay https://relay.example")
+        );
         assert_eq!(snap.custom_relays[0].working, Some(true));
         assert_eq!(snap.bypass_addrs, vec!["198.51.100.7".to_string()]);
 
@@ -1101,7 +1100,10 @@ mod tests {
         assert_eq!(snap.next_attempt_secs, Some(0));
 
         handle.set_connected(
-            ClientConnectedInfo { mtu: 1280, ..Default::default() },
+            ClientConnectedInfo {
+                mtu: 1280,
+                ..Default::default()
+            },
             Arc::new(|| {
                 Box::pin(async {
                     ConnectionSnapshot {
@@ -1198,8 +1200,8 @@ mod tests {
                 bypass_addrs: vec![],
             })
         };
-        let guard = spawn_status_listener(LockRole::Server, &instance, provider)
-            .expect("listener spawns");
+        let guard =
+            spawn_status_listener(LockRole::Server, &instance, provider).expect("listener spawns");
 
         // The socket must be world-connectable so unprivileged status/list work.
         {

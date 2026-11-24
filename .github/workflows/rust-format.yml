@@ -1,0 +1,26 @@
+name: Rust format
+
+# The crate's code as rustfmt.toml has it, checked with stable's rustfmt.
+on:
+  push:
+    paths:
+      - "**.rs"
+      - rustfmt.toml
+      - .github/workflows/rust-format.yml
+  pull_request:
+    paths:
+      - "**.rs"
+      - rustfmt.toml
+      - .github/workflows/rust-format.yml
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rustfmt
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: cargo +stable fmt --all --check

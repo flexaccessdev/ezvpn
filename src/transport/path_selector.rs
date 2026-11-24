@@ -66,7 +66,11 @@ impl ExcludingPathSelector {
 
     /// Index of the candidate to switch to, or `None` to keep the current
     /// selection.
-    fn choose(&self, current: Option<&FourTuple>, candidates: &[(&FourTuple, Duration)]) -> Option<usize> {
+    fn choose(
+        &self,
+        current: Option<&FourTuple>,
+        candidates: &[(&FourTuple, Duration)],
+    ) -> Option<usize> {
         let mut best: Option<(usize, (bool, i128))> = None;
         let mut current_key: Option<(bool, i128)> = None;
         for (i, (path, rtt)) in candidates.iter().enumerate() {
@@ -195,7 +199,10 @@ mod tests {
     fn relay_to_direct_switches_immediately() {
         let sel = ExcludingPathSelector::new(vec![]);
         let (r, lan) = (relay(), ip("10.22.40.61:4000"));
-        assert_eq!(sel.choose(Some(&r), &[(&r, ms(1)), (&lan, ms(40))]), Some(1));
+        assert_eq!(
+            sel.choose(Some(&r), &[(&r, ms(1)), (&lan, ms(40))]),
+            Some(1)
+        );
     }
 
     #[test]

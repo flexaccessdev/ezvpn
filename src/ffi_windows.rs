@@ -147,7 +147,10 @@ where
     <T as std::str::FromStr>::Err: std::fmt::Display,
 {
     raw.iter()
-        .map(|s| s.parse::<T>().map_err(|e| format!("invalid {label} '{s}': {e}")))
+        .map(|s| {
+            s.parse::<T>()
+                .map_err(|e| format!("invalid {label} '{s}': {e}"))
+        })
         .collect()
 }
 
@@ -401,7 +404,9 @@ async fn run_client(
     max_attempts: Option<NonZeroU32>,
 ) -> crate::error::VpnResult<()> {
     if auto_reconnect {
-        client.run_with_reconnect(endpoint, relay_config, max_attempts).await
+        client
+            .run_with_reconnect(endpoint, relay_config, max_attempts)
+            .await
     } else {
         client.connect(endpoint, relay_config).await
     }
@@ -438,7 +443,11 @@ pub unsafe extern "C" fn ezvpn_status(
         Ok(j) => j,
         Err(e) => format!("{{\"error\":\"failed to serialize status: {e}\"}}"),
     };
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    if write_cstr(out_buf, out_len, &json) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Snapshot the live connection's iroh path(s) and custom-relay health as JSON
@@ -489,11 +498,19 @@ pub unsafe extern "C" fn ezvpn_conn_path(
         Ok(rt) => rt.block_on(handle.status.connection_snapshot()),
         Err(e) => {
             let json = format!("{{\"error\":\"failed to build runtime: {e}\"}}");
-            return if write_cstr(out_buf, out_len, &json) { 1 } else { 0 };
+            return if write_cstr(out_buf, out_len, &json) {
+                1
+            } else {
+                0
+            };
         }
     };
     let json = crate::ffi_common::conn_path_json(snapshot);
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    if write_cstr(out_buf, out_len, &json) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Stop the tunnel and free the handle.

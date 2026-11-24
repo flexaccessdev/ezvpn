@@ -10,10 +10,10 @@ use crate::transport::path_selector::ExcludingPathSelector;
 use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use ipnet::IpNet;
 use flexaccess_iroh::endpoint::{
     CreatedEndpoint, EndpointOptions, PendingCloses, create_endpoint, endpoint_builder,
 };
+use ipnet::IpNet;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::{Builder as EndpointBuilder, Connection, Side},
@@ -43,7 +43,10 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`VpnError::Signaling`], which `is_recoverable()` treats as transient, so a
 /// failure here feeds the client's reconnect loop rather than killing it. Shared
 /// by the desktop/CLI client and the iOS session.
-pub async fn connect_with_timeout(endpoint: &Endpoint, addr: EndpointAddr) -> VpnResult<Connection> {
+pub async fn connect_with_timeout(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+) -> VpnResult<Connection> {
     tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, VPN_ALPN))
         .await
         .map_err(|_| {

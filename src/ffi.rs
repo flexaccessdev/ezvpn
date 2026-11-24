@@ -151,7 +151,10 @@ where
     <T as std::str::FromStr>::Err: std::fmt::Display,
 {
     raw.iter()
-        .map(|s| s.parse::<T>().map_err(|e| format!("invalid {label} '{s}': {e}")))
+        .map(|s| {
+            s.parse::<T>()
+                .map_err(|e| format!("invalid {label} '{s}': {e}"))
+        })
         .collect()
 }
 
@@ -280,7 +283,11 @@ pub unsafe extern "C" fn ezvpn_connect(
                 Box::into_raw(Box::new(handle))
             } else {
                 drop(handle);
-                write_cstr(out_buf, out_len, "out_buf too small for network-config JSON");
+                write_cstr(
+                    out_buf,
+                    out_len,
+                    "out_buf too small for network-config JSON",
+                );
                 ptr::null_mut()
             }
         }
@@ -307,7 +314,10 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
         relay_config: relay_config.clone(),
         routes: parse_routes::<Ipv4Net>(&cfg.routes, "IPv4 route")?,
         routes6: parse_routes::<Ipv6Net>(&cfg.routes6, "IPv6 route")?,
-        exclude_direct_paths: parse_routes::<IpNet>(&cfg.exclude_direct_paths, "excluded direct-path network")?,
+        exclude_direct_paths: parse_routes::<IpNet>(
+            &cfg.exclude_direct_paths,
+            "excluded direct-path network",
+        )?,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -393,7 +403,11 @@ pub unsafe extern "C" fn ezvpn_conn_path(
     }
     let handle = unsafe { &*handle };
     let json = handle.conn_path_json();
-    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+    if write_cstr(out_buf, out_len, &json) {
+        1
+    } else {
+        0
+    }
 }
 
 impl EzvpnHandle {
@@ -518,7 +532,9 @@ impl EzvpnHandle {
             });
             match close {
                 Ok(()) => log::info!("ezvpn stop: endpoint closed in {:?}", started.elapsed()),
-                Err(_) => log::warn!("ezvpn stop: endpoint close timed out after {STOP_CLOSE_TIMEOUT:?}"),
+                Err(_) => {
+                    log::warn!("ezvpn stop: endpoint close timed out after {STOP_CLOSE_TIMEOUT:?}")
+                }
             }
             drop(task);
             runtime.shutdown_background();
@@ -664,7 +680,9 @@ pub unsafe extern "C" fn ezvpn_stop(handle: *mut EzvpnHandle) {
 /// Lock the stop flag, recovering it from a callback that panicked (the flag
 /// itself is always valid).
 fn lock_ignoring_poison(stopped: &Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
-    stopped.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    stopped
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Write `s` (always NUL-terminated) into the caller buffer. Returns `true` if
