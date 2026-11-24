@@ -649,7 +649,11 @@ for the 64. That is the buffers' own count and an estimate of the memory, not
 a ceiling on it: a queued datagram is charged its payload, and keeps the whole
 received batch it arrived in allocated.
 
-A reply that fails or runs out of time ends the connection before it becomes
+A client that is turned away (a key that is not authorized, a full server)
+is waited on, within the same deadline, until it has the reply: the server
+drops the connection next, and a client that never saw the reason would take
+the close for a network failure and connect again. A reply that fails or runs
+out of time ends the connection before it becomes
 a session, and the addresses assigned for it go back to the pools. The pools
 count holders for this (`Lease`): a reconnecting client is given the address
 it already has, so its older connection and a newer handshake can hold one
