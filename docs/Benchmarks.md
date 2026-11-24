@@ -11,11 +11,12 @@ Mbit/s, down / up, one TCP flow, 2026-11-23. Each column is one session in
 which the rows were measured in turn, round after round (two sessions for the
 offload and Windows columns, pooled); the numbers are medians. Each ezvpn row
 ran that version at both ends, and the two versions were built together, with
-one toolchain, for these runs. The v0.0.71 build measured has the handshake
-deadlines and the stream grants; what the release adds after it (refusing a
-connection beyond the pending handshakes, the reply under the same deadline)
-is in the accept, handshake and address-pool code, none of it on the data
-path.
+one toolchain, for these runs. The v0.0.71 build in this table has the
+handshake deadlines and the stream grants. The release adds more after it, in
+the accept, handshake and address-pool code, and one comparison per packet
+the server forwards to a client (the route's session against the client's
+current one); the release build was then measured against the build in this
+table on the Linux pair, and is no slower: see "The release build" below.
 
 | | Linux pair, UDP offload on | Linux pair, default NIC | macOS client | Windows client |
 |---|---:|---:|---:|---:|
@@ -118,6 +119,28 @@ Five rounds.
 | Tailscale 1.104.7 | 1680 | 1268 | 1956 / 1438 |
 | ezvpn v0.0.70 | 2178 | 2325 | 0 / 0 |
 | ezvpn v0.0.71 | 2131 | 2368 | 0 / 0 |
+
+### The release build
+
+The v0.0.71 that was released against the v0.0.71 build of the tables above,
+on the Linux pair, the same day: five rounds at default NIC settings, and ten
+with the offload on, in two sessions of five with the two builds in opposite
+orders.
+
+| | Default NIC | UDP offload on |
+|---|---:|---:|
+| No tunnel | 20278 / 20242 | 20039 / 20135 |
+| v0.0.71, the build above | 2046 / 2137 | 3058 / 3001 |
+| v0.0.71 as released | 2059 / 2300 | 3305 / 3009 |
+
+Something else was running on the host for the first two default-NIC rounds
+(no tunnel fell to 16073 in the second), and both builds were low in them:
+1395 and 953 down for the earlier build, 1588 and 1429 for the release.
+With the offload on the download medians followed the order again, the build
+taken second being the faster in each session: the earlier build at 3034 and
+the release at 3309 with the earlier build first, then the release at 2998
+and the earlier build at 3082 with the release first. Every ezvpn run was on
+a direct path, and none retransmitted with the offload on.
 
 ### macOS and Windows clients against the Linux server
 
