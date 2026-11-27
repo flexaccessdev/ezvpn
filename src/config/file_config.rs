@@ -48,13 +48,19 @@ pub struct ServerAuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct VpnServerIrohConfig {
     pub secret_file: Option<PathBuf>,
-    /// Custom relay server URLs. At least two distinct relays: a server keeps
-    /// working through a relay outage by moving onto another configured relay,
-    /// so one relay is rejected. Both sides must list the full set.
+    /// Custom relay server URLs. A server keeps working through a relay
+    /// outage by moving onto another configured relay, so list two or more;
+    /// a single relay runs in reduced-redundancy mode, with no failover. Both
+    /// sides must list the full set.
     pub relay_urls: Option<Vec<String>>,
     /// Optional shared bearer token sent to the custom relays as
     /// `Authorization: Bearer <token>`. Only valid together with `relay_urls`.
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none (default: true). False for relays behind a Cloudflare Tunnel or
+    /// another HTTP-only front, which otherwise delay each start by iroh's
+    /// 3 s probe timeout. Only valid together with `relay_urls`.
+    pub relay_quic_addr_discovery: Option<bool>,
 }
 
 /// VPN routes the client installs once connected. `[network]` section.
@@ -80,13 +86,19 @@ pub struct ClientAuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct VpnClientIrohConfig {
     pub server_node_id: Option<String>,
-    /// Custom relay server URLs. At least two distinct relays: a server keeps
-    /// working through a relay outage by moving onto another configured relay,
-    /// so one relay is rejected. Both sides must list the full set.
+    /// Custom relay server URLs. A server keeps working through a relay
+    /// outage by moving onto another configured relay, so list two or more;
+    /// a single relay runs in reduced-redundancy mode, with no failover. Both
+    /// sides must list the full set.
     pub relay_urls: Option<Vec<String>>,
     /// Optional shared bearer token sent to the custom relays as
     /// `Authorization: Bearer <token>`. Only valid together with `relay_urls`.
     pub relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none (default: true). False for relays behind a Cloudflare Tunnel or
+    /// another HTTP-only front, which otherwise delay each start by iroh's
+    /// 3 s probe timeout. Only valid together with `relay_urls`.
+    pub relay_quic_addr_discovery: Option<bool>,
     /// Networks (CIDRs) whose server addresses path selection skips as direct
     /// paths, e.g. another VPN's range such as Tailscale's `100.64.0.0/10`.
     /// A preference, not a block: with no other path available (not even the
@@ -386,9 +398,10 @@ impl ResolvedVpnServerConfig {
             server_ip6: net.server_ip6.clone(),
             ip6_strategy: net.ip6_strategy,
             secret_file: iroh.secret_file.clone(),
-            relay_config: RelayConfig::from_urls_with_token(
+            relay_config: RelayConfig::from_settings(
                 iroh.relay_urls.as_deref().unwrap_or_default(),
                 iroh.relay_auth_token.clone(),
+                iroh.relay_quic_addr_discovery,
             )?,
             authorized_keys_file: auth.authorized_keys_file.as_deref().map(expand_tilde),
         })
@@ -419,6 +432,7 @@ pub struct VpnClientConfigBuilder {
     routes6: Option<Vec<String>>,
     relay_urls: Option<Vec<String>>,
     relay_auth_token: Option<String>,
+    relay_quic_addr_discovery: Option<bool>,
     exclude_direct_paths: Option<Vec<String>>,
     auto_reconnect: Option<bool>,
     max_reconnect_attempts: Option<NonZeroU32>,
@@ -447,6 +461,9 @@ impl VpnClientConfigBuilder {
                 }
                 if iroh.relay_auth_token.is_some() {
                     self.relay_auth_token = iroh.relay_auth_token.clone();
+                }
+                if iroh.relay_quic_addr_discovery.is_some() {
+                    self.relay_quic_addr_discovery = iroh.relay_quic_addr_discovery;
                 }
                 if iroh.exclude_direct_paths.is_some() {
                     self.exclude_direct_paths = iroh.exclude_direct_paths.clone();
@@ -481,6 +498,7 @@ impl VpnClientConfigBuilder {
         routes6: Vec<String>,
         relay_urls: Vec<String>,
         relay_auth_token: Option<String>,
+        relay_quic_addr_discovery: Option<bool>,
         exclude_direct_paths: Vec<String>,
         auto_reconnect: Option<bool>,
         max_reconnect_attempts: Option<NonZeroU32>,
@@ -506,6 +524,9 @@ impl VpnClientConfigBuilder {
         }
         if relay_auth_token.is_some() {
             self.relay_auth_token = relay_auth_token;
+        }
+        if relay_quic_addr_discovery.is_some() {
+            self.relay_quic_addr_discovery = relay_quic_addr_discovery;
         }
         if !exclude_direct_paths.is_empty() {
             self.exclude_direct_paths = Some(exclude_direct_paths);
@@ -562,9 +583,10 @@ impl VpnClientConfigBuilder {
             auth_key_file: self.auth_key_file,
             routes,
             routes6,
-            relay_config: RelayConfig::from_urls_with_token(
+            relay_config: RelayConfig::from_settings(
                 self.relay_urls.as_deref().unwrap_or_default(),
                 self.relay_auth_token,
+                self.relay_quic_addr_discovery,
             )?,
             exclude_direct_paths,
             auto_reconnect: self.auto_reconnect.unwrap_or(true),
@@ -762,6 +784,7 @@ exclude_direct_paths = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
                 vec![],
                 vec![],
                 None,
+                None,
                 vec!["10.9.0.0/16".to_string()],
                 None,
                 None,
@@ -820,6 +843,135 @@ relay_auth_token = "shared-secret"
             err.to_string().contains("relay_auth_token requires"),
             "unexpected error: {err}"
         );
+    }
+
+    /// One custom relay is reduced-redundancy mode (no failover), not an
+    /// error, on either side.
+    #[test]
+    fn test_single_custom_relay_accepted() {
+        let config: VpnClientConfig = toml::from_str(
+            r#"
+role = "vpnclient"
+
+[iroh]
+server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+relay_urls = ["https://relay.example.com"]
+"#,
+        )
+        .unwrap();
+        let resolved = VpnClientConfigBuilder::new()
+            .apply_defaults()
+            .apply_config(Some(&config))
+            .build()
+            .unwrap();
+        assert!(resolved.relay_config.is_single_relay());
+
+        let toml_str = server_toml("").replace(
+            "[iroh]\n",
+            "[iroh]\nrelay_urls = [\"https://relay.example.com\"]\n",
+        );
+        let config: VpnServerConfig = toml::from_str(&toml_str).unwrap();
+        let resolved = ResolvedVpnServerConfig::from_config(&config).unwrap();
+        assert!(resolved.relay_config.is_single_relay());
+    }
+
+    /// The relays' QUIC address discovery setting is on unless configured,
+    /// and the CLI value wins over the config file's.
+    #[test]
+    fn test_client_relay_quic_addr_discovery_resolves() {
+        let config = |setting: &str| -> VpnClientConfig {
+            toml::from_str(&format!(
+                r#"
+role = "vpnclient"
+
+[iroh]
+server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+relay_urls = ["https://relay.example.com", "https://relay2.example.com"]
+{setting}
+"#
+            ))
+            .unwrap()
+        };
+        let resolve = |config: &VpnClientConfig, cli: Option<bool>| {
+            VpnClientConfigBuilder::new()
+                .apply_defaults()
+                .apply_config(Some(config))
+                .apply_cli(
+                    None,
+                    None,
+                    None,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    cli,
+                    vec![],
+                    None,
+                    None,
+                )
+                .build()
+                .unwrap()
+                .relay_config
+                .quic_addr_discovery()
+        };
+
+        assert_eq!(resolve(&config(""), None), Some(true));
+        let off = config("relay_quic_addr_discovery = false");
+        assert_eq!(resolve(&off, None), Some(false));
+        assert_eq!(resolve(&off, Some(true)), Some(true));
+        assert_eq!(resolve(&config(""), Some(false)), Some(false));
+    }
+
+    /// The setting says how the custom relays are deployed, so with the
+    /// default relays it is rejected, whichever value it has, as a relay
+    /// token is.
+    #[test]
+    fn test_relay_quic_addr_discovery_without_relays_rejected() {
+        for value in [true, false] {
+            let config: VpnClientConfig = toml::from_str(&format!(
+                r#"
+role = "vpnclient"
+
+[iroh]
+server_node_id = "2xnbkpbc7izsilvewd7c62w7wnwziacmpfwvhcrya5nt76dqkpga"
+relay_quic_addr_discovery = {value}
+"#
+            ))
+            .unwrap();
+            let err = VpnClientConfigBuilder::new()
+                .apply_defaults()
+                .apply_config(Some(&config))
+                .build()
+                .expect_err("relay_quic_addr_discovery without relay_urls must be rejected");
+            assert!(
+                err.to_string().contains("requires custom relay_urls"),
+                "unexpected error: {err}"
+            );
+
+            let toml_str = server_toml("").replace(
+                "[iroh]\n",
+                &format!("[iroh]\nrelay_quic_addr_discovery = {value}\n"),
+            );
+            let config: VpnServerConfig = toml::from_str(&toml_str).unwrap();
+            let err = ResolvedVpnServerConfig::from_config(&config)
+                .expect_err("relay_quic_addr_discovery without relay_urls must be rejected");
+            assert!(
+                err.to_string().contains("requires custom relay_urls"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_server_relay_quic_addr_discovery_resolves() {
+        let toml_str = server_toml("").replace(
+            "[iroh]\n",
+            "[iroh]\nrelay_urls = [\"https://relay.example.com\"]\n\
+             relay_quic_addr_discovery = false\n",
+        );
+        let config: VpnServerConfig = toml::from_str(&toml_str).unwrap();
+        let resolved = ResolvedVpnServerConfig::from_config(&config).unwrap();
+        assert_eq!(resolved.relay_config.quic_addr_discovery(), Some(false));
     }
 
     /// Resolution enforces the authorized-keys file itself, like `secret_file`:

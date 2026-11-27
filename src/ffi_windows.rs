@@ -26,8 +26,9 @@
 //!    on Apple): every iroh path plus custom-relay health. Never
 //!    polled, since it makes a `/healthz` request per custom relay.
 //! 4. [`ezvpn_stop`] — signal the loop to stop, wait for the routes/TUN teardown
-//!    to complete (the run future's `Drop` removes routes and closes wintun),
-//!    then free the handle.
+//!    to complete (the run future's `Drop` removes routes and closes wintun)
+//!    and, for a bounded time, for the endpoint's graceful close, then free the
+//!    handle.
 //!
 //! All functions are null-safe and never unwind across the FFI boundary (the
 //! release profile is `panic = "abort"`, so a panic terminates the host process
@@ -42,11 +43,16 @@
 //! `auth_key` (the client's `ed25519-sec:...` secret key, whose public half must
 //! be on the server's authorized-keys file) and `server_node_id` are required;
 //! `max_reconnect_attempts` may be null. `relay_urls`, `relay_auth_token`,
-//! `routes`, `routes6`, `exclude_direct_paths`, `instance`, and
-//! `auto_reconnect` are all optional (with
+//! `relay_quic_addr_discovery`, `routes`, `routes6`, `exclude_direct_paths`,
+//! `instance`, and `auto_reconnect` are all optional (with
 //! the defaults shown). `relay_auth_token` is the shared bearer token for the
 //! custom relays (sent as `Authorization: Bearer <token>`); it is only valid
 //! together with `relay_urls` and is rejected with the default relays.
+//! `relay_quic_addr_discovery` says whether the custom relays serve QUIC
+//! address discovery, all of them or none (absent or null: true); false is for
+//! relays behind a Cloudflare Tunnel or another HTTP-only front, which
+//! otherwise delay each start by up to 3 s. Like the token, it is rejected
+//! with the default relays, whichever value it has.
 //!
 //! ```json
 //! {
@@ -54,6 +60,7 @@
 //!   "auth_key": "ed25519-sec:...",
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_auth_token": "<optional shared relay bearer token>",
+//!   "relay_quic_addr_discovery": null,
 //!   "routes": ["10.0.0.0/8"],
 //!   "routes6": ["fd00::/8"],
 //!   "instance": "default",
@@ -92,8 +99,25 @@ use tokio::sync::Notify;
 use crate::config::VpnClientConfig;
 use crate::control::{ClientEvent, ClientStatusHandle};
 use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison, write_cstr};
-use crate::transport::endpoint::{RelayConfig, create_client_endpoint};
+use crate::transport::endpoint::{
+    ENDPOINT_CLOSE_TIMEOUT, PendingCloses, RelayConfig, close_and_finish, close_failed_start,
+    create_client_endpoint,
+};
 use crate::tunnel::client::VpnClient;
+
+/// How long the worker thread, and so [`ezvpn_stop`], waits for the endpoint's
+/// graceful close once the tunnel is torn down. The CONNECTION_CLOSE goes out
+/// at once; this caps the wait for the server's acknowledgement and for the
+/// startup relay probe's endpoints to close. iroh's close has no deadline of
+/// its own, and the network may be what is gone. A slower close is cut short:
+/// the runtime goes with the worker thread, and with it every task of the
+/// session.
+///
+/// The shared crate's 5 s rather than the CLI's 3 s: with a connection attempt
+/// in flight to a server that does not answer, iroh's close takes about 3 s
+/// by itself (it waits out the attempt's drain period), and a bound of 3 s
+/// would cut that ordinary case off every time.
+const STOP_CLOSE_TIMEOUT: std::time::Duration = ENDPOINT_CLOSE_TIMEOUT;
 
 /// Opaque handle owned by the .NET side. Created by [`ezvpn_start`], freed by
 /// [`ezvpn_stop`].
@@ -142,6 +166,11 @@ struct FfiWinConfig {
     /// `relay_urls`; rejected with the default relays.
     #[serde(default)]
     relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none; absent or null keeps the default, on. Only valid with
+    /// `relay_urls`; rejected with the default relays.
+    #[serde(default)]
+    relay_quic_addr_discovery: Option<bool>,
     #[serde(default)]
     routes: Vec<String>,
     #[serde(default)]
@@ -336,8 +365,12 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
 
     let exclude_direct_paths =
         parse_routes::<IpNet>(&cfg.exclude_direct_paths, "excluded direct-path network")?;
-    let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
-        .map_err(|e| format!("{e:#}"))?;
+    let relay_config = RelayConfig::from_settings(
+        &cfg.relay_urls,
+        cfg.relay_auth_token,
+        cfg.relay_quic_addr_discovery,
+    )
+    .map_err(|e| format!("{e:#}"))?;
     let instance = cfg.instance;
     let auto_reconnect = cfg.auto_reconnect;
     let max_attempts = cfg.max_reconnect_attempts.and_then(NonZeroU32::new);
@@ -372,12 +405,29 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                 }
             };
 
-            runtime.block_on(async move {
-                let endpoint = match create_client_endpoint(&relay_config, &exclude_direct_paths).await {
+            // The session, up to the tunnel's teardown. A session that ran
+            // hands back its endpoint, still open, for the close below, and
+            // its client, for the single-instance lock it holds; a start
+            // that failed has cleaned up after itself (bounded) and hands
+            // back nothing.
+            let session = runtime.block_on(async move {
+                // The startup relay probe can outlast the start. What it
+                // leaves running is kept in `closes` and waited for after the
+                // endpoint's close, on every way out: the runtime ends with
+                // the session.
+                let closes = PendingCloses::new();
+                let endpoint = match create_client_endpoint(
+                    &relay_config,
+                    &exclude_direct_paths,
+                    &closes,
+                )
+                .await
+                {
                     Ok(e) => e,
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create iroh endpoint: {e}")));
-                        return;
+                        close_failed_start(None, &closes).await;
+                        return None;
                     }
                 };
 
@@ -385,7 +435,8 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                     Ok(c) => c,
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create VPN client: {e}")));
-                        return;
+                        close_failed_start(Some(endpoint), &closes).await;
+                        return None;
                     }
                 };
 
@@ -411,13 +462,14 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                 // Hand the status handle back; setup is done from here on.
                 if setup_tx.send(Ok(status.clone())).is_err() {
                     // The starter gave up (dropped the receiver); nothing to run.
-                    return;
+                    close_failed_start(Some(endpoint), &closes).await;
+                    return None;
                 }
 
                 // Race the run loop against the shutdown signal. When shutdown
                 // wins, the run future is dropped here, which runs the
                 // RouteGuard / TUN `Drop`s (removing routes, closing wintun)
-                // before this block returns and the runtime is torn down.
+                // before this block returns.
                 tokio::select! {
                     result = run_client(&client, &endpoint, &relay_config, auto_reconnect, max_attempts) => {
                         // The loop ended on its own and has already torn the
@@ -441,8 +493,37 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                     }
                 }
 
-                endpoint.close().await;
+                Some((client, endpoint, closes))
             });
+            let Some((client, endpoint, closes)) = session else {
+                return;
+            };
+
+            // The tunnel is down. Close the endpoint so the server frees this
+            // client's session now, then wait for what the startup relay
+            // probe left running. `ezvpn_stop` joins this thread, so the wait
+            // is bounded. The endpoint is dropped in there too, on the
+            // runtime it lives on.
+            let closed = runtime.block_on(async move {
+                tokio::time::timeout(STOP_CLOSE_TIMEOUT, close_and_finish(&endpoint, &closes)).await
+            });
+            if closed.is_err() {
+                log::warn!(
+                    "Closing the endpoint took longer than {STOP_CLOSE_TIMEOUT:?}; cut short"
+                );
+            }
+            // The runtime ends here, on this thread, and is not kept for a
+            // slower close: the stop that dropped the run future left the
+            // tunnel's tasks detached (`run_tunnel` aborts them only on its
+            // own way out), and the TUN reader among them holds the wintun
+            // adapter. Dropping the runtime waits for its workers, so every
+            // task is gone, and the adapter and bypass routes with them,
+            // before `ezvpn_stop` returns.
+            drop(runtime);
+            // Only now the single-instance lock: until here the old adapter
+            // and routes were still there for another start of this instance
+            // (from another thread or process) to run into.
+            drop(client);
         })
         .map_err(|e| format!("failed to spawn tunnel thread: {e}"))?;
 
@@ -591,7 +672,10 @@ pub unsafe extern "C" fn ezvpn_conn_path(
 /// loop to stop and **waits** for the worker thread to finish its teardown
 /// (routes removed, wintun adapter closed, single-instance lock released)
 /// before returning, so a subsequent [`ezvpn_start`] for the same instance
-/// does not race a half-released lock. After this call `handle` is
+/// does not race a half-released lock. It then waits up to 5 s for the
+/// endpoint's graceful close; a close that takes longer (the network is
+/// gone, say) is cut short. The session's runtime and tasks are gone once
+/// this returns, and the lock is released last. After this call `handle` is
 /// invalid and must not be used again. Passing null is a safe no-op.
 ///
 /// # Safety

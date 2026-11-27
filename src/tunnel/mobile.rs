@@ -62,7 +62,10 @@ use crate::auth::ClientKey;
 use crate::config::VPN_MTU;
 use crate::error::{VpnError, VpnResult};
 use crate::net::device::TunDevice;
-use crate::transport::endpoint::{RelayConfig, connect_with_timeout, create_client_endpoint};
+use crate::transport::endpoint::{
+    PendingCloses, RelayConfig, close_and_finish, close_failed_start, connect_with_timeout,
+    create_client_endpoint,
+};
 use crate::tunnel::client::{
     ServerInfo, calculate_backoff, collect_local_iroh_udp_ports, collect_relay_ips,
     overlapping_underlay_excludes, perform_handshake, run_tunnel,
@@ -170,6 +173,10 @@ impl Link {
 /// A connected, handshaked-but-not-yet-running mobile tunnel session.
 pub struct MobileSession {
     endpoint: Endpoint,
+    /// What the endpoint's creation left running (its startup relay probe),
+    /// to be waited for once the endpoint is closed (see
+    /// [`close_and_finish`]).
+    closes: PendingCloses,
     /// Server address dialed on connect and on every reconnect.
     server_addr: EndpointAddr,
     client_key: ClientKey,
@@ -189,15 +196,29 @@ impl MobileSession {
     /// handshake. The endpoint identity is ephemeral (a fresh key per session),
     /// so the server may assign a different IP on each connect — acceptable for
     /// the MVP.
+    ///
+    /// A connect that fails leaves no endpoint behind: it is closed, and the
+    /// closes are waited for (bounded, see [`close_failed_start`]), before
+    /// the error is returned, since the caller's runtime ends with it.
     pub async fn connect(cfg: MobileConfig) -> VpnResult<Self> {
-        let endpoint = create_client_endpoint(&cfg.relay_config, &cfg.exclude_direct_paths)
-            .await
-            .map_err(|e| VpnError::Signaling(format!("Failed to create iroh endpoint: {e}")))?;
-
         let server_id: EndpointId = cfg
             .server_node_id
             .parse()
             .map_err(|e| VpnError::config_with_source("Invalid server node ID", e))?;
+
+        let closes = PendingCloses::new();
+        let endpoint =
+            match create_client_endpoint(&cfg.relay_config, &cfg.exclude_direct_paths, &closes)
+                .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    close_failed_start(None, &closes).await;
+                    return Err(VpnError::Signaling(format!(
+                        "Failed to create iroh endpoint: {e}"
+                    )));
+                }
+            };
 
         let mut addr = EndpointAddr::new(server_id);
         for url in cfg.relay_config.custom_urls() {
@@ -207,7 +228,7 @@ impl MobileSession {
         // Random per-session id, like the desktop client. The server keys IP
         // allocation by (endpoint id, device id).
         let device_id: u64 = rand::rng().random();
-        let link = establish(
+        let link = match establish(
             &endpoint,
             addr.clone(),
             device_id,
@@ -216,11 +237,19 @@ impl MobileSession {
             &cfg.routes,
             &cfg.routes6,
         )
-        .await?;
+        .await
+        {
+            Ok(link) => link,
+            Err(e) => {
+                close_failed_start(Some(endpoint), &closes).await;
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             current_connection: Arc::new(Mutex::new(link.connection.clone())),
             endpoint,
+            closes,
             server_addr: addr,
             client_key: cfg.client_key,
             relay_config: cfg.relay_config,
@@ -241,6 +270,13 @@ impl MobileSession {
     /// A clone of the endpoint, used for live custom-relay health snapshots.
     pub fn endpoint(&self) -> Endpoint {
         self.endpoint.clone()
+    }
+
+    /// What the endpoint's creation left running (clones share one set), for
+    /// a caller that closes the [`endpoint`](Self::endpoint) clone itself
+    /// after [`Self::run`] has consumed the session.
+    pub fn closes(&self) -> PendingCloses {
+        self.closes.clone()
     }
 
     /// The network parameters for the extension's tunnel settings, for whichever
@@ -338,10 +374,11 @@ impl MobileSession {
         }
     }
 
-    /// Close the iroh endpoint, tearing down the connection. Used when the app
-    /// stops the tunnel before [`Self::run`] (or to force teardown).
+    /// Close the iroh endpoint, tearing down the connection, and wait for
+    /// what its creation left running. Used when the app stops the tunnel
+    /// before [`Self::run`] (or to force teardown).
     pub async fn close(self) {
-        self.endpoint.close().await;
+        close_and_finish(&self.endpoint, &self.closes).await;
     }
 }
 

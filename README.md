@@ -413,6 +413,7 @@ machine-readable output.
 | `--route <CIDR>` | Additional IPv4 route through the VPN; repeatable |
 | `--route6 <CIDR>` | Additional IPv6 route through the VPN; repeatable |
 | `--relay-url <URL>` | Custom relay URL; repeatable |
+| `--relay-quic-addr-discovery <BOOL>` | Whether the custom relays serve QUIC address discovery, all of them or none (default `true`). Pass `false` for relays behind a Cloudflare Tunnel or another HTTP-only front, which otherwise delay startup by up to 3 s. Only valid with custom relays |
 | `--exclude-direct-path <CIDR>` | Keep the tunnel off direct paths to server addresses in this network whenever another path (another direct one or the relay) is available, e.g. another VPN's range; repeatable; replaces `[iroh].exclude_direct_paths` (see [Excluding Direct Paths](#excluding-direct-paths)) |
 | `--auto-reconnect` | Force-enable reconnect |
 | `--no-auto-reconnect` | Exit on the first failed connection attempt or drop instead of retrying |
@@ -856,16 +857,23 @@ The short version as it applies to `ezvpn`:
   attaches to the connection as dial hints. These are **required** for
   connectivity in that mode — with lookup off there is no published record to
   fall back on — so configure both sides with the full relay list.
-- A custom relay set is **at least two distinct relays**: the server rides out
-  a relay outage by moving onto another configured relay, so one relay is
-  rejected at startup.
-- Every configured custom relay is probed individually at startup. Startup
-  fails only when **none** comes online; a relay that does not is named in a
-  warning and left out of the relay map, so a relay that answers probes but
-  refuses connections cannot keep the process from ever coming online. The
-  server's failover puts it back once it is connectable; a client keeps it out
-  for its session. `relay_auth_token` (custom relays only) is validated by the
-  same probe.
+- A custom relay set should hold **two or more distinct relays**: the server
+  rides out a relay outage by moving onto another configured relay. A single
+  relay is accepted as reduced-redundancy mode, with a startup warning and no
+  failover: while that relay is down, new off-LAN connections and those that
+  run only through it fail, and direct connections continue.
+- Every configured custom relay is probed individually at startup, beside the
+  endpoint as it comes online. Startup fails only when **none** comes online;
+  a relay that does not is named in a warning and taken out of the relay map,
+  so a relay that answers probes but refuses connections cannot keep the
+  process from ever coming online. The server's failover puts it back once it
+  is connectable; a client keeps it out for its session. `relay_auth_token`
+  (custom relays only) is validated by the same probe.
+- `relay_quic_addr_discovery` / `--relay-quic-addr-discovery` (custom relays
+  only, default `true`) says whether the relays serve QUIC address discovery,
+  all of them or none. Set it to `false`, on both sides, for relays behind a
+  Cloudflare Tunnel or another HTTP-only front: they cannot serve it, and left
+  on, each start waits out iroh's 3 s probe timeout.
 
 iroh address lookup is endpoint-ID resolution, not real/VPN DNS: it does not
 affect client DNS resolution, and the client does not push DNS or match domains

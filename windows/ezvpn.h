@@ -25,6 +25,10 @@
  *
  * All functions are NULL-safe and never unwind into .NET (release builds are
  * panic = "abort", so a panic terminates the host process instead).
+ *
+ * The DLL is not made to be unloaded: keep it loaded for the life of the
+ * process (no FreeLibrary). Helper threads of the wintun reader can outlive
+ * ezvpn_stop for a moment.
  */
 #ifndef EZVPN_H
 #define EZVPN_H
@@ -107,15 +111,22 @@ int ezvpn_client_public_key(const char *secret_key, char *out_buf, size_t out_le
  * config_json : NUL-terminated UTF-8 JSON, e.g.
  *   {"server_node_id":"<id>","auth_key":"ed25519-sec:...",
  *    "relay_urls":[],"relay_auth_token":null,
+ *    "relay_quic_addr_discovery":null,
  *    "routes":["10.0.0.0/8"],"routes6":["fd00::/8"],
  *    "instance":"default","auto_reconnect":true,"max_reconnect_attempts":null}
  *   auth_key is the client's ed25519 secret key; its public half must be on
  *   the server's authorized_keys file. It and server_node_id are required;
- *   max_reconnect_attempts may be null. relay_urls, relay_auth_token, routes,
- *   routes6, exclude_direct_paths, instance, and auto_reconnect are optional.
+ *   max_reconnect_attempts may be null. relay_urls, relay_auth_token,
+ *   relay_quic_addr_discovery, routes, routes6, exclude_direct_paths,
+ *   instance, and auto_reconnect are optional.
  *   relay_auth_token is the shared bearer token sent to the custom relays as
  *   "Authorization: Bearer <token>"; it is valid ONLY together with relay_urls
  *   and is rejected with the default relays.
+ *   relay_quic_addr_discovery says whether the custom relays serve QUIC
+ *   address discovery, all of them or none (absent or null: true). Pass false
+ *   for relays behind a Cloudflare Tunnel or another HTTP-only front, which
+ *   otherwise delay each start by up to 3 s. Like the token, it is valid ONLY
+ *   together with relay_urls, whichever value it has.
  *   routes/routes6 are the split-tunnel prefixes routed through the tunnel; the
  *   server's advertised gateway host prefix is always routed in addition.
  *   exclude_direct_paths lists networks (CIDR strings, e.g. "100.64.0.0/10")
@@ -204,8 +215,11 @@ int ezvpn_conn_path(const EzvpnHandle *handle, char *out_buf, size_t out_len);
  * Stop the tunnel and free the handle. Signals the run loop to stop and WAITS
  * for the worker to finish teardown (routes removed, wintun adapter closed,
  * single-instance lock released) before returning, so a subsequent ezvpn_start
- * for the same instance does not race a half-released lock. After this call the
- * handle is invalid. Passing NULL is a safe no-op.
+ * for the same instance does not race a half-released lock. It then waits up
+ * to 5 s for the endpoint's graceful close; a close that takes longer (the
+ * network is gone, say) is cut short. The lock is released last, once the
+ * adapter and routes are gone. After this call the handle is invalid. Passing
+ * NULL is a safe no-op.
  */
 void ezvpn_stop(EzvpnHandle *handle);
 

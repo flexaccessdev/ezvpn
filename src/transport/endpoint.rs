@@ -11,7 +11,7 @@ use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use flexaccess_iroh::endpoint::{
-    CreatedEndpoint, EndpointOptions, PendingCloses, create_endpoint, endpoint_builder,
+    CreatedEndpoint, EndpointOptions, close_endpoint, create_endpoint, endpoint_builder,
 };
 use ipnet::IpNet;
 use iroh::{
@@ -22,7 +22,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use flexaccess_iroh::relay::RelayConfig;
+pub use flexaccess_iroh::endpoint::{ENDPOINT_CLOSE_TIMEOUT, PendingCloses};
+pub use flexaccess_iroh::relay::{RelayConfig, RelayProbes};
 
 /// Deadline for establishing the QUIC connection to the VPN server.
 ///
@@ -115,26 +116,29 @@ fn server_builder(relay_config: &RelayConfig, secret: SecretKey) -> Result<Endpo
 /// resolve it by endpoint ID (iroh's relay failover re-homes and republishes on
 /// its own). With custom relays discovery is off, so clients reach the server
 /// through the relay hints they attach to its `EndpointAddr` (see
-/// `VpnClient::resolve_server_addr`). Every custom relay is probed (startup
-/// fails only if none answers), the endpoint is bound without the relays that
-/// failed and must come online. The relays left out come back in
-/// [`CreatedEndpoint::relays_left_out`] for the home-relay failover
-/// (`VpnServer::run`) to restore once they are connectable.
+/// `VpnClient::resolve_server_addr`). The endpoint binds with every custom
+/// relay and must come online, while each relay is probed beside it and taken
+/// out of the relay map if it fails; startup fails only if none answers. The
+/// startup probe comes back in [`CreatedEndpoint::relays`] for the home-relay
+/// failover (`VpnServer::run`), which puts the relays it left out back once
+/// they are connectable.
+///
+/// The probe can outlast the start: its task and probe endpoints, and any
+/// close the creation stops waiting for, are kept in `closes` (see
+/// [`close_and_finish`]).
 pub async fn create_server_endpoint(
     relay_config: &RelayConfig,
     secret: SecretKey,
+    closes: &PendingCloses,
 ) -> Result<CreatedEndpoint> {
-    // The endpoint lives on the process's runtime: a close its creation stops
-    // waiting for finishes there by itself.
-    let closes = PendingCloses::new();
-    create_endpoint(relay_config, server_builder(relay_config, secret)?, &closes).await
+    create_endpoint(relay_config, server_builder(relay_config, secret)?, closes).await
 }
 
 /// Create a client endpoint: ephemeral identity, never published (the client
 /// only dials out; its credential is the auth keypair, not the endpoint id).
-/// Same relay probe and online wait as the server. A relay that failed the
-/// probe stays out for the client's lifetime: it lives one session and runs
-/// no failover.
+/// Same relay probe and online wait as the server, with `closes` as there. A
+/// relay that failed the probe stays out for the client's lifetime: it lives
+/// one session and runs no failover.
 ///
 /// A non-empty `exclude_direct_paths` installs [`ExcludingPathSelector`], so no
 /// direct path to a server address in those networks carries the tunnel;
@@ -142,6 +146,7 @@ pub async fn create_server_endpoint(
 pub async fn create_client_endpoint(
     relay_config: &RelayConfig,
     exclude_direct_paths: &[IpNet],
+    closes: &PendingCloses,
 ) -> Result<Endpoint> {
     let mut builder = base_builder(relay_config, Side::Client)?;
     if !exclude_direct_paths.is_empty() {
@@ -149,9 +154,34 @@ pub async fn create_client_endpoint(
             exclude_direct_paths.to_vec(),
         )));
     }
-    // The endpoint lives on its session's runtime: a close its creation stops
-    // waiting for finishes there by itself.
-    let closes = PendingCloses::new();
-    let CreatedEndpoint { endpoint, .. } = create_endpoint(relay_config, builder, &closes).await?;
+    let CreatedEndpoint { endpoint, .. } = create_endpoint(relay_config, builder, closes).await?;
     Ok(endpoint)
+}
+
+/// Close `endpoint` gracefully, then wait for what its creation left running
+/// in `closes`: the startup relay probe, whose probe endpoints stay open for
+/// up to 10 s after the start when a relay does not answer (the endpoint's
+/// close stops the probe, which closes them), and any close the creation
+/// stopped waiting for. A runtime that ended sooner would drop them without
+/// `close()`. Neither close has a deadline of its own: the caller bounds the
+/// whole.
+pub async fn close_and_finish(endpoint: &Endpoint, closes: &PendingCloses) {
+    endpoint.close().await;
+    closes.finished().await;
+}
+
+/// Clean up after a start that failed, for a caller whose runtime ends with
+/// it (the FFI sessions, and the CLI as it exits with the error): close
+/// `endpoint` if it was created, then wait for what is still closing in
+/// `closes` (see [`close_and_finish`]; a failed creation leaves its own
+/// closes there too). Each of the two waits is bounded by the shared crate's
+/// 5 s close timeout (the close runs as a task of its own, so that bound
+/// holds whatever the close does), 10 s in all, so that the error is not held
+/// back by a network that does not answer; what is slower is cut short when
+/// the runtime goes.
+pub async fn close_failed_start(endpoint: Option<Endpoint>, closes: &PendingCloses) {
+    if let Some(endpoint) = endpoint {
+        close_endpoint(endpoint, closes).await;
+    }
+    let _ = tokio::time::timeout(ENDPOINT_CLOSE_TIMEOUT, closes.finished()).await;
 }

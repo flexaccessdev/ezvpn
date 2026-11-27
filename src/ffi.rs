@@ -27,10 +27,16 @@
 //! overlapping-server-address bypass. `auth_key` (the client's
 //! `ed25519-sec:...` secret key, whose public half must be on the server's
 //! authorized-keys file) and `server_node_id` are required; `relay_urls`,
-//! `relay_auth_token`, `routes`, and `routes6` are all optional.
+//! `relay_auth_token`, `relay_quic_addr_discovery`, `routes`, and `routes6`
+//! are all optional.
 //! `relay_auth_token` is the shared bearer token for the custom relays (sent as
 //! `Authorization: Bearer <token>`); it is only valid together with
 //! `relay_urls` and is rejected with the default relays.
+//! `relay_quic_addr_discovery` says whether the custom relays serve QUIC
+//! address discovery, all of them or none (absent or null: true); false is for
+//! relays behind a Cloudflare Tunnel or another HTTP-only front, which
+//! otherwise delay each connect by up to 3 s. Like the token, it is rejected
+//! with the default relays, whichever value it has.
 //!
 //! ```json
 //! {
@@ -38,6 +44,7 @@
 //!   "auth_key": "ed25519-sec:...",
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_auth_token": "<optional shared relay bearer token>",
+//!   "relay_quic_addr_discovery": null,
 //!   "routes": ["10.0.0.0/8"],
 //!   "routes6": ["fd00::/8"]
 //! }
@@ -75,7 +82,7 @@ use serde::Deserialize;
 
 use crate::error::{VpnError, VpnResult};
 use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison, write_cstr};
-use crate::transport::endpoint::RelayConfig;
+use crate::transport::endpoint::{PendingCloses, RelayConfig, close_and_finish};
 use crate::transport::paths::connection_snapshot;
 use crate::tunnel::mobile::{MobileConfig, MobileSession, SessionEvent, SessionEvents};
 
@@ -89,8 +96,8 @@ pub(crate) type ExitHook = Box<dyn FnOnce(&VpnResult<()>) + Send + 'static>;
 
 /// Upper bound on the graceful endpoint close in [`EzvpnHandle::stop`]. The
 /// CONNECTION_CLOSE goes out immediately; this only caps how long the
-/// teardown thread waits for the peer's acknowledgement before dropping the
-/// runtime.
+/// teardown thread waits for the peer's acknowledgement, and for the startup
+/// relay probe's endpoints to close, before dropping the runtime.
 const STOP_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Opaque handle owned by the app side. Created by [`ezvpn_connect`], freed by
@@ -115,6 +122,9 @@ pub struct EzvpnHandle {
     /// Clone of the session's iroh endpoint, kept so [`EzvpnHandle::stop`] can
     /// close it gracefully after `ezvpn_run` consumed the session.
     endpoint: iroh::Endpoint,
+    /// What the endpoint's creation left running (its startup relay probe),
+    /// waited for after the endpoint's close in [`EzvpnHandle::stop`].
+    closes: PendingCloses,
     /// Configured custom relays, retained so [`ezvpn_conn_path`] can probe their
     /// `/healthz` on demand.
     relay_config: RelayConfig,
@@ -132,6 +142,11 @@ struct FfiConfig {
     /// `relay_urls`; rejected with the default relays.
     #[serde(default)]
     relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none; absent or null keeps the default, on. Only valid with
+    /// `relay_urls`; rejected with the default relays.
+    #[serde(default)]
+    relay_quic_addr_discovery: Option<bool>,
     /// IPv4 routed prefixes (CIDR strings); used for overlap-bypass computation.
     #[serde(default)]
     routes: Vec<String>,
@@ -285,7 +300,11 @@ pub unsafe extern "C" fn ezvpn_connect(
             if unsafe { write_cstr(out_buf, out_len, &result_json) } {
                 Box::into_raw(Box::new(handle))
             } else {
-                drop(handle);
+                // Stopped as a handle given back would be, not dropped: the
+                // server has assigned this session an address, which only a
+                // graceful close frees at once, and the startup relay probe
+                // may still be running on the runtime.
+                Box::new(handle).stop();
                 unsafe {
                     write_cstr(
                         out_buf,
@@ -309,8 +328,12 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
     let cfg: FfiConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
 
-    let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
-        .map_err(|e| format!("{e:#}"))?;
+    let relay_config = RelayConfig::from_settings(
+        &cfg.relay_urls,
+        cfg.relay_auth_token,
+        cfg.relay_quic_addr_discovery,
+    )
+    .map_err(|e| format!("{e:#}"))?;
     let client_key = crate::auth::ClientKey::from_secret_str(cfg.auth_key.trim())
         .map_err(|e| format!("invalid auth key: {e:#}"))?;
     let ios_config = MobileConfig {
@@ -355,6 +378,7 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
 
     let connection = session.connection_cell();
     let endpoint = session.endpoint();
+    let closes = session.closes();
     Ok((
         EzvpnHandle {
             runtime,
@@ -363,6 +387,7 @@ pub(crate) fn connect_inner(json: &str) -> Result<(EzvpnHandle, String), String>
             stopped: Arc::new(Mutex::new(false)),
             connection,
             endpoint,
+            closes,
             relay_config,
         },
         result_json,
@@ -514,6 +539,7 @@ impl EzvpnHandle {
             session,
             task,
             endpoint,
+            closes,
             connection,
             ..
         } = *self;
@@ -532,8 +558,11 @@ impl EzvpnHandle {
             // The timeout's timer must be created inside the runtime context
             // (`tokio::time::timeout` registers it eagerly), so build it in the
             // async block rather than on this plain thread.
+            // The endpoint's close also stops a startup relay probe still
+            // running, whose probe endpoints then close; both are waited for
+            // so that the runtime does not go with them half closed.
             let close = runtime.block_on(async {
-                tokio::time::timeout(STOP_CLOSE_TIMEOUT, endpoint.close()).await
+                tokio::time::timeout(STOP_CLOSE_TIMEOUT, close_and_finish(&endpoint, &closes)).await
             });
             match close {
                 Ok(()) => log::info!("ezvpn stop: endpoint closed in {:?}", started.elapsed()),

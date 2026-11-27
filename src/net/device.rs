@@ -2890,7 +2890,8 @@ async fn run_powershell(script: &str) -> VpnResult<std::process::Output> {
         .map_err(|e| VpnError::tun_device_with_source("Failed to execute PowerShell", e))
 }
 
-/// Run a PowerShell script via the in-box `powershell.exe` (blocking, for Drop).
+/// Run a PowerShell script via the in-box `powershell.exe` (blocking: for
+/// `Drop`, and for a change that must run to its end).
 #[cfg(target_os = "windows")]
 fn run_powershell_sync(script: &str) -> std::io::Result<std::process::Output> {
     std::process::Command::new(windows_powershell_path())
@@ -3030,19 +3031,42 @@ pub async fn add_bypass_route(
         route_info.gateway
     );
 
-    // Add host-specific route
-    let outcome = add_bypass_route_impl(&route_info).await?;
-
-    Ok(BypassRouteGuard {
-        peer_ip,
-        device: route_info.device,
-        gateway: route_info.gateway,
-        gateway_str: route_info.gateway_str,
-        if_index: route_info.if_index,
-        // Only remove the route on drop if this process actually created it; a
-        // pre-existing route belongs to the system and must be left intact.
-        owned: outcome == RouteAddOutcome::Added,
+    // Add the host-specific route. The route is on the underlay interface,
+    // so nothing but its guard ever removes it, and the two must not come
+    // apart.
+    run_uncancelled(move || {
+        let outcome = add_bypass_route_impl(&route_info)?;
+        Ok(BypassRouteGuard {
+            peer_ip,
+            device: route_info.device,
+            gateway: route_info.gateway,
+            gateway_str: route_info.gateway_str,
+            if_index: route_info.if_index,
+            // Only remove the route on drop if this process actually created it; a
+            // pre-existing route belongs to the system and must be left intact.
+            owned: outcome == RouteAddOutcome::Added,
+        })
     })
+    .await
+}
+
+/// Run `add`, which changes the system and returns the guard that undoes the
+/// change, so that the change never outlives its guard: on a blocking thread,
+/// to its end, whatever becomes of the caller.
+///
+/// A caller that is cancelled while it waits (a stop during the connect drops
+/// the whole run future) would otherwise leave a command that is still
+/// running to finish with nobody holding the guard. Here `add` still returns
+/// its guard, to a task nobody waits for, which drops it and so undoes the
+/// change. A runtime that is dropped waits for that too; one shut down
+/// without waiting ([`tokio::runtime::Runtime::shutdown_background`]) does
+/// not.
+async fn run_uncancelled<G: Send + 'static>(
+    add: impl FnOnce() -> VpnResult<G> + Send + 'static,
+) -> VpnResult<G> {
+    tokio::task::spawn_blocking(add)
+        .await
+        .map_err(|e| VpnError::tun_device(format!("Route change did not run to its end: {e}")))?
 }
 
 /// Decide the route info to use for a bypass route, applying the captured
@@ -3128,9 +3152,9 @@ fn resolve_bypass_route_info(
     Ok(route_info)
 }
 
-/// Implementation of adding a bypass route (Linux).
+/// Implementation of adding a bypass route (Linux, blocking).
 #[cfg(target_os = "linux")]
-async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
+fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
     let prefix = if info.peer_ip.is_ipv4() { 32 } else { 128 };
 
     let mut args: Vec<String> = Vec::new();
@@ -3155,10 +3179,9 @@ async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutc
     args.extend(["dev".to_string(), info.device.clone()]);
 
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = Command::new("ip")
+    let output = std::process::Command::new("ip")
         .args(&args_ref)
         .output()
-        .await
         .map_err(|e| VpnError::tun_device_with_source("Failed to add bypass route", e))?;
 
     if output.status.success() {
@@ -3189,9 +3212,9 @@ async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutc
     )))
 }
 
-/// Implementation of adding a bypass route (macOS).
+/// Implementation of adding a bypass route (macOS, blocking).
 #[cfg(target_os = "macos")]
-async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
+fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
     let mut args: Vec<String> = vec!["add".to_string()];
 
     if info.peer_ip.is_ipv6() {
@@ -3213,10 +3236,9 @@ async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutc
     args.push(gw_str.clone());
 
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = Command::new("route")
+    let output = std::process::Command::new("route")
         .args(&args_ref)
         .output()
-        .await
         .map_err(|e| VpnError::tun_device_with_source("Failed to add bypass route", e))?;
 
     if output.status.success() {
@@ -3244,9 +3266,9 @@ async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutc
     )))
 }
 
-/// Implementation of adding a bypass route (Windows).
+/// Implementation of adding a bypass route (Windows, blocking).
 #[cfg(target_os = "windows")]
-async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
+fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
     let prefix = if info.peer_ip.is_ipv4() { 32 } else { 128 };
 
     // `add_bypass_route` guarantees a gateway is present; refuse the link-scope
@@ -3276,7 +3298,8 @@ async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutc
         gw = gw
     );
 
-    let output = run_powershell(&script).await?;
+    let output = run_powershell_sync(&script)
+        .map_err(|e| VpnError::tun_device_with_source("Failed to execute PowerShell", e))?;
     if output.status.success() {
         log::info!(
             "Added bypass route {}/{} via if {} gw {}",
@@ -3313,7 +3336,7 @@ async fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutc
 
 /// Implementation of adding a bypass route (unsupported platforms).
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn add_bypass_route_impl(_info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
+fn add_bypass_route_impl(_info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
     Err(VpnError::tun_device(
         "Bypass route not supported on this platform",
     ))
@@ -3531,6 +3554,39 @@ fn remove_bypass_route_sync(
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    /// A caller cancelled while the change is being made must not leave it
+    /// behind: the change still runs to its end, and its guard is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_uncancelled_undoes_the_change_of_a_cancelled_caller() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct Undo(mpsc::Sender<&'static str>);
+        impl Drop for Undo {
+            fn drop(&mut self) {
+                let _ = self.0.send("undone");
+            }
+        }
+
+        let (events_tx, events) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let caller = tokio::spawn(run_uncancelled(move || {
+            events_tx.send("started").unwrap();
+            // The command is still running when the caller goes away.
+            released.recv().unwrap();
+            events_tx.send("changed").unwrap();
+            Ok(Undo(events_tx))
+        }));
+
+        let wait = Duration::from_secs(10);
+        assert_eq!(events.recv_timeout(wait), Ok("started"));
+        caller.abort();
+        assert!(caller.await.is_err_and(|e| e.is_cancelled()));
+        release.send(()).unwrap();
+        assert_eq!(events.recv_timeout(wait), Ok("changed"));
+        assert_eq!(events.recv_timeout(wait), Ok("undone"));
+    }
 
     #[test]
     fn test_expand_default_route4_splits_only_default() {

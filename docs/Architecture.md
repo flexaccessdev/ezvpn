@@ -820,16 +820,31 @@ relay **in place**: same node id, same sockets, same direct paths, same
 established connections, same TUN device. Nothing is rebuilt. The removed
 relay is probed every 90 s (`RELAY_RESTORE_INTERVAL`) and put back once it is
 connectable again. Relays that failed the **startup** probe are handled the
-same way: the endpoint is bound without them (`CreatedEndpoint::relays_left_out`,
-which `run` receives) and the failover restores them, so a process that
-starts during such an outage still comes online on the relay that works.
+same way: the probe runs beside the endpoint as it comes online and takes them
+out of the relay map (`CreatedEndpoint::relays`, which `run` receives and the
+failover waits for), and the failover restores them, so a process that starts
+during such an outage still comes online on the relay that works. That probe
+can outlast the start by up to its 10 s timeout, so each endpoint's creator
+keeps a `PendingCloses` and waits for it after closing the endpoint
+(`close_and_finish` in `transport/endpoint.rs`): the close stops the probe,
+and the probe's own endpoints must be closed before the runtime goes.
 
 A reconnect at any point resets the outage clock. Non-home relays are connected
 on demand and dropped after a minute idle, which is normal and never counts as
 an outage. With the default relays the failover is pending forever:
 reachability there rests on n0 publishing/resolution, not on one relay
-registration. A custom relay set must therefore hold at least two distinct
-relays, which `RelayConfig` enforces at startup.
+registration. A custom relay set should therefore hold at least two distinct
+relays. A single one is accepted as reduced-redundancy mode
+(`RelayConfig::is_single_relay`, a warning at startup): there is nothing to
+move onto, so the failover only nudges the endpoint into a fresh net report
+and iroh keeps retrying that relay.
+
+Whether the custom relays serve QUIC address discovery is one setting for all
+of them (`relay_quic_addr_discovery`, on by default as in iroh), carried in
+`RelayConfig` and built with `RelayConfig::from_settings` from the config
+file, the CLI and both FFI configs. Relays behind an HTTP-only front such as
+a Cloudflare Tunnel cannot serve it, and with it left on every start waits
+out iroh's 3 s probe timeout.
 
 The failover is shared with tunnel-rs and flextunnel through that crate: fix it
 there, tag a release, and bump the tag here. Until flexaccess-iroh v0.0.7 this
