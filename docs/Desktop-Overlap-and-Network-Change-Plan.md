@@ -114,7 +114,7 @@ se:
   already redials (and the §1 check runs again on the new network). The one
   caveat to weigh at implementation time: a QUIC session that *survives* a
   network change keeps bypass-route pins whose next hops were resolved for
-  the old network (on Windows explicitly via `Find-NetRoute`). If stale pins
+  the old network (on Windows explicitly via `GetBestRoute2`). If stale pins
   prove to be a real problem, end such sessions as
   `VpnError::ConnectionLost("network changed")` — recoverable, counter reset,
   clean redial — but that is a refinement, not the goal.
