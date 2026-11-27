@@ -11,7 +11,7 @@ use crate::tunnel::signaling::VPN_ALPN;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use flexaccess_iroh::endpoint::{
-    CreatedEndpoint, EndpointOptions, create_endpoint, endpoint_builder,
+    CreatedEndpoint, EndpointOptions, close_endpoint, create_endpoint, endpoint_builder,
 };
 use ipnet::IpNet;
 use iroh::{
@@ -22,8 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use flexaccess_iroh::endpoint::PendingCloses;
-use flexaccess_iroh::endpoint::{ENDPOINT_CLOSE_TIMEOUT, close_endpoint};
+pub use flexaccess_iroh::endpoint::{ENDPOINT_CLOSE_TIMEOUT, PendingCloses, tear_down_runtime};
 pub use flexaccess_iroh::relay::{RelayConfig, RelayProbes};
 
 /// Deadline for establishing the QUIC connection to the VPN server.
@@ -172,12 +171,14 @@ pub async fn close_and_finish(endpoint: &Endpoint, closes: &PendingCloses) {
 }
 
 /// Clean up after a start that failed, for a caller whose runtime ends with
-/// it (the FFI sessions): close `endpoint` if it was created, then wait for
-/// what is still closing in `closes` (see [`close_and_finish`]; a failed
-/// creation leaves its own closes there too). Each of the two waits is
-/// bounded by the shared crate's 5 s close timeout, so that the error is not
-/// held back by a network that does not answer; what is slower is cut short
-/// when the runtime goes.
+/// it (the FFI sessions, and the CLI as it exits with the error): close
+/// `endpoint` if it was created, then wait for what is still closing in
+/// `closes` (see [`close_and_finish`]; a failed creation leaves its own
+/// closes there too). Each of the two waits is bounded by the shared crate's
+/// 5 s close timeout (the close runs as a task of its own, so that bound
+/// holds whatever the close does), 10 s in all, so that the error is not held
+/// back by a network that does not answer; what is slower is cut short when
+/// the runtime goes.
 pub async fn close_failed_start(endpoint: Option<Endpoint>, closes: &PendingCloses) {
     if let Some(endpoint) = endpoint {
         close_endpoint(endpoint, closes).await;

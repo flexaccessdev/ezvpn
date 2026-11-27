@@ -26,8 +26,9 @@
 //!    on Apple): every iroh path plus custom-relay health. Never
 //!    polled, since it makes a `/healthz` request per custom relay.
 //! 4. [`ezvpn_stop`] — signal the loop to stop, wait for the routes/TUN teardown
-//!    to complete (the run future's `Drop` removes routes and closes wintun),
-//!    then free the handle.
+//!    to complete (the run future's `Drop` removes routes and closes wintun)
+//!    and, for a bounded time, for the endpoint's graceful close, then free the
+//!    handle.
 //!
 //! All functions are null-safe and never unwind across the FFI boundary (the
 //! release profile is `panic = "abort"`, so a panic terminates the host process
@@ -99,9 +100,26 @@ use crate::config::VpnClientConfig;
 use crate::control::{ClientEvent, ClientStatusHandle};
 use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison, write_cstr};
 use crate::transport::endpoint::{
-    PendingCloses, RelayConfig, close_and_finish, close_failed_start, create_client_endpoint,
+    ENDPOINT_CLOSE_TIMEOUT, PendingCloses, RelayConfig, close_and_finish, close_failed_start,
+    create_client_endpoint, tear_down_runtime,
 };
 use crate::tunnel::client::VpnClient;
+
+/// How long the worker thread, and so [`ezvpn_stop`], waits for the endpoint's
+/// graceful close once the tunnel is torn down. The CONNECTION_CLOSE goes out
+/// at once; this caps the wait for the server's acknowledgement and for the
+/// startup relay probe's endpoints to close. iroh's close has no deadline of
+/// its own, and the network may be what is gone. Only the wait is bounded: a
+/// slower close finishes in the background (see [`tear_down_runtime`]).
+///
+/// The shared crate's 5 s rather than the CLI's 3 s: with a connection attempt
+/// in flight to a server that does not answer, iroh's close takes about 3 s
+/// by itself (it waits out the attempt's drain period), and a bound of 3 s
+/// would cut that ordinary case off every time.
+const STOP_CLOSE_TIMEOUT: std::time::Duration = ENDPOINT_CLOSE_TIMEOUT;
+
+/// The thread a close that outlasts [`STOP_CLOSE_TIMEOUT`] finishes on.
+const CLOSE_THREAD_NAME: &str = "ezvpn-close";
 
 /// Opaque handle owned by the .NET side. Created by [`ezvpn_start`], freed by
 /// [`ezvpn_stop`].
@@ -389,11 +407,15 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                 }
             };
 
-            runtime.block_on(async move {
+            // The session, up to the tunnel's teardown. A session that ran
+            // hands back its endpoint, still open, for the close below; a
+            // start that failed has cleaned up after itself (bounded) and
+            // hands back nothing.
+            let session = runtime.block_on(async move {
                 // The startup relay probe can outlast the start. What it
-                // leaves running is kept in `closes` and waited for before
-                // this block returns, on every way out: the runtime ends
-                // with it.
+                // leaves running is kept in `closes` and waited for after the
+                // endpoint's close, on every way out: the runtime ends with
+                // the session.
                 let closes = PendingCloses::new();
                 let endpoint = match create_client_endpoint(
                     &relay_config,
@@ -406,7 +428,7 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create iroh endpoint: {e}")));
                         close_failed_start(None, &closes).await;
-                        return;
+                        return None;
                     }
                 };
 
@@ -415,7 +437,7 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create VPN client: {e}")));
                         close_failed_start(Some(endpoint), &closes).await;
-                        return;
+                        return None;
                     }
                 };
 
@@ -442,13 +464,13 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                 if setup_tx.send(Ok(status.clone())).is_err() {
                     // The starter gave up (dropped the receiver); nothing to run.
                     close_failed_start(Some(endpoint), &closes).await;
-                    return;
+                    return None;
                 }
 
                 // Race the run loop against the shutdown signal. When shutdown
                 // wins, the run future is dropped here, which runs the
                 // RouteGuard / TUN `Drop`s (removing routes, closing wintun)
-                // before this block returns and the runtime is torn down.
+                // before this block returns.
                 tokio::select! {
                     result = run_client(&client, &endpoint, &relay_config, auto_reconnect, max_attempts) => {
                         // The loop ended on its own and has already torn the
@@ -472,8 +494,26 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                     }
                 }
 
-                close_and_finish(&endpoint, &closes).await;
+                Some((endpoint, closes))
             });
+            let Some((endpoint, closes)) = session else {
+                return;
+            };
+
+            // The tunnel is down and the client, with its single-instance
+            // lock, dropped. Close the endpoint so the server frees this
+            // client's session now, then wait for what the startup relay
+            // probe left running. `ezvpn_stop` joins this thread, so the wait
+            // is bounded; the close is not: one still running when the wait
+            // is up keeps the runtime, on a thread of its own, until it is
+            // over, where dropping the runtime here would cut it short.
+            let close = async move { close_and_finish(&endpoint, &closes).await };
+            if !tear_down_runtime(runtime, close, STOP_CLOSE_TIMEOUT, CLOSE_THREAD_NAME) {
+                log::warn!(
+                    "Closing the endpoint is taking longer than {STOP_CLOSE_TIMEOUT:?}; \
+                     stopped, and the close goes on in the background"
+                );
+            }
         })
         .map_err(|e| format!("failed to spawn tunnel thread: {e}"))?;
 
@@ -622,7 +662,9 @@ pub unsafe extern "C" fn ezvpn_conn_path(
 /// loop to stop and **waits** for the worker thread to finish its teardown
 /// (routes removed, wintun adapter closed, single-instance lock released)
 /// before returning, so a subsequent [`ezvpn_start`] for the same instance
-/// does not race a half-released lock. After this call `handle` is
+/// does not race a half-released lock. It then waits up to 5 s for the
+/// endpoint's graceful close; a close that takes longer (the network is
+/// gone, say) finishes in the background. After this call `handle` is
 /// invalid and must not be used again. Passing null is a safe no-op.
 ///
 /// # Safety

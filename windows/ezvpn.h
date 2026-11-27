@@ -211,7 +211,9 @@ int ezvpn_conn_path(const EzvpnHandle *handle, char *out_buf, size_t out_len);
  * Stop the tunnel and free the handle. Signals the run loop to stop and WAITS
  * for the worker to finish teardown (routes removed, wintun adapter closed,
  * single-instance lock released) before returning, so a subsequent ezvpn_start
- * for the same instance does not race a half-released lock. After this call the
+ * for the same instance does not race a half-released lock. It then waits up
+ * to 5 s for the endpoint's graceful close; a close that takes longer (the
+ * network is gone, say) finishes in the background. After this call the
  * handle is invalid. Passing NULL is a safe no-op.
  */
 void ezvpn_stop(EzvpnHandle *handle);

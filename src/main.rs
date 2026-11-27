@@ -33,7 +33,8 @@ use ezvpn::config::file_config::{
 };
 use ezvpn::runtime::LockRole;
 use ezvpn::transport::endpoint::{
-    PendingCloses, close_and_finish, create_client_endpoint, create_server_endpoint, load_secret,
+    PendingCloses, close_and_finish, close_failed_start, create_client_endpoint,
+    create_server_endpoint, load_secret,
 };
 use ezvpn::transport::{
     CongestionConfig, CongestionControl, parse_congestion_initial_window, set_congestion_config,
@@ -1006,12 +1007,17 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // connection fails. A single endpoint serves both relay modes; internet
     // discovery follows the mode (on for default relays, off for custom).
     // The startup relay probe (`relays`) can outlast the start; what it leaves
-    // running is kept in `closes` and waited for at shutdown.
+    // running is kept in `closes` and waited for at shutdown, and before a
+    // start that fails returns its error.
     let closes = PendingCloses::new();
     let CreatedEndpoint { endpoint, relays } =
-        create_server_endpoint(&resolved.relay_config, secret_key, &closes)
-            .await
-            .context("Failed to create iroh endpoint")?;
+        match create_server_endpoint(&resolved.relay_config, secret_key, &closes).await {
+            Ok(created) => created,
+            Err(e) => {
+                close_failed_start(None, &closes).await;
+                return Err(e).context("Failed to create iroh endpoint");
+            }
+        };
 
     log::info!(
         "Clients connect with: ezvpn client start --server-node-id {} --auth-key-file <KEY FILE>",
@@ -1019,15 +1025,25 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     );
 
     // Create and run VPN server
-    let server = VpnServer::new(config, endpoint.id())
-        .await
-        .context("Failed to create VPN server")?;
+    let server = match VpnServer::new(config, endpoint.id()).await {
+        Ok(server) => server,
+        Err(e) => {
+            close_failed_start(Some(endpoint), &closes).await;
+            return Err(e).context("Failed to create VPN server");
+        }
+    };
 
     let close_endpoint = endpoint.clone();
     let run = server.run(endpoint, &resolved.relay_config, &relays);
     tokio::pin!(run);
     let result = tokio::select! {
-        res = &mut run => res,
+        res = &mut run => {
+            // The server ended by itself, on a setup error or with its
+            // endpoint closed: close the endpoint, which is a no-op for one
+            // that is closed already.
+            close_endpoint_bounded(&close_endpoint, &closes).await;
+            res
+        }
         _ = shutdown_signal() => {
             // Close the endpoint so every client gets a CONNECTION_CLOSE now
             // and reconnects (or gives up) at once, instead of finding out at
@@ -1117,21 +1133,33 @@ async fn run_vpn_client(
         log::info!("Excluding direct paths to {net}");
     }
     // The startup relay probe can outlast the start; what it leaves running is
-    // kept in `closes` and waited for at shutdown.
+    // kept in `closes` and waited for at shutdown, and before a start that
+    // fails returns its error.
     let closes = PendingCloses::new();
-    let endpoint = create_client_endpoint(
+    let endpoint = match create_client_endpoint(
         &resolved.relay_config,
         &resolved.exclude_direct_paths,
         &closes,
     )
     .await
-    .context("Failed to create iroh endpoint")?;
+    {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            close_failed_start(None, &closes).await;
+            return Err(e).context("Failed to create iroh endpoint");
+        }
+    };
 
     log::info!("VPN Client Node ID: {}", endpoint.id());
 
     // Create VPN client
-    let client = VpnClient::new(config, instance)
-        .map_err(|e| anyhow::anyhow!("Failed to create VPN client: {}", e))?;
+    let client = match VpnClient::new(config, instance) {
+        Ok(client) => client,
+        Err(e) => {
+            close_failed_start(Some(endpoint), &closes).await;
+            anyhow::bail!("Failed to create VPN client: {}", e);
+        }
+    };
 
     // Surface the daemon log-file path through the status socket (None when
     // running in the foreground).
