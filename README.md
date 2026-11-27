@@ -780,10 +780,10 @@ Because the VPN runs as root, ezvpn's transport stack sets the buffers with
 `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`, which are not subject to the cap.
 
 Measured numbers and the setup they came from are in
-[docs/Benchmarks.md](docs/Benchmarks.md). They track ezvpn across versions and
-techniques; the Tailscale runs alongside are a control on the same machines,
-to tell a slow host from an ezvpn regression, and not a contest between the
-two.
+[docs/Benchmarks.md](docs/Benchmarks.md). They compare the current version
+with an earlier one; the Tailscale runs alongside are a control on the same
+machines, to tell a slow host from an ezvpn regression, and not a contest
+between the two.
 
 ## Reconnect Behavior
 
