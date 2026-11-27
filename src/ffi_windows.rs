@@ -101,7 +101,7 @@ use crate::control::{ClientEvent, ClientStatusHandle};
 use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison, write_cstr};
 use crate::transport::endpoint::{
     ENDPOINT_CLOSE_TIMEOUT, PendingCloses, RelayConfig, close_and_finish, close_failed_start,
-    create_client_endpoint, tear_down_runtime,
+    create_client_endpoint,
 };
 use crate::tunnel::client::VpnClient;
 
@@ -109,17 +109,15 @@ use crate::tunnel::client::VpnClient;
 /// graceful close once the tunnel is torn down. The CONNECTION_CLOSE goes out
 /// at once; this caps the wait for the server's acknowledgement and for the
 /// startup relay probe's endpoints to close. iroh's close has no deadline of
-/// its own, and the network may be what is gone. Only the wait is bounded: a
-/// slower close finishes in the background (see [`tear_down_runtime`]).
+/// its own, and the network may be what is gone. A slower close is cut short:
+/// the runtime goes with the worker thread, and with it every task of the
+/// session.
 ///
 /// The shared crate's 5 s rather than the CLI's 3 s: with a connection attempt
 /// in flight to a server that does not answer, iroh's close takes about 3 s
 /// by itself (it waits out the attempt's drain period), and a bound of 3 s
 /// would cut that ordinary case off every time.
 const STOP_CLOSE_TIMEOUT: std::time::Duration = ENDPOINT_CLOSE_TIMEOUT;
-
-/// The thread a close that outlasts [`STOP_CLOSE_TIMEOUT`] finishes on.
-const CLOSE_THREAD_NAME: &str = "ezvpn-close";
 
 /// Opaque handle owned by the .NET side. Created by [`ezvpn_start`], freed by
 /// [`ezvpn_stop`].
@@ -504,16 +502,26 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
             // lock, dropped. Close the endpoint so the server frees this
             // client's session now, then wait for what the startup relay
             // probe left running. `ezvpn_stop` joins this thread, so the wait
-            // is bounded; the close is not: one still running when the wait
-            // is up keeps the runtime, on a thread of its own, until it is
-            // over, where dropping the runtime here would cut it short.
-            let close = async move { close_and_finish(&endpoint, &closes).await };
-            if !tear_down_runtime(runtime, close, STOP_CLOSE_TIMEOUT, CLOSE_THREAD_NAME) {
+            // is bounded. The endpoint is dropped in there too, on the
+            // runtime it lives on.
+            let closed = runtime.block_on(async move {
+                tokio::time::timeout(STOP_CLOSE_TIMEOUT, close_and_finish(&endpoint, &closes)).await
+            });
+            if closed.is_err() {
                 log::warn!(
-                    "Closing the endpoint is taking longer than {STOP_CLOSE_TIMEOUT:?}; \
-                     stopped, and the close goes on in the background"
+                    "Closing the endpoint took longer than {STOP_CLOSE_TIMEOUT:?}; cut short"
                 );
             }
+            // The runtime ends here, on this thread, and is not kept for a
+            // slower close: the stop that dropped the run future left the
+            // tunnel's tasks detached (`run_tunnel` aborts them only on its
+            // own way out), and the TUN reader among them holds the wintun
+            // adapter. Dropping the runtime waits for its workers, so every
+            // task is gone, and the adapter and bypass routes with them,
+            // before `ezvpn_stop` returns and the same instance can start
+            // again. It also leaves no thread of this library running after
+            // the stop.
+            drop(runtime);
         })
         .map_err(|e| format!("failed to spawn tunnel thread: {e}"))?;
 
@@ -664,8 +672,9 @@ pub unsafe extern "C" fn ezvpn_conn_path(
 /// before returning, so a subsequent [`ezvpn_start`] for the same instance
 /// does not race a half-released lock. It then waits up to 5 s for the
 /// endpoint's graceful close; a close that takes longer (the network is
-/// gone, say) finishes in the background. After this call `handle` is
-/// invalid and must not be used again. Passing null is a safe no-op.
+/// gone, say) is cut short. Nothing of the session is left running once
+/// this returns. After this call `handle` is invalid and must not be used
+/// again. Passing null is a safe no-op.
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`ezvpn_start`] and not already

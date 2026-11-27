@@ -213,8 +213,9 @@ int ezvpn_conn_path(const EzvpnHandle *handle, char *out_buf, size_t out_len);
  * single-instance lock released) before returning, so a subsequent ezvpn_start
  * for the same instance does not race a half-released lock. It then waits up
  * to 5 s for the endpoint's graceful close; a close that takes longer (the
- * network is gone, say) finishes in the background. After this call the
- * handle is invalid. Passing NULL is a safe no-op.
+ * network is gone, say) is cut short. Nothing of the session is left running
+ * once this returns. After this call the handle is invalid. Passing NULL is a
+ * safe no-op.
  */
 void ezvpn_stop(EzvpnHandle *handle);
 

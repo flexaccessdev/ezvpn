@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use flexaccess_iroh::endpoint::{ENDPOINT_CLOSE_TIMEOUT, PendingCloses, tear_down_runtime};
+pub use flexaccess_iroh::endpoint::{ENDPOINT_CLOSE_TIMEOUT, PendingCloses};
 pub use flexaccess_iroh::relay::{RelayConfig, RelayProbes};
 
 /// Deadline for establishing the QUIC connection to the VPN server.

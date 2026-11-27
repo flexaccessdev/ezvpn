@@ -300,7 +300,11 @@ pub unsafe extern "C" fn ezvpn_connect(
             if unsafe { write_cstr(out_buf, out_len, &result_json) } {
                 Box::into_raw(Box::new(handle))
             } else {
-                drop(handle);
+                // Stopped as a handle given back would be, not dropped: the
+                // server has assigned this session an address, which only a
+                // graceful close frees at once, and the startup relay probe
+                // may still be running on the runtime.
+                Box::new(handle).stop();
                 unsafe {
                     write_cstr(
                         out_buf,
