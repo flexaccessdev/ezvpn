@@ -1330,11 +1330,9 @@ mod windows_routes {
         let family = if ipv6 { AF_INET6 } else { AF_INET };
         let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
         status(unsafe { GetIpForwardTable2(family, &mut table) })?;
-        // SAFETY: on success `table` points at `NumEntries` rows, which stay
-        // valid until `FreeMibTable` below.
-        let rows = unsafe {
-            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
-        };
+        // SAFETY: on success `table` is a valid table, which stays valid
+        // until `FreeMibTable` below.
+        let rows = unsafe { table_rows(table) };
         let best = rows
             .iter()
             .filter(|row| row.DestinationPrefix.PrefixLength == 0)
@@ -1353,6 +1351,23 @@ mod windows_routes {
                 format!("no {} default route", if ipv6 { "IPv6" } else { "IPv4" }),
             ))
         })
+    }
+
+    /// The rows of `table`, which holds `NumEntries` of them from `Table`
+    /// on, past the one the struct declares.
+    ///
+    /// The rows are reached through the field's raw address: a pointer taken
+    /// from a reference to `Table` (`Table.as_ptr()`) may only reach that
+    /// declared one-row array.
+    ///
+    /// # Safety
+    /// `table` must point at a table whose `NumEntries` rows are initialized
+    /// and outlive `'a`.
+    unsafe fn table_rows<'a>(table: *const MIB_IPFORWARD_TABLE2) -> &'a [MIB_IPFORWARD_ROW2] {
+        unsafe {
+            let first = std::ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>();
+            std::slice::from_raw_parts(first, (*table).NumEntries as usize)
+        }
     }
 
     /// The IP interface `route` leaves by, for its metric and state; `None`
@@ -1528,6 +1543,31 @@ mod windows_routes {
             assert_eq!(ip_of(&sockaddr(Ipv6Addr::UNSPECIFIED.into())), None);
             let unknown: SOCKADDR_INET = unsafe { std::mem::zeroed() };
             assert_eq!(ip_of(&unknown), None);
+        }
+
+        #[test]
+        fn table_rows_reaches_every_row_past_the_declared_one() {
+            use std::alloc::{Layout, alloc_zeroed, dealloc};
+            use std::mem::{align_of, size_of};
+            // A table as GetIpForwardTable2 lays one out: the header, then
+            // two rows where the struct declares one.
+            let layout = Layout::from_size_align(
+                size_of::<MIB_IPFORWARD_TABLE2>() + size_of::<MIB_IPFORWARD_ROW2>(),
+                align_of::<MIB_IPFORWARD_TABLE2>(),
+            )
+            .unwrap();
+            unsafe {
+                let table = alloc_zeroed(layout).cast::<MIB_IPFORWARD_TABLE2>();
+                assert!(!table.is_null(), "allocation failed");
+                (*table).NumEntries = 2;
+                let first = std::ptr::addr_of_mut!((*table).Table).cast::<MIB_IPFORWARD_ROW2>();
+                (*first).InterfaceIndex = 7;
+                (*first.add(1)).InterfaceIndex = 9;
+                let rows = table_rows(table);
+                let indices: Vec<u32> = rows.iter().map(|row| row.InterfaceIndex).collect();
+                assert_eq!(indices, [7, 9]);
+                dealloc(table.cast(), layout);
+            }
         }
 
         #[test]
