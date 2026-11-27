@@ -406,9 +406,10 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
             };
 
             // The session, up to the tunnel's teardown. A session that ran
-            // hands back its endpoint, still open, for the close below; a
-            // start that failed has cleaned up after itself (bounded) and
-            // hands back nothing.
+            // hands back its endpoint, still open, for the close below, and
+            // its client, for the single-instance lock it holds; a start
+            // that failed has cleaned up after itself (bounded) and hands
+            // back nothing.
             let session = runtime.block_on(async move {
                 // The startup relay probe can outlast the start. What it
                 // leaves running is kept in `closes` and waited for after the
@@ -492,14 +493,13 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                     }
                 }
 
-                Some((endpoint, closes))
+                Some((client, endpoint, closes))
             });
-            let Some((endpoint, closes)) = session else {
+            let Some((client, endpoint, closes)) = session else {
                 return;
             };
 
-            // The tunnel is down and the client, with its single-instance
-            // lock, dropped. Close the endpoint so the server frees this
+            // The tunnel is down. Close the endpoint so the server frees this
             // client's session now, then wait for what the startup relay
             // probe left running. `ezvpn_stop` joins this thread, so the wait
             // is bounded. The endpoint is dropped in there too, on the
@@ -518,10 +518,12 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
             // own way out), and the TUN reader among them holds the wintun
             // adapter. Dropping the runtime waits for its workers, so every
             // task is gone, and the adapter and bypass routes with them,
-            // before `ezvpn_stop` returns and the same instance can start
-            // again. It also leaves no thread of this library running after
-            // the stop.
+            // before `ezvpn_stop` returns.
             drop(runtime);
+            // Only now the single-instance lock: until here the old adapter
+            // and routes were still there for another start of this instance
+            // (from another thread or process) to run into.
+            drop(client);
         })
         .map_err(|e| format!("failed to spawn tunnel thread: {e}"))?;
 
@@ -672,9 +674,9 @@ pub unsafe extern "C" fn ezvpn_conn_path(
 /// before returning, so a subsequent [`ezvpn_start`] for the same instance
 /// does not race a half-released lock. It then waits up to 5 s for the
 /// endpoint's graceful close; a close that takes longer (the network is
-/// gone, say) is cut short. Nothing of the session is left running once
-/// this returns. After this call `handle` is invalid and must not be used
-/// again. Passing null is a safe no-op.
+/// gone, say) is cut short. The session's runtime and tasks are gone once
+/// this returns, and the lock is released last. After this call `handle` is
+/// invalid and must not be used again. Passing null is a safe no-op.
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by [`ezvpn_start`] and not already

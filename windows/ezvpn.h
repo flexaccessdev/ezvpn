@@ -25,6 +25,10 @@
  *
  * All functions are NULL-safe and never unwind into .NET (release builds are
  * panic = "abort", so a panic terminates the host process instead).
+ *
+ * The DLL is not made to be unloaded: keep it loaded for the life of the
+ * process (no FreeLibrary). Helper threads of the wintun reader can outlive
+ * ezvpn_stop for a moment.
  */
 #ifndef EZVPN_H
 #define EZVPN_H
@@ -213,9 +217,9 @@ int ezvpn_conn_path(const EzvpnHandle *handle, char *out_buf, size_t out_len);
  * single-instance lock released) before returning, so a subsequent ezvpn_start
  * for the same instance does not race a half-released lock. It then waits up
  * to 5 s for the endpoint's graceful close; a close that takes longer (the
- * network is gone, say) is cut short. Nothing of the session is left running
- * once this returns. After this call the handle is invalid. Passing NULL is a
- * safe no-op.
+ * network is gone, say) is cut short. The lock is released last, once the
+ * adapter and routes are gone. After this call the handle is invalid. Passing
+ * NULL is a safe no-op.
  */
 void ezvpn_stop(EzvpnHandle *handle);
 
