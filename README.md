@@ -551,9 +551,9 @@ Default routes are installed as split half-routes (`0.0.0.0/1` +
 removed. On Linux, macOS, and Windows, `ezvpn` also installs host-specific
 bypass routes for iroh underlay addresses that would otherwise be captured by
 VPN routes, so full-tunnel routes keep the underlay path to the server/relay
-off the tunnel automatically. On Windows the underlay next hop is resolved with
-the in-box `NetTCPIP` PowerShell cmdlets (`Find-NetRoute` / `Get-NetRoute`) and
-the host route is pinned with `New-NetRoute`.
+off the tunnel automatically. On Windows the underlay next hop is resolved and
+the host route pinned through the IP Helper API (`GetBestRoute2`,
+`GetIpForwardTable2`, `CreateIpForwardEntry2`), as the tunnel's own routes are.
 
 ### Caveat: the transport endpoint address is pinned off the tunnel
 

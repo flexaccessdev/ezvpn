@@ -292,7 +292,7 @@ When both `network` and `network6` are configured, each client normally receives
 |----------|------------|---------------------|------------|
 | Linux | `/dev/net/tun` | `ip route add` | CAP_NET_ADMIN or root |
 | macOS | `utunX` | `route add` | root |
-| Windows | `wintun.dll` | `netsh interface route` (VPN routes); `NetTCPIP` PowerShell cmdlets `Find-NetRoute`/`New-NetRoute` (underlay bypass host routes) | Administrator |
+| Windows | `wintun.dll` | IP Helper API: `CreateIpForwardEntry2`/`DeleteIpForwardEntry2` (VPN routes and underlay bypass host routes), `GetBestRoute2`/`GetIpForwardTable2` (underlay next hop) | Administrator |
 
 **TUN subnet route.** A TUN configured with an address and netmask has the
 whole subnet routed onto it on every platform, as Linux does on its own. macOS

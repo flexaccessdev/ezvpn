@@ -33,6 +33,7 @@ use std::pin::Pin;
 use tokio::io::ReadBuf;
 #[cfg(not(target_vendor = "apple"))]
 use tokio::io::{AsyncRead, AsyncWriteExt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tokio::process::Command;
 use tun::{AbstractDevice, AsyncDevice, Configuration};
 #[cfg(not(target_vendor = "apple"))]
@@ -46,9 +47,9 @@ use std::os::windows::process::CommandExt as _;
 /// `CREATE_NO_WINDOW` process-creation flag.
 ///
 /// The tunnel runs in-process inside the WinUI GUI app, which has no console.
-/// Spawning a console subprocess (`netsh`, `powershell`) from a windowed process
-/// otherwise flashes a transient console window on screen each time a route is
-/// added/removed or the gateway is queried. This flag suppresses that window.
+/// Spawning a console subprocess (`netsh`, for the TUN's IPv6 address) from a
+/// windowed process otherwise flashes a transient console window on screen.
+/// This flag suppresses that window.
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -1196,7 +1197,6 @@ impl TunWriter {
 /// - Linux iproute2: "RTNETLINK answers: File exists"
 /// - macOS route: "route: writing to routing socket: File exists"
 /// - Windows netsh: "The object already exists" or "Element already exists"
-/// - Windows PowerShell (New-NetRoute): "...already exists"
 fn is_already_exists_error(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
     lower.contains("file exists") || lower.contains("eexist") || lower.contains("already exists")
@@ -1209,29 +1209,243 @@ fn is_already_exists_error(stderr: &str) -> bool {
 /// Windows route-table manipulation via the IP Helper API.
 ///
 /// WireGuard and Tailscale manage routes with `CreateIpForwardEntry2` /
-/// `DeleteIpForwardEntry2` against the interface LUID rather than shelling out
-/// to `netsh`; this module does the same. Beyond matching that practice, the
-/// API returns typed error codes — `netsh` prints localized text, so detecting
-/// "already exists" by English string match silently breaks idempotency on
-/// non-English Windows — and it avoids spawning a console subprocess (and the
-/// `CREATE_NO_WINDOW` dance) for every route.
+/// `DeleteIpForwardEntry2` rather than shelling out to `netsh` or the
+/// `NetTCPIP` PowerShell cmdlets; this module does the same, for the tunnel's
+/// routes (against the TUN's LUID) and for the underlay bypass host routes
+/// (against the underlay interface's index), and looks routes up with
+/// `GetBestRoute2` and `GetIpForwardTable2`. Beyond matching that practice,
+/// the API returns typed error codes — the tools print localized text, so
+/// detecting "already exists" by English string match silently breaks
+/// idempotency on non-English Windows — and each call returns at once, where
+/// starting `powershell.exe` cost about 1.5 s per lookup, add and removal.
 #[cfg(target_os = "windows")]
 mod windows_routes {
     use super::RouteAddOutcome;
     use std::io;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        ConvertInterfaceAliasToLuid, CreateIpForwardEntry2, DeleteIpForwardEntry2,
-        MIB_IPFORWARD_ROW2,
+        ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToAlias, CreateIpForwardEntry2,
+        DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIpForwardTable2,
+        GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+        MIB_IPINTERFACE_ROW,
     };
-    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT};
+    use windows_sys::Win32::NetworkManagement::Ndis::{IF_MAX_STRING_SIZE, NET_LUID_LH};
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
+    };
 
-    /// Route metric for TUN routes. Matches the metric the previous
-    /// `netsh interface … add route` calls produced, so upgrading does not
-    /// change effective route selection on existing setups.
+    /// Route metric for TUN routes and bypass host routes. Matches the metric
+    /// the previous `netsh interface … add route` and `New-NetRoute` calls
+    /// produced (their default), so route selection is unchanged.
     const ROUTE_METRIC: u32 = 256;
+
+    /// A route the system holds: the interface it leaves by, its next hop
+    /// (`None` for an on-link route), and that interface's alias.
+    pub struct RouteLookup {
+        pub if_index: u32,
+        pub next_hop: Option<IpAddr>,
+        pub alias: String,
+    }
+
+    fn sockaddr(ip: IpAddr) -> SOCKADDR_INET {
+        let mut addr: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+        match ip {
+            IpAddr::V4(a) => {
+                addr.Ipv4.sin_family = AF_INET;
+                addr.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(a.octets());
+            }
+            IpAddr::V6(a) => {
+                addr.Ipv6.sin6_family = AF_INET6;
+                addr.Ipv6.sin6_addr.u.Byte = a.octets();
+            }
+        }
+        addr
+    }
+
+    /// The address in `addr`, or `None` when it is unspecified (an on-link
+    /// next hop) or of another family.
+    fn ip_of(addr: &SOCKADDR_INET) -> Option<IpAddr> {
+        // SAFETY: every variant of the union starts with the address family,
+        // which says which variant the rest of it is.
+        let ip: IpAddr = unsafe {
+            match addr.si_family {
+                AF_INET => Ipv4Addr::from(addr.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes()).into(),
+                AF_INET6 => Ipv6Addr::from(addr.Ipv6.sin6_addr.u.Byte).into(),
+                _ => return None,
+            }
+        };
+        (!ip.is_unspecified()).then_some(ip)
+    }
+
+    fn status(code: u32) -> io::Result<()> {
+        match code {
+            NO_ERROR => Ok(()),
+            code => Err(io::Error::from_raw_os_error(code as i32)),
+        }
+    }
+
+    /// The alias of the interface `luid` names (what `Get-NetRoute` shows as
+    /// `InterfaceAlias`, and what the TUN device is named by).
+    fn interface_alias(luid: &NET_LUID_LH) -> io::Result<String> {
+        let mut alias = [0u16; IF_MAX_STRING_SIZE as usize + 1];
+        status(unsafe { ConvertInterfaceLuidToAlias(luid, alias.as_mut_ptr(), alias.len()) })?;
+        let len = alias.iter().position(|&c| c == 0).unwrap_or(alias.len());
+        Ok(String::from_utf16_lossy(&alias[..len]))
+    }
+
+    fn lookup(row: &MIB_IPFORWARD_ROW2) -> io::Result<RouteLookup> {
+        Ok(RouteLookup {
+            if_index: row.InterfaceIndex,
+            next_hop: ip_of(&row.NextHop),
+            alias: interface_alias(&row.InterfaceLuid)?,
+        })
+    }
+
+    /// The route the kernel's route selection picks for `dest` right now
+    /// (longest prefix, then metric), as `Find-NetRoute` reports it.
+    pub fn best_route(dest: IpAddr) -> io::Result<RouteLookup> {
+        let dest = sockaddr(dest);
+        let mut route: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+        let mut source: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+        status(unsafe {
+            GetBestRoute2(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &dest,
+                0,
+                &mut route,
+                &mut source,
+            )
+        })?;
+        lookup(&route)
+    }
+
+    /// The default route (`0.0.0.0/0`, or `::/0` when `ipv6`) with the lowest
+    /// effective metric — the route's metric plus its interface's, as the
+    /// kernel ranks them — on a connected interface. `ErrorKind::NotFound`
+    /// when there is none.
+    pub fn default_route(ipv6: bool) -> io::Result<RouteLookup> {
+        let family = if ipv6 { AF_INET6 } else { AF_INET };
+        let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        status(unsafe { GetIpForwardTable2(family, &mut table) })?;
+        // SAFETY: on success `table` is a valid table, which stays valid
+        // until `FreeMibTable` below.
+        let rows = unsafe { table_rows(table) };
+        let best = rows
+            .iter()
+            .filter(|row| row.DestinationPrefix.PrefixLength == 0)
+            .filter_map(|row| {
+                let interface = interface_row(row)?;
+                interface
+                    .Connected
+                    .then_some((row.Metric.saturating_add(interface.Metric), row))
+            })
+            .min_by_key(|(metric, _)| *metric)
+            .map(|(_, row)| lookup(row));
+        unsafe { FreeMibTable(table.cast()) };
+        best.unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no {} default route", if ipv6 { "IPv6" } else { "IPv4" }),
+            ))
+        })
+    }
+
+    /// The rows of `table`, which holds `NumEntries` of them from `Table`
+    /// on, past the one the struct declares.
+    ///
+    /// The rows are reached through the field's raw address: a pointer taken
+    /// from a reference to `Table` (`Table.as_ptr()`) may only reach that
+    /// declared one-row array.
+    ///
+    /// # Safety
+    /// `table` must point at a table whose `NumEntries` rows are initialized
+    /// and outlive `'a`.
+    unsafe fn table_rows<'a>(table: *const MIB_IPFORWARD_TABLE2) -> &'a [MIB_IPFORWARD_ROW2] {
+        unsafe {
+            let first = std::ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>();
+            std::slice::from_raw_parts(first, (*table).NumEntries as usize)
+        }
+    }
+
+    /// The IP interface `route` leaves by, for its metric and state; `None`
+    /// when it cannot be read (the interface is going away).
+    fn interface_row(route: &MIB_IPFORWARD_ROW2) -> Option<MIB_IPINTERFACE_ROW> {
+        let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
+        unsafe { InitializeIpInterfaceEntry(&mut row) };
+        // SAFETY: the family is the first field of every variant.
+        row.Family = unsafe { route.DestinationPrefix.Prefix.si_family };
+        row.InterfaceLuid = route.InterfaceLuid;
+        status(unsafe { GetIpInterfaceEntry(&mut row) }).ok()?;
+        Some(row)
+    }
+
+    /// Build a route row for `dest/prefix_len` via `next_hop`, or on-link
+    /// when `next_hop` is `None`. The caller names the interface.
+    ///
+    /// An on-link next hop is the unspecified address (`0.0.0.0` / `::`), the
+    /// same shape the previous `netsh … interface=<tun>` calls (no `nexthop=`)
+    /// created. Zeroing the struct leaves the remaining fields (`Loopback`,
+    /// `Publish`, `Origin`, …) at their documented defaults; lifetimes are set
+    /// to infinite so the route lives until explicitly deleted (`store=active`
+    /// semantics — it does not survive a reboot).
+    fn route_row(dest: IpAddr, prefix_len: u8, next_hop: Option<IpAddr>) -> MIB_IPFORWARD_ROW2 {
+        let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+        row.DestinationPrefix.PrefixLength = prefix_len;
+        row.DestinationPrefix.Prefix = sockaddr(dest);
+        row.NextHop = match (next_hop, dest) {
+            (Some(hop), _) => sockaddr(hop),
+            (None, IpAddr::V4(_)) => sockaddr(Ipv4Addr::UNSPECIFIED.into()),
+            (None, IpAddr::V6(_)) => sockaddr(Ipv6Addr::UNSPECIFIED.into()),
+        };
+        row.Metric = ROUTE_METRIC;
+        // Administratively added — the same origin netsh and New-NetRoute
+        // stamp (shows as "NetMgmt" in Get-NetRoute), and what the
+        // route-cleanup key expects.
+        row.Protocol = MIB_IPPROTO_NETMGMT;
+        row.ValidLifetime = u32::MAX;
+        row.PreferredLifetime = u32::MAX;
+        row
+    }
+
+    fn host_prefix(ip: IpAddr) -> u8 {
+        if ip.is_ipv4() { 32 } else { 128 }
+    }
+
+    /// Row for the bypass host route `dest/32` (`/128`) via `gateway`, on the
+    /// underlay interface `if_index`.
+    fn host_route_row(if_index: u32, dest: IpAddr, gateway: IpAddr) -> MIB_IPFORWARD_ROW2 {
+        let mut row = route_row(dest, host_prefix(dest), Some(gateway));
+        row.InterfaceIndex = if_index;
+        row
+    }
+
+    /// Add the bypass host route for `dest` via `gateway` on `if_index`.
+    pub fn add_host_route(
+        if_index: u32,
+        dest: IpAddr,
+        gateway: IpAddr,
+    ) -> io::Result<RouteAddOutcome> {
+        let row = host_route_row(if_index, dest, gateway);
+        match unsafe { CreateIpForwardEntry2(&row) } {
+            NO_ERROR => Ok(RouteAddOutcome::Added),
+            ERROR_OBJECT_ALREADY_EXISTS => Ok(RouteAddOutcome::AlreadyExisted),
+            code => Err(io::Error::from_raw_os_error(code as i32)),
+        }
+    }
+
+    /// Remove a host route added by [`add_host_route`]. `Ok(false)` when it
+    /// was already gone (its interface went away, say).
+    pub fn delete_host_route(if_index: u32, dest: IpAddr, gateway: IpAddr) -> io::Result<bool> {
+        let row = host_route_row(if_index, dest, gateway);
+        match unsafe { DeleteIpForwardEntry2(&row) } {
+            NO_ERROR => Ok(true),
+            ERROR_NOT_FOUND => Ok(false),
+            code => Err(io::Error::from_raw_os_error(code as i32)),
+        }
+    }
 
     /// Resolve an interface alias (the TUN device name) to its LUID.
     fn interface_luid(tun_name: &str) -> io::Result<NET_LUID_LH> {
@@ -1243,38 +1457,11 @@ mod windows_routes {
         }
     }
 
-    /// Build the forward row for `dest/prefix_len` on the interface.
-    ///
-    /// The next hop is left unspecified (`0.0.0.0` / `::`), making this an
-    /// on-link interface route — the same shape the previous
-    /// `netsh … interface=<tun>` calls (no `nexthop=`) created. Zeroing the
-    /// struct leaves the remaining fields (`Loopback`, `Publish`, `Origin`, …)
-    /// at their documented defaults; lifetimes are set to infinite so the
-    /// route lives until explicitly deleted (`store=active` semantics — it
-    /// does not survive a reboot because the wintun adapter itself doesn't).
+    /// Row for the on-link tunnel route `dest/prefix_len` on the TUN `luid`
+    /// (the wintun adapter's routes go with it, so none survives a reboot).
     fn forward_row(luid: NET_LUID_LH, dest: IpAddr, prefix_len: u8) -> MIB_IPFORWARD_ROW2 {
-        let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+        let mut row = route_row(dest, prefix_len, None);
         row.InterfaceLuid = luid;
-        row.DestinationPrefix.PrefixLength = prefix_len;
-        match dest {
-            IpAddr::V4(a) => {
-                row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
-                row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr =
-                    u32::from_ne_bytes(a.octets());
-                row.NextHop.Ipv4.sin_family = AF_INET;
-            }
-            IpAddr::V6(a) => {
-                row.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
-                row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte = a.octets();
-                row.NextHop.Ipv6.sin6_family = AF_INET6;
-            }
-        }
-        row.Metric = ROUTE_METRIC;
-        // Administratively added — the same origin netsh stamps (shows as
-        // "NetMgmt" in Get-NetRoute), and what the route-cleanup key expects.
-        row.Protocol = MIB_IPPROTO_NETMGMT;
-        row.ValidLifetime = u32::MAX;
-        row.PreferredLifetime = u32::MAX;
         row
     }
 
@@ -1340,6 +1527,71 @@ mod windows_routes {
                 assert_eq!(row.NextHop.Ipv6.sin6_addr.u.Byte, [0u8; 16]);
             }
             assert_eq!(row.Metric, ROUTE_METRIC);
+        }
+
+        #[test]
+        fn sockaddr_round_trips_both_families() {
+            for ip in ["104.16.230.132", "2606:4700::6810:e684"] {
+                let ip: IpAddr = ip.parse().unwrap();
+                assert_eq!(ip_of(&sockaddr(ip)), Some(ip));
+            }
+        }
+
+        #[test]
+        fn an_unspecified_or_unknown_next_hop_is_on_link() {
+            assert_eq!(ip_of(&sockaddr(Ipv4Addr::UNSPECIFIED.into())), None);
+            assert_eq!(ip_of(&sockaddr(Ipv6Addr::UNSPECIFIED.into())), None);
+            let unknown: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+            assert_eq!(ip_of(&unknown), None);
+        }
+
+        #[test]
+        fn table_rows_reaches_every_row_past_the_declared_one() {
+            use std::alloc::{Layout, alloc_zeroed, dealloc};
+            use std::mem::{align_of, size_of};
+            // A table as GetIpForwardTable2 lays one out: the header, then
+            // two rows where the struct declares one.
+            let layout = Layout::from_size_align(
+                size_of::<MIB_IPFORWARD_TABLE2>() + size_of::<MIB_IPFORWARD_ROW2>(),
+                align_of::<MIB_IPFORWARD_TABLE2>(),
+            )
+            .unwrap();
+            unsafe {
+                let table = alloc_zeroed(layout).cast::<MIB_IPFORWARD_TABLE2>();
+                assert!(!table.is_null(), "allocation failed");
+                (*table).NumEntries = 2;
+                let first = std::ptr::addr_of_mut!((*table).Table).cast::<MIB_IPFORWARD_ROW2>();
+                (*first).InterfaceIndex = 7;
+                (*first.add(1)).InterfaceIndex = 9;
+                let rows = table_rows(table);
+                let indices: Vec<u32> = rows.iter().map(|row| row.InterfaceIndex).collect();
+                assert_eq!(indices, [7, 9]);
+                dealloc(table.cast(), layout);
+            }
+        }
+
+        #[test]
+        fn host_route_row_pins_the_address_via_the_gateway_on_the_interface() {
+            let dest: IpAddr = "104.16.230.132".parse().unwrap();
+            let gateway: IpAddr = "10.22.32.1".parse().unwrap();
+            let row = host_route_row(3, dest, gateway);
+            assert_eq!(row.InterfaceIndex, 3);
+            assert_eq!(
+                unsafe { row.InterfaceLuid.Value },
+                0,
+                "named by index, not LUID"
+            );
+            assert_eq!(row.DestinationPrefix.PrefixLength, 32);
+            assert_eq!(ip_of(&row.DestinationPrefix.Prefix), Some(dest));
+            assert_eq!(ip_of(&row.NextHop), Some(gateway));
+            assert_eq!(row.Metric, ROUTE_METRIC);
+            assert_eq!(row.Protocol, MIB_IPPROTO_NETMGMT);
+
+            let dest6: IpAddr = "2606:4700::6810:e684".parse().unwrap();
+            let gateway6: IpAddr = "fe80::1".parse().unwrap();
+            let row = host_route_row(5, dest6, gateway6);
+            assert_eq!(row.DestinationPrefix.PrefixLength, 128);
+            assert_eq!(ip_of(&row.NextHop), Some(gateway6));
         }
     }
 }
@@ -2448,7 +2700,7 @@ struct BypassRouteInfo {
     /// Used on macOS where link-local addresses need the scope.
     gateway_str: Option<String>,
     /// Interface index of the resolving interface. Set on Windows (used to pin
-    /// the host route via `New-NetRoute -InterfaceIndex`); `None` elsewhere.
+    /// the host route to that interface); `None` elsewhere.
     if_index: Option<u32>,
 }
 
@@ -2545,54 +2797,18 @@ pub async fn query_default_gateway(is_ipv6: bool) -> VpnResult<UnderlayGateway> 
 
 /// Query the system's default-route gateway for one address family (Windows).
 ///
-/// Picks the active default route (`0.0.0.0/0` / `::/0`) with the lowest
-/// *effective* metric (route metric + interface metric), matching the kernel's
-/// route selection.
+/// Picks the default route (`0.0.0.0/0` / `::/0`) with the lowest *effective*
+/// metric (route metric + interface metric) on a connected interface, matching
+/// the kernel's route selection.
 #[cfg(target_os = "windows")]
 pub async fn query_default_gateway(is_ipv6: bool) -> VpnResult<UnderlayGateway> {
-    let (family, prefix) = if is_ipv6 {
-        ("IPv6", "::/0")
-    } else {
-        ("IPv4", "0.0.0.0/0")
-    };
-
-    let script = format!(
-        concat!(
-            "$ErrorActionPreference='Stop'; ",
-            "$r = Get-NetRoute -DestinationPrefix '{prefix}' -AddressFamily {family} ",
-            "-PolicyStore ActiveStore | Select-Object InterfaceIndex,InterfaceAlias,NextHop,",
-            "@{{n='Eff';e={{ $_.RouteMetric + ((Get-NetIPInterface -InterfaceIndex ",
-            "$_.InterfaceIndex -AddressFamily {family} -PolicyStore ActiveStore).InterfaceMetric ",
-            "| Select-Object -First 1) }}}} | Sort-Object Eff | Select-Object -First 1; ",
-            "if ($null -eq $r) {{ throw 'no default route' }}; ",
-            "($r.InterfaceIndex,$r.NextHop,$r.InterfaceAlias) -join [char]9"
-        ),
-        prefix = prefix,
-        family = family
-    );
-
-    let output = run_powershell(&script).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
-        };
-        return Err(VpnError::tun_device(format!(
-            "Failed to query default route: {}",
-            detail
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_windows_route_line(&stdout)?;
+    let route = windows_routes::default_route(is_ipv6)
+        .map_err(|e| VpnError::tun_device(format!("Failed to query default route: {e}")))?;
     Ok(UnderlayGateway {
-        device: parsed.alias,
-        gateway: parsed.next_hop,
-        gateway_str: parsed.next_hop.map(|g| g.to_string()),
-        if_index: Some(parsed.if_index),
+        device: route.alias,
+        gateway: route.next_hop,
+        gateway_str: route.next_hop.map(|g| g.to_string()),
+        if_index: Some(route.if_index),
     })
 }
 
@@ -2823,165 +3039,20 @@ fn parse_macos_route_get(output: &str, peer_ip: IpAddr) -> VpnResult<BypassRoute
     })
 }
 
-// ============================================================================
-// Windows route detection / host-route management (PowerShell NetTCPIP)
-// ============================================================================
-//
-// Windows has no direct `route get <ip>` equivalent, so we drive the in-box
-// `NetTCPIP` PowerShell cmdlets (present on every Windows 8+/Server 2012+, run
-// here via the always-present Windows PowerShell 5.1, resolved by absolute
-// `System32` path rather than `PATH` so a shadowing PowerShell 7 install never
-// shadows it — see `windows_powershell_path`):
-//
-// - `Find-NetRoute -RemoteIPAddress <ip>` runs the kernel's route selection
-//   (longest-prefix + source selection) and returns the chosen `NextHop` and
-//   `InterfaceIndex` for an arbitrary destination — exactly the per-IP lookup
-//   `query_route_for_ip` needs.
-// - `Get-NetRoute -DestinationPrefix 0.0.0.0/0` (or `::/0`), sorted by effective
-//   metric (route metric + interface metric), gives the default-route next hop
-//   captured by `query_default_gateway` before VPN routes are installed.
-// - `New-NetRoute` / `Remove-NetRoute` with `-PolicyStore ActiveStore` add and
-//   remove the per-IP `/32`(`/128`) host route (non-persistent, matching the
-//   `store=active` semantics used by the netsh routes elsewhere).
-//
-// Queries are read-only and need no elevation; only add/remove require the
-// elevation the app already holds to manage the TUN. Scripts are kept free of
-// double quotes and backticks (output uses `-join [char]9`) so they pass cleanly
-// through `Command` as a single argument without Windows quote-escaping hazards.
-// All interpolated values are `IpAddr`/`u32`/static literals, so the
-// single-quoted PowerShell strings cannot be broken out of.
-
-/// Absolute path to the in-box Windows PowerShell 5.1 executable.
-///
-/// Resolving by bare name (`powershell`) goes through `PATH`, which on many
-/// machines is shadowed by PowerShell 7 (`pwsh.exe` symlinked/copied as
-/// `powershell.exe`), a Microsoft Store alias, or another shim. The NetTCPIP
-/// scripts here are written for, and verified against, the always-present
-/// Windows PowerShell 5.1, so we pin to its fixed location under the real
-/// `System32` directory.
-///
-/// `System32` is resolved via the Known Folders API
-/// (`SHGetKnownFolderPath(FOLDERID_System)`) — the same authoritative source
-/// used for `%ProgramData%` — which follows the real install drive and cannot
-/// be redirected by a spoofed `%SystemRoot%`. The `%SystemRoot%` env var, then
-/// the `C:\Windows` literal, are last-ditch fallbacks only reached if that call
-/// fails. The returned path is the native-bitness `System32`; a 64-bit process
-/// reaches `powershell.exe` directly and a 32-bit process is filesystem-
-/// redirected to the matching `SysWOW64` copy, both of which ship NetTCPIP.
-#[cfg(target_os = "windows")]
-fn windows_powershell_path() -> std::path::PathBuf {
-    let system32 = known_folders::get_known_folder_path(known_folders::KnownFolder::System)
-        .unwrap_or_else(|| {
-            let system_root =
-                std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-            std::path::Path::new(&system_root).join("System32")
-        });
-    system32.join(r"WindowsPowerShell\v1.0\powershell.exe")
-}
-
-/// Run a PowerShell script via the in-box `powershell.exe` (async).
-#[cfg(target_os = "windows")]
-async fn run_powershell(script: &str) -> VpnResult<std::process::Output> {
-    Command::new(windows_powershell_path())
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .await
-        .map_err(|e| VpnError::tun_device_with_source("Failed to execute PowerShell", e))
-}
-
-/// Run a PowerShell script via the in-box `powershell.exe` (blocking: for
-/// `Drop`, and for a change that must run to its end).
-#[cfg(target_os = "windows")]
-fn run_powershell_sync(script: &str) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(windows_powershell_path())
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-}
-
-/// Parse a next-hop string from PowerShell, mapping the unspecified address
-/// (`0.0.0.0` / `::`, emitted for on-link routes) to `None` so callers treat it
-/// as "no gateway" and refuse the link-scope host route.
-#[cfg(target_os = "windows")]
-fn parse_windows_next_hop(s: &str) -> Option<IpAddr> {
-    let ip: IpAddr = s.parse().ok()?;
-    if ip.is_unspecified() { None } else { Some(ip) }
-}
-
-/// Parsed `<InterfaceIndex>\t<NextHop>\t<InterfaceAlias>` route line.
-#[cfg(target_os = "windows")]
-struct WindowsRouteLine {
-    if_index: u32,
-    next_hop: Option<IpAddr>,
-    alias: String,
-}
-
-/// Parse the single tab-delimited line emitted by the route-query scripts.
-#[cfg(target_os = "windows")]
-fn parse_windows_route_line(stdout: &str) -> VpnResult<WindowsRouteLine> {
-    let line = stdout
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .ok_or_else(|| VpnError::tun_device("PowerShell route query returned no output"))?;
-
-    let mut parts = line.splitn(3, '\t');
-    let idx_str = parts.next().unwrap_or("").trim();
-    let next_hop_str = parts.next().unwrap_or("").trim();
-    let alias = parts.next().unwrap_or("").trim().to_string();
-
-    let if_index: u32 = idx_str.parse().map_err(|_| {
-        VpnError::tun_device(format!(
-            "Unexpected interface index in route query output: {:?}",
-            idx_str
-        ))
-    })?;
-
-    Ok(WindowsRouteLine {
-        if_index,
-        next_hop: parse_windows_next_hop(next_hop_str),
-        alias,
-    })
-}
-
 /// Query the current route for a given IP address (Windows).
+///
+/// `GetBestRoute2` runs the kernel's route selection (longest prefix, then
+/// metric) for the address, as `route get` does elsewhere.
 #[cfg(target_os = "windows")]
 async fn query_route_for_ip(ip: IpAddr) -> VpnResult<BypassRouteInfo> {
-    let script = format!(
-        concat!(
-            "$ErrorActionPreference='Stop'; ",
-            "$r = Find-NetRoute -RemoteIPAddress '{ip}' ",
-            "| Where-Object {{ $null -ne $_.NextHop }} | Select-Object -First 1; ",
-            "if ($null -eq $r) {{ throw 'no route found for {ip}' }}; ",
-            "($r.InterfaceIndex,$r.NextHop,$r.InterfaceAlias) -join [char]9"
-        ),
-        ip = ip
-    );
-
-    let output = run_powershell(&script).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
-        };
-        return Err(VpnError::tun_device(format!(
-            "Failed to query route for {}: {}",
-            ip, detail
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = parse_windows_route_line(&stdout)?;
+    let route = windows_routes::best_route(ip)
+        .map_err(|e| VpnError::tun_device(format!("Failed to query route for {ip}: {e}")))?;
     Ok(BypassRouteInfo {
         peer_ip: ip,
-        device: parsed.alias,
-        gateway: parsed.next_hop,
-        gateway_str: parsed.next_hop.map(|g| g.to_string()),
-        if_index: Some(parsed.if_index),
+        device: route.alias,
+        gateway: route.next_hop,
+        gateway_str: route.next_hop.map(|g| g.to_string()),
+        if_index: Some(route.if_index),
     })
 }
 
@@ -3286,52 +3357,30 @@ fn add_bypass_route_impl(info: &BypassRouteInfo) -> VpnResult<RouteAddOutcome> {
         )));
     };
 
-    let script = format!(
-        concat!(
-            "$ErrorActionPreference='Stop'; ",
-            "New-NetRoute -DestinationPrefix '{ip}/{prefix}' -InterfaceIndex {idx} ",
-            "-NextHop '{gw}' -PolicyStore ActiveStore -ErrorAction Stop | Out-Null"
-        ),
-        ip = info.peer_ip,
-        prefix = prefix,
-        idx = if_index,
-        gw = gw
-    );
-
-    let output = run_powershell_sync(&script)
-        .map_err(|e| VpnError::tun_device_with_source("Failed to execute PowerShell", e))?;
-    if output.status.success() {
-        log::info!(
-            "Added bypass route {}/{} via if {} gw {}",
-            info.peer_ip,
-            prefix,
-            if_index,
-            gw
-        );
-        return Ok(RouteAddOutcome::Added);
+    match windows_routes::add_host_route(if_index, info.peer_ip, gw) {
+        Ok(RouteAddOutcome::Added) => {
+            log::info!(
+                "Added bypass route {}/{} via if {} gw {}",
+                info.peer_ip,
+                prefix,
+                if_index,
+                gw
+            );
+            Ok(RouteAddOutcome::Added)
+        }
+        Ok(RouteAddOutcome::AlreadyExisted) => {
+            log::warn!(
+                "Bypass route {}/{} already exists (treating as success)",
+                info.peer_ip,
+                prefix
+            );
+            Ok(RouteAddOutcome::AlreadyExisted)
+        }
+        Err(e) => Err(VpnError::tun_device(format!(
+            "Failed to add bypass route {}/{}: {}",
+            info.peer_ip, prefix, e
+        ))),
     }
-
-    // PowerShell errors land on stderr; check both for the idempotent case.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if is_already_exists_error(&stderr) || is_already_exists_error(&stdout) {
-        log::warn!(
-            "Bypass route {}/{} already exists (treating as success)",
-            info.peer_ip,
-            prefix
-        );
-        return Ok(RouteAddOutcome::AlreadyExisted);
-    }
-
-    let detail = if stderr.trim().is_empty() {
-        stdout.trim().to_string()
-    } else {
-        stderr.trim().to_string()
-    };
-    Err(VpnError::tun_device(format!(
-        "Failed to add bypass route {}/{}: {}",
-        info.peer_ip, prefix, detail
-    )))
 }
 
 /// Implementation of adding a bypass route (unsupported platforms).
@@ -3350,7 +3399,7 @@ pub struct BypassRouteGuard {
     /// Raw gateway string with scope ID preserved (e.g., "fe80::1%en0").
     gateway_str: Option<String>,
     /// Interface index of the resolving interface. Set on Windows (used to
-    /// target `Remove-NetRoute -InterfaceIndex`); `None` elsewhere.
+    /// remove the host route from that interface); `None` elsewhere.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     if_index: Option<u32>,
     /// True only when this process added the route, so dropping must remove it.
@@ -3493,48 +3542,26 @@ fn remove_bypass_route_sync(
 ) {
     let prefix = if peer_ip.is_ipv4() { 32 } else { 128 };
 
-    let Some(if_index) = if_index else {
+    // An owned route always has both: `add_bypass_route_impl` refuses one
+    // without them.
+    let (Some(if_index), Some(gw)) = (if_index, gateway) else {
         log::warn!(
-            "Cannot remove bypass route for {}/{} (no interface index recorded)",
+            "Cannot remove bypass route for {}/{} (no interface index or gateway recorded)",
             peer_ip,
             prefix
         );
         return;
     };
 
-    // Include the next hop when known so we target the exact route we added.
-    let mut script = format!(
-        "$ErrorActionPreference='Stop'; \
-         Remove-NetRoute -DestinationPrefix '{}/{}' -InterfaceIndex {}",
-        peer_ip, prefix, if_index
-    );
-    if let Some(gw) = gateway {
-        script.push_str(&format!(" -NextHop '{}'", gw));
-    }
-    script.push_str(" -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop | Out-Null");
-
-    match run_powershell_sync(&script) {
-        Ok(output) if output.status.success() => {
-            log::info!("Removed bypass route {}/{}", peer_ip, prefix);
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let detail = if stderr.trim().is_empty() {
-                stdout.trim().to_string()
-            } else {
-                stderr.trim().to_string()
-            };
-            log::warn!(
-                "Failed to remove bypass route {}/{}: {}",
-                peer_ip,
-                prefix,
-                detail
-            );
-        }
-        Err(e) => {
-            log::warn!("Failed to execute PowerShell route delete: {}", e);
-        }
+    match windows_routes::delete_host_route(if_index, peer_ip, gw) {
+        Ok(true) => log::info!("Removed bypass route {}/{}", peer_ip, prefix),
+        Ok(false) => log::info!("Bypass route {}/{} was already gone", peer_ip, prefix),
+        Err(e) => log::warn!(
+            "Failed to remove bypass route {}/{}: {}",
+            peer_ip,
+            prefix,
+            e
+        ),
     }
 }
 
