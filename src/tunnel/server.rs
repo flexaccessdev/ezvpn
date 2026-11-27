@@ -11,7 +11,7 @@ use crate::error::{VpnError, VpnResult};
 use crate::net::buffer::uninitialized_vec;
 use crate::net::device::{TunConfig, TunDevice, TunOffloadStatus};
 use crate::runtime::{LockRole, VpnLock};
-use crate::transport::endpoint::RelayConfig;
+use crate::transport::endpoint::{RelayConfig, RelayProbes};
 use crate::transport::paths::{format_connection_paths, watch_connection_paths};
 use crate::transport::{HANDSHAKE_TIMEOUT, HEARTBEAT_TIMEOUT, SERVER_ADDR_PUBLISH_INTERVAL};
 use crate::tunnel::offload::VirtioNetHdr;
@@ -30,7 +30,7 @@ use flexaccess_iroh::relay_failover::fail_over_home_relay;
 use futures::StreamExt;
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointId, RelayUrl, Watcher};
+use iroh::{Endpoint, EndpointId, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -994,15 +994,16 @@ impl VpnServer {
     ///
     /// With custom relays the shared home-relay failover
     /// (`flexaccess_iroh::relay_failover`) runs alongside the accept loop and
-    /// keeps the server dialable: `relay_config` is what it moves between, and
-    /// `relays_left_out` are the configured relays the endpoint was bound
-    /// without because they failed the startup probe, which it puts back once
+    /// keeps the server dialable: `relay_config` is what it moves between (a
+    /// single custom relay has none to move onto), and `relays` is the
+    /// endpoint's startup probe (`CreatedEndpoint::relays`), which it waits
+    /// for: the relays that probe took out of the relay map are put back once
     /// they are connectable. With the default relays it is pending forever.
     pub async fn run(
         mut self,
         endpoint: Endpoint,
         relay_config: &RelayConfig,
-        relays_left_out: &[RelayUrl],
+        relays: &RelayProbes,
     ) -> VpnResult<()> {
         // Setup TUN device
         self.setup_tun().await?;
@@ -1153,14 +1154,14 @@ impl VpnServer {
         // failover moves the endpoint onto another configured relay in place.
         // Nothing is torn down: the identity, the direct paths, the
         // established connections and the TUN device all stay. Relays the
-        // startup probe could not connect (the endpoint was bound without
-        // them) are put back by the same failover once they are. With the
-        // default relays the failover future is pending forever.
+        // startup probe could not connect (taken out of the relay map) are
+        // put back by the same failover once they are. With the default
+        // relays the failover future is pending forever.
         tokio::select! {
             () = server.accept_loop(&endpoint, &tun_write_tx) => {
                 log::info!("Endpoint closed, shutting down");
             }
-            () = fail_over_home_relay(&endpoint, relay_config, relays_left_out) => {}
+            () = fail_over_home_relay(&endpoint, relay_config, relays) => {}
         }
 
         // Graceful shutdown: drop channel sender to signal TUN writer to exit,

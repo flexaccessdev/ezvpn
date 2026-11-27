@@ -142,11 +142,12 @@ secret_file = "./vpn-server.key"
 # Relay and Discovery (Optional)
 # ============================================================================
 
-# Custom relay server URLs: at least two distinct relays. The server rides out
+# Custom relay server URLs: two or more distinct relays. The server rides out
 # a relay outage by moving onto another configured relay in place (same node
-# id, nothing torn down), so a single custom relay is rejected at startup.
+# id, nothing torn down); a single custom relay runs in reduced-redundancy
+# mode, with a startup warning and no failover.
 # Every relay is probed at startup; startup fails only when none comes online,
-# and a relay that does not is named in a warning, left out of the relay map,
+# and a relay that does not is named in a warning, taken out of the relay map,
 # and put back once it is connectable again. Clients must be configured with
 # this same full list: with custom relays they reach the server only through
 # the relay it is currently homed on.
@@ -161,6 +162,13 @@ secret_file = "./vpn-server.key"
 # relays is rejected at startup. All endpoints (server and clients) that use the
 # private relay must present the same token.
 # relay_auth_token = "your-shared-relay-token"
+#
+# Whether the custom relays serve QUIC address discovery, all of them or none
+# (default: true). Set false for relays behind a Cloudflare Tunnel or another
+# HTTP-only front: left on, iroh probes them for it and each start can wait
+# out its 3 s probe timeout. Only valid together with relay_urls (above); set
+# it the same on the clients.
+# relay_quic_addr_discovery = false
 #
 # Whether iroh address lookup (pkarr publishing + DNS lookup via n0's
 # dns.iroh.link, https://docs.iroh.computer/concepts/address-lookup) runs

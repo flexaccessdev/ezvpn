@@ -42,11 +42,16 @@
 //! `auth_key` (the client's `ed25519-sec:...` secret key, whose public half must
 //! be on the server's authorized-keys file) and `server_node_id` are required;
 //! `max_reconnect_attempts` may be null. `relay_urls`, `relay_auth_token`,
-//! `routes`, `routes6`, `exclude_direct_paths`, `instance`, and
-//! `auto_reconnect` are all optional (with
+//! `relay_quic_addr_discovery`, `routes`, `routes6`, `exclude_direct_paths`,
+//! `instance`, and `auto_reconnect` are all optional (with
 //! the defaults shown). `relay_auth_token` is the shared bearer token for the
 //! custom relays (sent as `Authorization: Bearer <token>`); it is only valid
 //! together with `relay_urls` and is rejected with the default relays.
+//! `relay_quic_addr_discovery` says whether the custom relays serve QUIC
+//! address discovery, all of them or none (absent or null: true); false is for
+//! relays behind a Cloudflare Tunnel or another HTTP-only front, which
+//! otherwise delay each start by up to 3 s. Like the token, it is rejected
+//! with the default relays, whichever value it has.
 //!
 //! ```json
 //! {
@@ -54,6 +59,7 @@
 //!   "auth_key": "ed25519-sec:...",
 //!   "relay_urls": ["https://relay.example/"],
 //!   "relay_auth_token": "<optional shared relay bearer token>",
+//!   "relay_quic_addr_discovery": null,
 //!   "routes": ["10.0.0.0/8"],
 //!   "routes6": ["fd00::/8"],
 //!   "instance": "default",
@@ -92,7 +98,9 @@ use tokio::sync::Notify;
 use crate::config::VpnClientConfig;
 use crate::control::{ClientEvent, ClientStatusHandle};
 use crate::ffi_common::{EventTarget, EzvpnEventCallback, lock_ignoring_poison, write_cstr};
-use crate::transport::endpoint::{RelayConfig, create_client_endpoint};
+use crate::transport::endpoint::{
+    PendingCloses, RelayConfig, close_and_finish, close_failed_start, create_client_endpoint,
+};
 use crate::tunnel::client::VpnClient;
 
 /// Opaque handle owned by the .NET side. Created by [`ezvpn_start`], freed by
@@ -142,6 +150,11 @@ struct FfiWinConfig {
     /// `relay_urls`; rejected with the default relays.
     #[serde(default)]
     relay_auth_token: Option<String>,
+    /// Whether the custom relays serve QUIC address discovery, all of them or
+    /// none; absent or null keeps the default, on. Only valid with
+    /// `relay_urls`; rejected with the default relays.
+    #[serde(default)]
+    relay_quic_addr_discovery: Option<bool>,
     #[serde(default)]
     routes: Vec<String>,
     #[serde(default)]
@@ -336,8 +349,12 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
 
     let exclude_direct_paths =
         parse_routes::<IpNet>(&cfg.exclude_direct_paths, "excluded direct-path network")?;
-    let relay_config = RelayConfig::from_urls_with_token(&cfg.relay_urls, cfg.relay_auth_token)
-        .map_err(|e| format!("{e:#}"))?;
+    let relay_config = RelayConfig::from_settings(
+        &cfg.relay_urls,
+        cfg.relay_auth_token,
+        cfg.relay_quic_addr_discovery,
+    )
+    .map_err(|e| format!("{e:#}"))?;
     let instance = cfg.instance;
     let auto_reconnect = cfg.auto_reconnect;
     let max_attempts = cfg.max_reconnect_attempts.and_then(NonZeroU32::new);
@@ -373,10 +390,22 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
             };
 
             runtime.block_on(async move {
-                let endpoint = match create_client_endpoint(&relay_config, &exclude_direct_paths).await {
+                // The startup relay probe can outlast the start. What it
+                // leaves running is kept in `closes` and waited for before
+                // this block returns, on every way out: the runtime ends
+                // with it.
+                let closes = PendingCloses::new();
+                let endpoint = match create_client_endpoint(
+                    &relay_config,
+                    &exclude_direct_paths,
+                    &closes,
+                )
+                .await
+                {
                     Ok(e) => e,
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create iroh endpoint: {e}")));
+                        close_failed_start(None, &closes).await;
                         return;
                     }
                 };
@@ -385,6 +414,7 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                     Ok(c) => c,
                     Err(e) => {
                         let _ = setup_tx.send(Err(format!("failed to create VPN client: {e}")));
+                        close_failed_start(Some(endpoint), &closes).await;
                         return;
                     }
                 };
@@ -411,6 +441,7 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                 // Hand the status handle back; setup is done from here on.
                 if setup_tx.send(Ok(status.clone())).is_err() {
                     // The starter gave up (dropped the receiver); nothing to run.
+                    close_failed_start(Some(endpoint), &closes).await;
                     return;
                 }
 
@@ -441,7 +472,7 @@ fn start_inner(json: &str, target: Option<EventTarget>) -> Result<EzvpnHandle, S
                     }
                 }
 
-                endpoint.close().await;
+                close_and_finish(&endpoint, &closes).await;
             });
         })
         .map_err(|e| format!("failed to spawn tunnel thread: {e}"))?;

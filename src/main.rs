@@ -32,7 +32,9 @@ use ezvpn::config::file_config::{
     load_vpn_client_config, load_vpn_server_config,
 };
 use ezvpn::runtime::LockRole;
-use ezvpn::transport::endpoint::{create_client_endpoint, create_server_endpoint, load_secret};
+use ezvpn::transport::endpoint::{
+    PendingCloses, close_and_finish, create_client_endpoint, create_server_endpoint, load_secret,
+};
 use ezvpn::transport::{
     CongestionConfig, CongestionControl, parse_congestion_initial_window, set_congestion_config,
 };
@@ -188,8 +190,9 @@ enum ClientAction {
         #[arg(short = 'n', long)]
         server_node_id: Option<String>,
 
-        /// Custom relay server URLs (at least two, for failover); the server
-        /// moves onto another one when its home relay is lost
+        /// Custom relay server URLs, the server's full set: it moves onto
+        /// another one when its home relay is lost (a single relay runs in
+        /// reduced-redundancy mode, with no failover)
         #[arg(long = "relay-url")]
         relay_urls: Vec<String>,
 
@@ -198,6 +201,13 @@ enum ClientAction {
         /// --relay-url or the configured [iroh].relay_urls setting.
         #[arg(long = "relay-token")]
         relay_auth_token: Option<String>,
+
+        /// Whether the custom relays serve QUIC address discovery, all of them
+        /// or none (default: true). Pass false for relays behind a Cloudflare
+        /// Tunnel or another HTTP-only front, which otherwise delay startup by
+        /// up to 3 s. Requires custom relay URLs, like --relay-token.
+        #[arg(long, value_name = "BOOL")]
+        relay_quic_addr_discovery: Option<bool>,
 
         /// Inline client secret key (`ed25519-sec:...`) used to authenticate to
         /// the server. Prefer --auth-key-file; an inline secret is visible in
@@ -385,6 +395,7 @@ fn main() -> Result<()> {
                     server_node_id,
                     relay_urls,
                     relay_auth_token,
+                    relay_quic_addr_discovery,
                     auth_key,
                     auth_key_file,
                     routes,
@@ -405,6 +416,7 @@ fn main() -> Result<()> {
                 server_node_id,
                 relay_urls,
                 relay_auth_token,
+                relay_quic_addr_discovery,
                 auth_key,
                 auth_key_file,
                 routes,
@@ -532,6 +544,7 @@ fn prepare_client_start(
     server_node_id: Option<String>,
     relay_urls: Vec<String>,
     relay_auth_token: Option<String>,
+    relay_quic_addr_discovery: Option<bool>,
     auth_key: Option<String>,
     auth_key_file: Option<PathBuf>,
     routes: Vec<String>,
@@ -578,6 +591,7 @@ fn prepare_client_start(
             routes6,
             relay_urls,
             relay_auth_token,
+            relay_quic_addr_discovery,
             exclude_direct_paths,
             auto_reconnect_opt,
             max_reconnect_attempts,
@@ -991,12 +1005,13 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
     // for VPN traffic; relays are only the automatic fallback when a direct
     // connection fails. A single endpoint serves both relay modes; internet
     // discovery follows the mode (on for default relays, off for custom).
-    let CreatedEndpoint {
-        endpoint,
-        relays_left_out,
-    } = create_server_endpoint(&resolved.relay_config, secret_key)
-        .await
-        .context("Failed to create iroh endpoint")?;
+    // The startup relay probe (`relays`) can outlast the start; what it leaves
+    // running is kept in `closes` and waited for at shutdown.
+    let closes = PendingCloses::new();
+    let CreatedEndpoint { endpoint, relays } =
+        create_server_endpoint(&resolved.relay_config, secret_key, &closes)
+            .await
+            .context("Failed to create iroh endpoint")?;
 
     log::info!(
         "Clients connect with: ezvpn client start --server-node-id {} --auth-key-file <KEY FILE>",
@@ -1009,7 +1024,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
         .context("Failed to create VPN server")?;
 
     let close_endpoint = endpoint.clone();
-    let run = server.run(endpoint, &resolved.relay_config, &relays_left_out);
+    let run = server.run(endpoint, &resolved.relay_config, &relays);
     tokio::pin!(run);
     let result = tokio::select! {
         res = &mut run => res,
@@ -1019,12 +1034,7 @@ async fn run_vpn_server(resolved: ResolvedVpnServerConfig) -> Result<()> {
             // its heartbeat timeout. The close frames go out immediately; the
             // timeout only caps the wait for the clients' acknowledgements.
             log::info!("Received shutdown signal, closing client connections");
-            if tokio::time::timeout(CLOSE_TIMEOUT, close_endpoint.close())
-                .await
-                .is_err()
-            {
-                log::warn!("Endpoint close timed out after {CLOSE_TIMEOUT:?}");
-            }
+            close_endpoint_bounded(&close_endpoint, &closes).await;
             // The closed endpoint ends the accept loop, and `run` tears the
             // TUN tasks down; bounded in case a task is stuck.
             match tokio::time::timeout(CLOSE_TIMEOUT, &mut run).await {
@@ -1106,9 +1116,16 @@ async fn run_vpn_client(
     for net in &resolved.exclude_direct_paths {
         log::info!("Excluding direct paths to {net}");
     }
-    let endpoint = create_client_endpoint(&resolved.relay_config, &resolved.exclude_direct_paths)
-        .await
-        .context("Failed to create iroh endpoint")?;
+    // The startup relay probe can outlast the start; what it leaves running is
+    // kept in `closes` and waited for at shutdown.
+    let closes = PendingCloses::new();
+    let endpoint = create_client_endpoint(
+        &resolved.relay_config,
+        &resolved.exclude_direct_paths,
+        &closes,
+    )
+    .await
+    .context("Failed to create iroh endpoint")?;
 
     log::info!("VPN Client Node ID: {}", endpoint.id());
 
@@ -1170,18 +1187,26 @@ async fn run_vpn_client(
     // heartbeat timeout. The close frame goes out immediately; the timeout
     // only caps the wait for the server's acknowledgement (e.g. when the
     // network is already gone).
-    if tokio::time::timeout(CLOSE_TIMEOUT, endpoint.close())
-        .await
-        .is_err()
-    {
-        log::warn!("Endpoint close timed out after {CLOSE_TIMEOUT:?}");
-    }
+    close_endpoint_bounded(&endpoint, &closes).await;
     result
 }
 
 /// Upper bound on each graceful-shutdown step when the client or server
 /// stops: the endpoint close, and (server) the teardown after it.
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Close `endpoint` gracefully, and wait for what its creation left running
+/// (the startup relay probe's endpoints, see [`close_and_finish`]), for at
+/// most [`CLOSE_TIMEOUT`] in all. The process exits afterwards, which cuts
+/// short whatever is still closing by then.
+async fn close_endpoint_bounded(endpoint: &iroh::Endpoint, closes: &PendingCloses) {
+    if tokio::time::timeout(CLOSE_TIMEOUT, close_and_finish(endpoint, closes))
+        .await
+        .is_err()
+    {
+        log::warn!("Endpoint close timed out after {CLOSE_TIMEOUT:?}");
+    }
+}
 
 #[cfg(all(test, unix))]
 mod tests {
