@@ -420,6 +420,9 @@ Design".
 
 ## Reproducing
 
+The scripts that took the tables above, rounds and checks included, are in
+[`scripts/bench`](../scripts/bench/README.md). By hand, one run is this.
+
 Start a server on one machine with `iperf3 -s` beside it, and a client on
 the other (the README's quick start has both). Wait for
 `ezvpn client status` to show a `Direct … (selected)` path in its
