@@ -267,10 +267,11 @@ pause around each quarter-hour that the Linux pair's columns took.
 ### macOS
 
 **Downloads read the same on both versions.** The no-tunnel download read
-1946 on every run, which suggests a cap in the VM's NAT path, and both
-versions read 1832 in most runs (1744 at the lowest for v0.0.75, 1813 for
-v0.0.76), which looks like the same cap less what the tunnel adds to each
-packet. So the column says only that both reach it. The server used more CPU
+1946 on every run, a cap on the way to the server rather than in the VM's
+NAT, since the VM's host reads the same with neither in the way
+([below](#macos-on-the-vms-host-optional)), and both versions read 1832 in
+most runs (1744 at the lowest for v0.0.75, 1813 for v0.0.76), which looks
+like the same cap less what the tunnel adds to each packet. So the column says only that both reach it. The server used more CPU
 for the same rate on v0.0.76: 1.26 cores against 1.12 with one flow, where
 every v0.0.76 run read above every v0.0.75 one, and 1.29 against 1.17 with
 four. A Windows download, at three quarters of the rate, shows two hundredths
@@ -325,6 +326,57 @@ whose own download gains 8% from them (2241 against 2080), and uploads read
 the same with four as with one. The limit is in the tunnel in both
 directions, and the download is the slower one, at 1.35 cores on the client.
 
+### macOS on the VM's host (optional)
+
+Not part of the version comparison: the Mac that hosts the macOS VM, as a
+client of the same server on `test1`, measured on 2026-11-28 to see what the
+VM costs. Three rounds, taken in turn as the other columns' are, with the
+same two versions and the same flags, and no Tailscale row, since Tailscale
+is not installed there. The client is an Apple M2 Max (12 cores, 32 GB,
+macOS 27.2.1, iperf3 3.21) on 2.5 Gbit/s Ethernet in the server's own LAN,
+with no NAT in between; it is a desktop in use, and its apps stayed open
+during the rounds.
+
+Mbit/s, down / up, medians of three rounds, beside the VM's medians of ten
+from [the table above](#macos-and-windows-clients):
+
+| | One flow | Four flows | VM, one flow | VM, four flows |
+|---|---:|---:|---:|---:|
+| No tunnel | 1946 / 2345 | 1946 / 2354 | 1946 / 2354 | 1946 / 2353 |
+| ezvpn v0.0.75 | 1835 / 1131 | 1834 / 1230 | 1832 / 878 | 1831 / 857 |
+| ezvpn v0.0.76 | 1828 / 1157 | 1834 / 1254 | 1832 / 892 | 1831 / 909 |
+
+| | Flows | Retr (down / up) | CPU down (client / server) | CPU up (client / server) |
+|---|---|---:|---:|---:|
+| ezvpn v0.0.75 | one | 0 / 52 | 1.10 / 1.27 | 1.48 / 1.90 |
+| ezvpn v0.0.76 | one | 526 / 0 | 1.31 / 1.35 | 1.39 / 1.89 |
+| ezvpn v0.0.75 | four | 1876 / 589 | 1.09 / 1.35 | 1.43 / 1.91 |
+| ezvpn v0.0.76 | four | 2084 / 299 | 1.35 / 1.42 | 1.49 / 1.92 |
+
+All 24 ezvpn runs were over IPv4 to the server's own address, before and
+after, and none had to be taken again; the server's kernel refused no
+receive and its queues dropped nothing.
+
+**Downloads read as they do on the VM.** The no-tunnel download reads 1946
+here too, without the VM or its NAT, so that cap is on the way to the
+server, and both versions read just under it, as on the VM.
+
+**Uploads read 29–44% higher.** With one flow they ranged from 1131 to 1174
+for v0.0.75 and from 829 to 1237 for v0.0.76 (829 in the first round, 1237
+and 1157 after it); with four, from 1118 to 1267 and from 1210 to 1356. The
+client used 1.4–1.5 cores where the VM's used 1.6, and four flows carry
+about 8% more than one, where on the VM they carry none. The server used
+1.89–1.92 cores, as it does for the VM's uploads, so with this client the
+server's two runtime workers are the likely limit; it was not profiled.
+Three rounds do not separate the versions: v0.0.76 was ahead in one round
+of three with one flow and in two with four.
+
+On a download v0.0.76's server used more CPU than v0.0.75's, as with the
+VM, and here its client did too (1.31 cores against 1.10 with one flow),
+which on the VM it did not; three rounds are too few to say more. Four-flow
+downloads retransmitted in every run for either version (1203 to 6394
+segments), and 5 of the 12 one-flow runs retransmitted at all.
+
 ## Opportunities left
 
 What is known to be left on the table, with what is known about each. None
@@ -344,8 +396,11 @@ Design".
   server does per packet is as likely a place as the client.
 - **The upload gains nothing from more flows.** Four flows carry what one
   does, about 0.9 Gbit/s on a path that carries 2.35, so the limit is in the
-  tunnel. Which end holds it was not measured: the client is at 1.6 cores
-  and the server at 1.9.
+  tunnel. On the VM it is most likely the client's: the VM's host, as a
+  client of the same server, carries 1.13–1.25 Gbit/s up at 1.4–1.5 cores,
+  gains from four flows, and leaves the server at the same 1.9 cores
+  ([above](#macos-on-the-vms-host-optional)). The server is then the likely
+  next limit for a fast macOS client; that was not profiled.
 - **Two syscalls per packet.** What is left of a macOS upload's client time
   is the utun `read` and the UDP `sendmsg`, one of each per packet, on two
   threads. Batching the syscalls (`recvmsg_x`, `sendmsg_x`) was not tried:

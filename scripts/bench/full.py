@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """full.py COLUMN A B [ROUNDS] [FIRST]: benchmark rounds for one column of docs/Benchmarks.md.
 
-COLUMN is linux-default, linux-offload, mac or win; A and B are the labels of the two staged ezvpn
+COLUMN is linux-default, linux-offload, mac, mac-host or win; A and B are the labels of the two staged ezvpn
 binaries (ezvpn-A, ezvpn-B). Rows are taken in turn, round after round: no tunnel, Tailscale (not on
-Windows), then the two ezvpn versions in an order that alternates by round. Each row is four runs: one
+Windows or the host Mac), then the two ezvpn versions in an order that alternates by round. Each row is four runs: one
 flow down and up, four flows down and up. Server and client are restarted for every ezvpn run.
 One JSON line per run goes to results/<COLUMN>.jsonl in the work directory.
 """
@@ -21,7 +21,7 @@ first = int(sys.argv[5]) if len(sys.argv) > 5 else 1
 OUT = f"{WORK}/results/{col}.jsonl"
 os.makedirs(f"{WORK}/results", exist_ok=True)
 # Seconds a run may take from its start (server restart included) to the end of its iperf3.
-BUDGET = {"linux-default": 28, "linux-offload": 28, "mac": 36, "win": 45}[col]
+BUDGET = {"linux-default": 28, "linux-offload": 28, "mac": 36, "mac-host": 36, "win": 45}[col]
 SRV, CLI = RIG["SERVER_HOST"], RIG["CLIENT_HOST"]
 NET = f"SERVER_IP={RIG['SERVER_IP']} SERVER_TS_IP={RIG['SERVER_TS_IP']}"
 
@@ -128,6 +128,11 @@ def client(row, d, flows):
         env = f"{NET} ROUTER_PUBLIC_IP={RIG['ROUTER_PUBLIC_IP']}"
         return ssh(RIG["MAC_HOST"], f'/opt/homebrew/bin/tmux new-window -d -t macsandbox "{env} ~/codes/staging-area/ezvpn-bench/mb.sh {row} {d} {flows} {SECS} '
                    f'> /tmp/{job}.log 2>&1; echo \\$? > /tmp/{job}.status; /opt/homebrew/bin/tmux wait-for -S {job}-done" \\; wait-for {job}-done; cat /tmp/{job}.log')
+    if col == "mac-host":
+        # Straight over ssh: sshd has macOS's Local Network permission, and a tmux server started over ssh
+        # does not, so iperf3 in its windows cannot reach the server ("No route to host").
+        env = f"{NET} ROUTER_PUBLIC_IP={RIG['ROUTER_PUBLIC_IP']}"
+        return ssh(RIG["MAC_METAL_HOST"], f"{env} ~/codes/staging-area/ezvpn-bench/mb.sh {row} {d} {flows} {SECS} 2>&1")
     p = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-File", f"{B}/win-run.ps1", RIG["WIN_HOST"], row, d, str(flows), str(SECS),
                         RIG["SERVER_IP"], RIG["ROUTER_PUBLIC_IP"]], capture_output=True, text=True, timeout=240)
     return (p.stdout + p.stderr).replace("\r", "").strip()
@@ -187,7 +192,7 @@ def one(rnd, row, flows, d):
 
 
 ssh(SRV, "sudo systemctl is-active -q iperf3-bench || sudo systemd-run -q --unit iperf3-bench /usr/bin/iperf3 -s")
-rows = ["none"] + ([] if col == "win" else ["ts"])
+rows = ["none"] + ([] if col in ("win", "mac-host") else ["ts"])
 for rnd in range(first, rounds + 1):
     order = VERSIONS if rnd % 2 else VERSIONS[::-1]
     log(f"round {rnd}: {' '.join(rows + order)}")
