@@ -2147,7 +2147,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-1.5.0#6eaaf970bab5fddd784ca9c4356926a8344e5670"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2168,7 +2168,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-1.5.0#6eaaf970bab5fddd784ca9c4356926a8344e5670"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2195,7 +2195,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.5.0"
-source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-1.5.0#2814c282a3c426844b25bf2256480a321b9f32e5"
+source = "git+https://github.com/flexaccessdev/noq.git?branch=ezvpn-1.5.0#6eaaf970bab5fddd784ca9c4356926a8344e5670"
 dependencies = [
  "cfg_aliases",
  "libc",
