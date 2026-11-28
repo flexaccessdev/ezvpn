@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# columns.sh linux|mac|win|clients A B [ROUNDS]: the columns of docs/Benchmarks.md, logged to results/<column>.log.
+# columns.sh linux|mac|win|clients|mac-host A B [ROUNDS]: the columns of docs/Benchmarks.md, logged to results/<column>.log.
 #   linux    both Linux columns: ROUNDS at default NIC settings, then ROUNDS with tx-udp-segmentation on
 #            (on both guests; the setting is put back off after)
 #   mac|win  one client column against the server
 #   clients  the Mac column, then the Windows column
+#   mac-host the optional column of the macOS VM's host Mac, without a Tailscale row (not part of clients)
 # Long: run it detached (see README.md). results/<column>.done marks a finished column.
 set -u
 . "$(dirname "$0")/rig.sh"
@@ -22,7 +23,7 @@ case $what in
     nic off > "$WORK/results/linux-default.log"; col linux-default
     nic on > "$WORK/results/linux-offload.log"; col linux-offload
     nic off >> "$WORK/results/linux-offload.log" ;;
-  mac|win) : > "$WORK/results/$what.log"; col "$what" ;;
+  mac|win|mac-host) : > "$WORK/results/$what.log"; col "$what" ;;
   clients) : > "$WORK/results/mac.log"; col mac; : > "$WORK/results/win.log"; col win ;;
-  *) echo "usage: $0 linux|mac|win|clients A B [ROUNDS]" >&2; exit 2 ;;
+  *) echo "usage: $0 linux|mac|win|clients|mac-host A B [ROUNDS]" >&2; exit 2 ;;
 esac

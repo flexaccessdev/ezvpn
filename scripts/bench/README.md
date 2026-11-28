@@ -12,7 +12,8 @@ The machines and their addresses are not in this repo. The scripts read them fro
 
 - `rig.env`: `SERVER_HOST`, `SERVER_IP`, `CLIENT_HOST`, `SERVER_TS_IP` (the server's Tailscale address),
   `MAC_HOST`, `WIN_HOST`, `ROUTER_PUBLIC_IP` (kept off the macOS and Windows clients' direct paths), and
-  optionally `LINUX_DIR`, the staging directory on the Linux machines.
+  optionally `LINUX_DIR`, the staging directory on the Linux machines, and `MAC_METAL_HOST`, the Mac that hosts
+  the macOS VM, for the optional `mac-host` column.
 - `heavy-jobs.txt` (optional): scheduled jobs on the machines' host that no run may overlap.
 - `host-check.sh` (optional): printed at the start of each round, such as the host's load.
 
@@ -28,10 +29,13 @@ Windows); the labels are what the scripts take. Then:
 | server | `LINUX_DIR` | the binaries, the server key, `authorized_keys`, `vpn_server.toml` (network `10.77.0.0/24`) |
 | Linux client | `LINUX_DIR` | the binaries, `client.key`, `server_id`, `cli.sh` |
 | Mac | `~/codes/staging-area/ezvpn-bench` | the binaries, `client.key`, `server_id`, `mb.sh` |
+| host Mac (optional) | `~/codes/staging-area/ezvpn-bench` | the same as the Mac's |
 | Windows | `C:\ci-workspaces\ezvpn-bench\run` | the binaries, `client.key`, `server_id`, `wb.ps1`, `iperf3.exe`, `wintun.dll` |
 
 `server_id` is the server's id on one line. The server and the Linux client also need `iperf3`, `jq` and
-`nstat`, the Mac a `macsandbox` tmux session, and Tailscale must be up for its rows.
+`nstat`, the Mac a `macsandbox` tmux session, and Tailscale must be up for its rows. The host Mac needs `iperf3`
+and `sudo` without a password prompt for the run (a temporary `NOPASSWD` rule, removed after); it is driven
+straight over ssh, not through tmux, and has no Tailscale row.
 
 ## Running
 
@@ -41,6 +45,10 @@ setsid nohup scripts/bench/columns.sh linux v0.0.75 v0.0.76 10 > target/bench/re
 setsid nohup scripts/bench/columns.sh clients v0.0.75 v0.0.76 10 >> target/bench/results/columns.out 2>&1 < /dev/null &
 
 uv run --python 3.13 scripts/bench/sum.py v0.0.75 v0.0.76 linux-default linux-offload mac win
+
+# optional: the macOS VM's host Mac, against the same server
+scripts/bench/columns.sh mac-host v0.0.75 v0.0.76 3
+uv run --python 3.13 scripts/bench/sum.py v0.0.75 v0.0.76 mac-host
 ```
 
 Run the Linux and client columns one after the other, not together: both use the same server. Progress is
