@@ -43,7 +43,7 @@ pub const DATAGRAM_READ_BATCH: usize = 64;
 
 /// Maximum number of datagrams the client's TUN reader drains from the TUN
 /// before sending them as one batch. The batch takes the connection lock
-/// (shared with the driver, which holds it across every encrypt + send) once,
+/// (shared with the driver, which holds it while it builds packets) once,
 /// where a per-packet send takes it three times per packet and, on a TUN with
 /// no offload (macOS utun, Windows: one packet per read), serializes
 /// the reader against the driver's every send. A Linux GSO super-frame already
@@ -107,7 +107,7 @@ impl DatagramSendOutcome {
 /// datagram, and awaiting `send_datagram_wait` only under backpressure.
 ///
 /// The connection's state lock is shared with its driver, which holds it while
-/// it encrypts and sends, so per-datagram calls (a GSO super-frame segments into
+/// it builds packets, so per-datagram calls (a GSO super-frame segments into
 /// dozens of datagrams) serialize the producer against the driver. Here one
 /// `try_send_many_datagrams` queues the longest prefix the send buffer holds
 /// and reports how many that was; the evicting `send_many_datagrams` is never

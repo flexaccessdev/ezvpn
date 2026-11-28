@@ -1,6 +1,6 @@
 [package]
 name = "ezvpn"
-version = "0.0.75"
+version = "0.0.76"
 edition = "2024"
 description = "IP-over-QUIC VPN tunnel via iroh P2P"
 license = "MIT"
@@ -126,8 +126,11 @@ iroh = { git = "https://github.com/flexaccessdev/iroh.git", branch = "ezvpn-1.5.
 # UDP send (except on Windows, where that slowed downloads), so tasks queueing
 # data for the connection (the TUN reader) no longer wait out the send
 # syscalls, and packs up to 32 datagrams into one GSO send where upstream
-# stops at 10 (see docs/Architecture.md, "Throughput Design"). All three
-# crates come from the fork so the graph holds a single `noq-udp`.
+# stops at 10. Where a send takes such a batch (Linux), the driver also leaves
+# the packets' encryption and the send itself to a second task of the
+# connection, so that one task no longer carries a connection's whole send
+# path (see docs/Architecture.md, "Throughput Design"). All three crates come
+# from the fork so the graph holds a single `noq-udp`.
 noq = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-1.5.0" }
 noq-proto = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-1.5.0" }
 noq-udp = { git = "https://github.com/flexaccessdev/noq.git", branch = "ezvpn-1.5.0" }

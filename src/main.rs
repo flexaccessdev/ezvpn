@@ -341,9 +341,10 @@ fn init_logger() {
 /// says otherwise.
 ///
 /// One connection's data path is a chain of tasks (TUN reader, QUIC
-/// connection driver, endpoint driver, TUN writer) that hand packets to each
-/// other through the connection's lock, so it gains nothing from running on
-/// more threads at once, and Tokio's default of one worker per core spreads
+/// connection driver and its sending task, endpoint driver, TUN writer) that
+/// hand packets to each other, most of them through the connection's lock, so
+/// it gains little from running on more threads at once (three workers
+/// measured slower than two), and Tokio's default of one worker per core spreads
 /// the chain over idle workers, where each handoff becomes a cross-thread wake
 /// and a contended lock. Measured between two 6-vCPU Linux VMs (see
 /// docs/Benchmarks.md), one tunnel moved about 40% more on one or two workers
