@@ -5,90 +5,103 @@ against another, on the same machines. They show proportions, not what your
 hardware will do. How the data path is built, and why, is in
 [Architecture](Architecture.md), "Throughput Design".
 
-## v0.0.74 against v0.0.70
+## v0.0.76 against v0.0.75
 
-Mbit/s, down / up, one TCP flow, 2026-11-26. In each column the rows were
-measured in turn, round after round; the numbers are medians of ten rounds,
-twenty for the macOS client. Each ezvpn row ran that version's release
-binary at both ends.
+Mbit/s, down / up, between the Linux pair, 2026-11-27. The rows of a column
+were measured in turn, round after round; the numbers are medians of ten
+rounds. Each ezvpn row ran that version at both ends.
 
-| | Linux pair, default NIC | Linux pair, UDP offload on | macOS client | Windows client |
+| | Default NIC, one flow | Default NIC, four flows | UDP offload on, one flow | UDP offload on, four flows |
 |---|---:|---:|---:|---:|
-| No tunnel | 21061 / 21219 | 21217 / 21337 | 1946 / 2353 | 2101 / 2361 |
-| Tailscale (control) | 1295 / 1260 | 3211 / 3130 | 429 / 216 | not installed |
-| ezvpn v0.0.70 | 2195 / 2396 | 3412 / 3083 | 1832 / 956 | 1391 / 1709 |
-| **ezvpn v0.0.74** | **2181 / 2382** | **3422 / 3073** | **1832 / 917** | **1436 / 1684** |
+| No tunnel | 21339 / 21401 | 22062 / 21932 | 21158 / 21309 | 21843 / 21997 |
+| Tailscale | 1276 / 1329 | 1391 / 1400 | 3235 / 3234 | 3807 / 3704 |
+| ezvpn v0.0.75 | 2225 / 2299 | 2415 / 2388 | 3139 / 3076 | 3537 / 3069 |
+| **ezvpn v0.0.76** | **2322 / 2430** | **2498 / 2507** | **3939 / 4015** | **3996 / 3992** |
 
-Nothing between the two versions is meant to change how fast a tunnel
-carries packets. The four releases bound the handshake (a deadline at both
-ends, and a limit on how many connections may be waiting to authenticate),
-grant a peer the control stream and no other, close client connections when
-a server is told to stop, and rework how a client or server shuts down and
-how the Windows session reports it. On the data path they add one comparison
-per packet the server forwards to a client (the route's session against the
-client's current one). The transport forks (iroh, noq, netwatch) are at the
-same commits in both versions.
+v0.0.76 changes one thing on the data path. Until it, the task that drives a
+connection built each packet, encrypted it and sent it, and on the sending
+side of a fast tunnel that one task was saturated. On Linux, v0.0.76 hands
+the encryption and the UDP send to a second task of the connection
+([Architecture](Architecture.md), "Encryption and send in a task of their
+own").
 
-The table is here to show what all of that costs. Between the Linux pair
-it is nothing that these machines can tell: the two versions are within 1%
-of each other in both columns. The Windows client's medians are 3% apart on
-downloads, in v0.0.74's favour, and 1.5% on uploads, in v0.0.70's, on runs
-that ranged over an eighth of their value or more for either version.
+With the offload on, v0.0.76 is 25% faster down and 31% faster up with one
+flow, and 13% and 30% with four; it was ahead in every round of all four
+cells. At default NIC settings the gain is 3–6%, and it was ahead in 6 rounds
+of 10 on one-flow downloads and in 9 or 10 of 10 in the other three cells.
+What it costs is in [Results](#results): each end uses more CPU for the
+higher rate (about 1.5–1.6 cores where it used 1.3), and with four flows and
+the offload on, more of v0.0.76's runs retransmit.
 
-The macOS client's upload is the exception. v0.0.74's median is 4% under
-v0.0.70's, and over 27 rounds it was ahead in 8: small beside the quarter of
-its value that an upload ranges over there, but steadier than chance would
-leave it. It was not traced to a change
-([Results](#macos-and-windows-clients-against-the-linux-server)).
+The four-flow rows are there because a limit that every version has passes a
+one-flow table unseen. v0.0.75's row shows one: with the offload on its
+uploads read the same with four flows as with one (3069 and 3076), and its
+downloads gain 13%, while Tailscale, which spreads its work over threads,
+gains 15–18% and ends ahead of it by 8% down and 21% up. With one flow the
+two were 3–5% apart, inside what Tailscale moves from one day to the next.
+A tunnel that gains nothing from more flows where another does has a ceiling
+of its own, and so has one whose upload stays below its download in every
+run. v0.0.76 reads about 4 Gbit/s in all four cells of that column, so it
+has a ceiling too, a higher one
+([Opportunities left](#opportunities-left)).
+
+No row transfers a file. A download or an upload of a file measures the
+disk, the page cache and the copying tool along with the tunnel, and its row
+would move with them.
+
+Neither the macOS nor the Windows client sends through the new task, but a
+v0.0.76 Linux server sends their downloads through it. Both clients were
+measured on the two versions the same day
+([below](#macos-and-windows-clients)), and neither shows a difference that
+ten rounds can tell from none: every median is within 2.5% of the other
+version's but the macOS four-flow upload, which is 6% higher on v0.0.76.
 
 > **Tailscale is in these tables as a control, not as a competitor.** It is a
 > mature VPN that runs on the same machines, so when an ezvpn number comes
 > out unexpectedly low, a Tailscale run on the same pair tells the two causes
 > apart: if Tailscale is low too, the host or the network is having a bad
-> day; if Tailscale is where it was, ezvpn regressed.
+> day; if Tailscale is where it was, ezvpn regressed. On the four-flow rows
+> it is also a comparison of shape: what a tunnel that uses several threads
+> gains from several flows on these machines.
 >
 > The numbers are not meant to show which of the two is the faster VPN, and
 > they cannot. They come from one pair of virtual machines on one host, over
-> a virtual network with no real distance, loss or NAT, with one TCP flow per
-> test, and with each product at whatever version and defaults it had that
-> day. The two also do different jobs on the way (ezvpn carries IP in QUIC
-> datagrams over iroh; Tailscale runs WireGuard with its own userspace
-> stack), and a change of kernel, NIC, CPU, or a single offload flag reorders
-> the table, as the two Linux columns show. Measure on your own hardware and
-> path before drawing conclusions.
+> a virtual network with no real distance, loss or NAT, with one or four TCP
+> flows per test, and with each product at whatever version and defaults it
+> had that day. The two also do different jobs on the way (ezvpn carries IP
+> in QUIC datagrams over iroh; Tailscale runs WireGuard with its own
+> userspace stack), and a change of kernel, NIC, CPU, or a single offload
+> flag reorders the table, as the two halves of it show. Measure on your own
+> hardware and path before drawing conclusions.
 
-## Setup (2026-11-26)
+## Setup (2026-11-27)
 
 | | |
 |---|---|
-| Machines | `test1` (server, `10.22.40.61`) and `test2` (client, `10.22.40.62`): two KVM guests on the same physical host, joined by a virtual bridge |
+| Machines | `test1` (server, `10.22.40.61`) and `test2` (client, `10.22.40.62`): two KVM guests on the same physical host, joined by a virtual bridge; both rebooted before the session |
 | Host CPU | Intel Core i5-8400T (6 cores, no SMT); each guest has 6 vCPUs, so the two guests together overcommit the host 2:1 |
 | Guest | Debian 13, kernel 6.12.118, 2 GB RAM |
 | NIC | `virtio_net`, 6 queues (multi-queue), XPS at its default of one transmit queue per CPU, `tx-udp-segmentation` off by default |
 | Kernel UDP buffer limit | `net.core.rmem_max` and `wmem_max` at their default of 212992 bytes; ezvpn runs as root and sets its 7 MiB buffers past the limit |
-| ezvpn | v0.0.70 and v0.0.74 as released (the binaries of their GitHub releases), the same version at both ends; direct path, Cubic, inner MTU 1280 |
-| Tailscale | 1.104.7 on the Linux pair, 1.104.2 on macOS; `tailscale0` MTU 1280 |
-| Tool | iperf3 3.18 (3.21 on macOS, 3.22.1 on Windows), one TCP flow, 6 s per run after a 1 s warm-up; "up" is client to server, "down" is server to client (`-R`) |
+| ezvpn | v0.0.75 and v0.0.76, the same version at both ends; direct path, Cubic, inner MTU 1280 |
+| Tailscale | 1.104.7; `tailscale0` MTU 1280 |
+| Tool | iperf3 3.18, one TCP flow or four (`-P 4`), 6 s per run after a 1 s warm-up; "up" is client to server, "down" is server to client (`-R`) |
 
 One test ran at a time, and the rows of a table were taken in turn, one
 round after another: no tunnel, Tailscale, then the two ezvpn versions, in an
-order that alternated by round. Server and client were both restarted for
-every ezvpn run, a run being one direction. The path was read off
-`ezvpn client status` before each run, five seconds after the tunnel first
-answered a ping, and again after it: a run that starts before a direct path
-has been selected measures the rate-limited public relay. Every ezvpn run
-below was on a direct path to the server's own address, before and after;
-none had to be taken again for its path.
+order that alternated by round. A row is four runs: one flow down and up,
+then four flows down and up. Server and client were both restarted for every
+ezvpn run. The path was read off `ezvpn client status` before each run, five
+seconds after the tunnel first answered a ping, and again after it: a run
+that starts before a direct path has been selected measures the rate-limited
+public relay. All 160 ezvpn runs were on a direct path to the server's own
+address, before and after; none had to be taken again.
 
 The clients kept the Tailscale address ranges off their direct paths
 (`--exclude-direct-path`), since `test1` has a Tailscale address that they
-could otherwise reach it by. The macOS and Windows clients also kept IPv6
-and the router's public address off theirs, so that each of their runs was
-over IPv4 to `10.22.40.61`: ezvpn picks its direct path per connection, and
-on the macOS VM an IPv6 path has carried uploads more slowly than an IPv4
-one ([Opportunities left](#opportunities-left)). Between the Linux pair the
-path was as iroh chose, IPv4 for 73 of the 80 runs and IPv6 on the same
-bridge for the rest.
+could otherwise reach it by. Otherwise the path was as iroh chose: IPv4 for
+143 of the 160 runs, IPv6 on the same bridge for 16, and one that began on
+IPv4 and ended on IPv6.
 
 Anything else running on the physical host moves every row, and something
 there runs on the quarter-hour (flextunnel's benchmarks on the same pair
@@ -98,113 +111,241 @@ three minutes after it.
 
 ## Results
 
-Mbit/s, medians of ten rounds (twenty for the macOS client). "Retr" is the
-median of the inner TCP sender's retransmits per run. "CPU" is the ezvpn
+Mbit/s, medians of ten rounds. "Retr" is the median of the inner TCP
+senders' retransmits per run, all flows together. "CPU" is the ezvpn
 process's CPU time over a run divided by the run's length, in cores, on the
 client and on the server. No receive was refused for want of socket buffer
-(`UdpRcvbufErrors`) on either Linux machine in any run, and the server's
-per-client queues dropped nothing (`dropped_full`).
+(`UdpRcvbufErrors`) on either machine in any run. The server's per-client
+queues dropped nothing (`dropped_full`) except in the eight runs named
+below.
 
 ### Linux pair, default NIC settings
 
+One flow:
+
 | | Down | Up | Retr (down / up) | CPU down (client / server) | CPU up (client / server) |
 |---|---:|---:|---:|---:|---:|
-| No tunnel (TCP with TSO over the bridge) | 21061 | 21219 | 0 / 0 | | |
-| Tailscale 1.104.7 | 1295 | 1260 | 1206 / 1684 | | |
-| ezvpn v0.0.70 | 2195 | 2396 | 0 / 0 | 1.17 / 1.16 | 1.16 / 1.25 |
-| ezvpn v0.0.74 | 2181 | 2382 | 0 / 0 | 1.15 / 1.15 | 1.13 / 1.24 |
+| No tunnel (TCP with TSO over the bridge) | 21339 | 21401 | 0 / 0 | | |
+| Tailscale 1.104.7 | 1276 | 1329 | 1270 / 1068 | | |
+| ezvpn v0.0.75 | 2225 | 2299 | 0 / 0 | 1.17 / 1.17 | 1.14 / 1.24 |
+| ezvpn v0.0.76 | 2322 | 2430 | 0 / 0 | 1.17 / 1.17 | 1.11 / 1.29 |
 
-Downloads ranged from 2067 to 2423 for v0.0.70 and from 1863 to 2419 for
-v0.0.74, uploads from 2125 to 2434 and from 2094 to 2444. v0.0.74 was ahead
-in six rounds of ten on downloads and three on uploads. One upload of each
-version retransmitted (429 and 819 segments); no other ezvpn run did.
-Tailscale ranged from 1066 to 1807 down and from 1091 to 1904 up.
+Four flows:
+
+| | Down | Up | Retr (down / up) | CPU down (client / server) | CPU up (client / server) |
+|---|---:|---:|---:|---:|---:|
+| No tunnel | 22062 | 21932 | 16262 / 15069 | | |
+| Tailscale 1.104.7 | 1391 | 1400 | 5062 / 4405 | | |
+| ezvpn v0.0.75 | 2415 | 2388 | 0 / 28 | 1.27 / 1.16 | 1.16 / 1.29 |
+| ezvpn v0.0.76 | 2498 | 2507 | 0 / 0 | 1.33 / 1.20 | 1.18 / 1.33 |
+
+With one flow, downloads ranged from 2173 to 2422 for v0.0.75 and from 1848
+to 2488 for v0.0.76, uploads from 1841 to 2454 and from 2174 to 2523.
+v0.0.76 was ahead in six rounds of ten on downloads and nine on uploads. One
+run of each version retransmitted in each direction (38 and 146 segments for
+v0.0.75, 1 and 559 for v0.0.76). Tailscale ranged from 1033 to 1915 down and
+from 1218 to 1855 up.
+
+With four flows, downloads ranged from 2270 to 2518 for v0.0.75 and from
+2410 to 2591 for v0.0.76, uploads from 1858 to 2429 and from 2406 to 2586.
+v0.0.76 was ahead in nine rounds of ten on downloads, level in the other,
+and ahead in all ten on uploads. About four runs in ten retransmitted for
+either version: three downloads and five uploads of v0.0.75 (38 to 16586
+segments), four and four of v0.0.76 (5 to 10476). The server's queues
+dropped nothing in those runs and neither kernel refused a receive; where
+the segments were lost was not traced. Tailscale ranged from 1235 to 2112
+down and from 1335 to 2260 up.
+
+Four flows carry 3–9% more than one through either version here, and CPU is
+within a tenth of a core between the two.
 
 ### Linux pair, `tx-udp-segmentation` on
 
+One flow:
+
 | | Down | Up | Retr (down / up) | CPU down (client / server) | CPU up (client / server) |
 |---|---:|---:|---:|---:|---:|
-| No tunnel | 21217 | 21337 | 112 / 0 | | |
-| Tailscale 1.104.7 | 3211 | 3130 | 1620 / 1236 | | |
-| ezvpn v0.0.70 | 3412 | 3083 | 0 / 0 | 1.30 / 1.33 | 1.28 / 1.27 |
-| ezvpn v0.0.74 | 3422 | 3073 | 0 / 0 | 1.29 / 1.33 | 1.28 / 1.27 |
+| No tunnel | 21158 | 21309 | 68 / 136 | | |
+| Tailscale 1.104.7 | 3235 | 3234 | 1203 / 869 | | |
+| ezvpn v0.0.75 | 3139 | 3076 | 0 / 0 | 1.28 / 1.32 | 1.28 / 1.28 |
+| ezvpn v0.0.76 | 3939 | 4015 | 0 / 0 | 1.46 / 1.58 | 1.55 / 1.47 |
+
+Four flows:
+
+| | Down | Up | Retr (down / up) | CPU down (client / server) | CPU up (client / server) |
+|---|---:|---:|---:|---:|---:|
+| No tunnel | 21843 | 21997 | 17754 / 16048 | | |
+| Tailscale 1.104.7 | 3807 | 3704 | 3562 / 3962 | | |
+| ezvpn v0.0.75 | 3537 | 3069 | 0 / 0 | 1.35 / 1.38 | 1.30 / 1.29 |
+| ezvpn v0.0.76 | 3996 | 3992 | 59 / 828 | 1.50 / 1.62 | 1.63 / 1.52 |
 
 `virtio_net` supports UDP segmentation offload but leaves it off by default
 (`ethtool -K eth0 tx-udp-segmentation on`). With it on, a UDP GSO batch
 crosses to the host as one buffer instead of being segmented in the guest.
 It is a setting of the underlay NIC, outside either VPN's control.
 
-Downloads ranged from 3004 to 3489 for v0.0.70 and from 2523 to 3547 for
-v0.0.74, uploads from 2994 to 3110 and from 2886 to 3151. v0.0.74 was ahead
-in five rounds of ten in each direction, and no ezvpn run retransmitted.
-Tailscale ranged from 2930 to 3601 down and, but for one upload of 1600,
-from 3063 to 3309 up.
+With one flow, downloads ranged from 2979 to 3494 for v0.0.75 and from 3584
+to 4081 for v0.0.76, uploads from 2956 to 3123 and from 3560 to 4097: the
+slowest run of v0.0.76 was faster than the fastest of v0.0.75 in both
+directions, and no ezvpn run retransmitted. Tailscale ranged from 1466 to
+3366 down and from 1463 to 3413 up.
 
-### macOS and Windows clients against the Linux server
+With four flows, downloads ranged from 3216 to 3658 for v0.0.75 and from
+3862 to 4102 for v0.0.76, uploads from 2909 to 3138 and from 3200 to 4155,
+and v0.0.76 was again ahead in every round. Tailscale ranged from 1551 to
+3900 down and from 1603 to 3850 up.
 
-One client at a time against the ezvpn server on `test1`, both ends at
-default NIC settings. Unlike the Linux pair these cross a real network, and
-the "no tunnel" row is what that path carries for one TCP flow, so read each
-tunnel number against its own baseline.
+The sending end is the one whose CPU grows most: the server's on a download
+(1.32 to 1.58 cores with one flow), the client's on an upload (1.28 to
+1.55). Per bit carried, every end of v0.0.76 uses less CPU than v0.0.75's or
+the same, but for the server on a four-flow download, which uses 4% more.
 
-| Client | | Down | Up | Client CPU, cores (down / up) |
-|---|---|---:|---:|---:|
-| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 | 2353 | |
-| | Tailscale 1.104.2 | 429 | 216 | |
-| | ezvpn v0.0.70 | 1832 | 956 | 1.71 / 1.60 |
-| | ezvpn v0.0.74 | 1832 | 917 | 1.71 / 1.59 |
-| Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2101 | 2361 | |
-| | ezvpn v0.0.70 | 1391 | 1709 | 1.44 / 1.15 |
-| | ezvpn v0.0.74 | 1436 | 1684 | 1.46 / 1.13 |
+Retransmits are what v0.0.76 pays for the rate, and only with four flows:
 
-Twenty rounds for the macOS client, in two sessions of ten, and ten for the
-Windows one, taken as the Linux pair's were, with iperf3 run on the client.
-Every tunnel run was over IPv4 to the server's own address, and the server's
-kernel refused no receive during any of them. Tailscale is not installed on
-the Windows VM. On the macOS VM it is normally stopped and was started for
-the two sessions; its own path to `test1` went by the router's public
-address, and its runs ranged from 426 to 432 down and from 211 to 221 up.
+- **Downloads.** Three of v0.0.75's ten runs retransmitted (118, 134 and 708
+  segments), and in each the server's queue for the client had dropped
+  exactly that many packets. Six of v0.0.76's did (26 to 723 segments); the
+  queue had dropped packets in five of them (26, 92, 159, 418 and 830). That
+  queue is where a server puts what it reads from its TUN device faster than
+  the tunnel takes it, so a drop there is the tunnel telling the inner TCP
+  flows to slow down.
+- **Uploads.** Seven of v0.0.76's ten runs retransmitted (339 to 2604
+  segments, a median of 828 against about 2.4 million sent), and none of
+  v0.0.75's. No counter read in these runs shows where; when the change was
+  developed, the receiving end's QUIC datagram buffer was seen to overflow
+  under four flows, with nothing lost by QUIC itself
+  ([Architecture](Architecture.md), "Encryption and send in a task of their
+  own").
 
-The macOS no-tunnel download read 1945 or 1946 on every run, which suggests
-a cap in the VM's NAT path. Both versions' downloads read 1832 in most runs
-(1768 at the lowest), which looks like the same cap less what the tunnel
-adds to each packet, so the download column says only that both reach it.
+## macOS and Windows clients
 
-Uploads are where the macOS client has room, and where the versions differ.
-They ranged from 816 to 1018 for v0.0.70 and from 787 to 1034 for v0.0.74,
-and v0.0.74 was ahead in 6 rounds of 20: the two sessions read 965 against
-903 and 956 against 926. Seven more rounds of uploads alone, with Tailscale
-stopped, read 922 against 894, with v0.0.74 ahead in two. Over all 27 rounds
-the medians are 956 and 906, v0.0.74 was ahead in 8, and 12 of its uploads
-were under 900 against 4 of v0.0.70's. A sign test puts 8 of 27 at about one
-chance in twenty, so the difference is probably real and about 5%. Which
-release brought it was not measured (v0.0.71 to v0.0.73 lie between), and
-the client's CPU does not show it: 1.6 cores for either version. The server
-is the busier end of a macOS upload, at about 1.9 cores on its two runtime
-workers for either version, where a Linux client's upload at two and a half
-times the rate costs it 1.25. A macOS client sends one datagram per UDP
-send, so they probably reach the server unbatched; that was not checked.
+Mbit/s, down / up, 2026-11-27: one client at a time against the ezvpn server
+on `test1`, both ends at default NIC settings and on the same version.
+Medians of ten rounds, taken in turn as the Linux pair's are. Unlike the
+Linux pair these cross a real network, and the "no tunnel" row is what that
+path carries, so read each tunnel number against its own baseline.
 
-Windows downloads ranged from 1294 to 1459 for v0.0.70 and from 1339 to 1572
-for v0.0.74, uploads from 1603 to 1810 and from 1620 to 1783. v0.0.74 was
-ahead in eight rounds of ten on downloads and five on uploads.
+| Client | | One flow | Four flows |
+|---|---|---:|---:|
+| macOS 26.7 VM (Apple M2 Max host, 8 vCPUs, arm64), behind its host's NAT | No tunnel | 1946 / 2354 | 1946 / 2353 |
+| | Tailscale 1.104.2 | 421 / 208 | 403 / 209 |
+| | ezvpn v0.0.75 | 1832 / 878 | 1831 / 857 |
+| | ezvpn v0.0.76 | 1832 / 892 | 1831 / 909 |
+| Windows VM (build 26100, Hyper-V, 4 vCPUs, 2 GB, 2.5 Gbit/s link, another host) | No tunnel | 2080 / 2372 | 2241 / 2371 |
+| | ezvpn v0.0.75 | 1371 / 1661 | 1261 / 1685 |
+| | ezvpn v0.0.76 | 1383 / 1701 | 1258 / 1674 |
+
+| Client | | Flows | Retr (down / up) | CPU down (client / server) | CPU up (client / server) |
+|---|---|---|---:|---:|---:|
+| macOS | ezvpn v0.0.75 | one | 0 / 0 | 1.72 / 1.12 | 1.58 / 1.87 |
+| | ezvpn v0.0.76 | one | 0 / 0 | 1.73 / 1.26 | 1.60 / 1.89 |
+| | ezvpn v0.0.75 | four | 1776 / 256 | 1.72 / 1.17 | 1.60 / 1.87 |
+| | ezvpn v0.0.76 | four | 186 / 320 | 1.73 / 1.29 | 1.63 / 1.89 |
+| Windows | ezvpn v0.0.75 | one | 0 / – | 1.37 / 1.10 | 1.15 / 1.27 |
+| | ezvpn v0.0.76 | one | 0 / – | 1.37 / 1.12 | 1.12 / 1.31 |
+| | ezvpn v0.0.75 | four | 0 / – | 1.33 / 1.07 | 1.15 / 1.27 |
+| | ezvpn v0.0.76 | four | 0 / – | 1.35 / 1.09 | 1.11 / 1.30 |
+
+iperf3 ran on the client (3.21 on macOS, 3.22.1 on Windows, where it does
+not report an upload's retransmits). Both clients kept IPv6 and the router's
+public address off their direct paths as well as the Tailscale ranges: ezvpn
+picks its direct path per connection, and on the macOS VM an IPv6 path has
+carried uploads more slowly than an IPv4 one
+([Opportunities left](#opportunities-left)). All 160 ezvpn runs, 80 for each
+client, were over IPv4 to the server's own address, before and after, and
+none had to be taken again. The server's kernel refused no receive and its
+per-client queues dropped nothing in any of them. Tailscale is not installed
+on the Windows VM; on the macOS VM it is normally stopped and was started
+for that client's rounds.
+
+For these two columns the container that runs the quarter-hourly jobs on
+`test1`'s host was shut down, and no run was started that would overlap one
+of the host's scheduled backups. That took one pause of five minutes in the
+macOS rounds and one of twenty-two in the Windows rounds, in place of the
+pause around each quarter-hour that the Linux pair's columns took.
+
+### macOS
+
+**Downloads read the same on both versions.** The no-tunnel download read
+1946 on every run, which suggests a cap in the VM's NAT path, and both
+versions read 1832 in most runs (1744 at the lowest for v0.0.75, 1813 for
+v0.0.76), which looks like the same cap less what the tunnel adds to each
+packet. So the column says only that both reach it. The server used more CPU
+for the same rate on v0.0.76: 1.26 cores against 1.12 with one flow, where
+every v0.0.76 run read above every v0.0.75 one, and 1.29 against 1.17 with
+four. A Windows download, at three quarters of the rate, shows two hundredths
+of a core between them.
+
+**Uploads are where the macOS client has room, and the versions are close.**
+A macOS client sends one datagram per UDP send and does not use the new
+task. With one flow, uploads ranged from 666 to 988 for v0.0.75 and from 781
+to 970 for v0.0.76, and v0.0.76 was ahead in five rounds of ten. With four
+flows they ranged from 729 to 906 and from 859 to 925, v0.0.76 was ahead in
+eight rounds of ten and its median is 6% higher. Eight of ten is what two
+equal versions give about one time in nine, so ten rounds do not settle
+whether that is a difference, and nothing was measured that would explain
+one. The server is the busier end of a macOS upload for either version, at
+about 1.9 cores on its two runtime workers.
+
+Four flows carry no more than one in either direction, for ezvpn or for
+Tailscale: the download is at the path's cap, and the upload's limit is in
+the tunnel, not in TCP.
+
+With four flows most runs retransmitted, and so did the path itself: the
+no-tunnel four-flow downloads retransmitted in every run (275 to 648
+segments). Eight of v0.0.75's ten four-flow downloads did (1076 to 4416
+segments) and all ten of v0.0.76's (1 to 3928, fewer than v0.0.75 in seven
+rounds); nine of ten four-flow uploads did for either version (up to 1221
+and 596). Since the server's queues dropped nothing, the segments were lost
+elsewhere; where was not traced. With one flow, 6 of the 40 ezvpn runs
+retransmitted at all.
+
+Tailscale ranged from 414 to 427 down and from 206 to 210 up with one flow,
+and from 392 to 406 and from 207 to 211 with four.
+
+### Windows
+
+**No cell separates the versions.** With one flow, downloads ranged from
+1319 to 1490 for v0.0.75 and from 1216 to 1462 for v0.0.76, uploads from
+1615 to 1783 and from 1582 to 1811; v0.0.76 was ahead in five rounds of ten
+on downloads and seven on uploads. With four flows, downloads ranged from
+1217 to 1344 and from 1090 to 1278, uploads from 1588 to 1834 and from 1606
+to 1752; v0.0.76 was ahead in three rounds of ten on downloads and four on
+uploads. The medians are within 2.5% of each other in all four cells.
+v0.0.76's slowest download was the slowest of its cell both times (1216 and
+1090, where v0.0.75's were 1319 and 1217); one run in ten does not say
+whether a v0.0.76 server's downloads to this client are less steady.
+
+No download retransmitted for either version, and CPU is within four
+hundredths of a core between them at both ends.
+
+**Four flows carry less down than one.** Downloads read 8–9% lower with four
+flows than with one for either version (about 1260 against 1375), on a path
+whose own download gains 8% from them (2241 against 2080), and uploads read
+the same with four as with one. The limit is in the tunnel in both
+directions, and the download is the slower one, at 1.35 cores on the client.
 
 ## Opportunities left
 
 What is known to be left on the table, with what is known about each. None
 of it is scheduled work. Where a figure from the tables above is given it
-was measured in these runs; the rest was not measured again, and its
+was measured in those runs; the rest was not measured again, and its
 mechanisms are described in [Architecture](Architecture.md), "Throughput
 Design".
 
 **macOS and iOS**
 
-- **v0.0.74's upload.** A macOS upload reads about 5% lower on v0.0.74
-  than on v0.0.70 ([Results](#macos-and-windows-clients-against-the-linux-server)).
-  The release binaries of v0.0.71 to v0.0.73, taken in turn the same way,
-  would say which release moved it. The server is at 1.9 cores of its two
-  workers during one, so a change to what the server does per packet is as
-  likely a place as the client.
+- **v0.0.74's upload.** A macOS upload read about 5% lower on v0.0.74
+  than on v0.0.70 when the two were compared on 2026-11-26 (906 against 956,
+  medians of 27 rounds with one flow), and v0.0.75 and v0.0.76 read 878 and
+  892 [above](#macos-and-windows-clients). The release binaries of v0.0.71 to v0.0.73,
+  taken in turn the same way, would say which release moved it. The server
+  is at 1.9 cores of its two workers during one, so a change to what the
+  server does per packet is as likely a place as the client.
+- **The upload gains nothing from more flows.** Four flows carry what one
+  does, about 0.9 Gbit/s on a path that carries 2.35, so the limit is in the
+  tunnel. Which end holds it was not measured: the client is at 1.6 cores
+  and the server at 1.9.
 - **Two syscalls per packet.** What is left of a macOS upload's client time
   is the utun `read` and the UDP `sendmsg`, one of each per packet, on two
   threads. Batching the syscalls (`recvmsg_x`, `sendmsg_x`) was not tried:
@@ -246,11 +387,23 @@ Design".
   inside a UDP payload; what raising the cap still needs is a bound that
   also respects the relay frame limit, a few bytes lower, which 32 datagrams
   stay under by themselves.
-- **The sender is one thread's worth.** Each end used 1.15–1.25 cores for
-  2.2–2.4 Gbit/s, and about 1.3 for 3.1–3.4 with the offload on, on machines
-  of six: one connection's data path is a chain of tasks that hand packets
-  on through the connection's lock, so a second thread adds handoffs rather
-  than capacity. Where the time goes was not profiled on these versions.
+- **A ceiling near 4 Gbit/s.** With the offload on, v0.0.76 reads the same
+  with four flows as with one (3996 / 3992 against 3939 / 4015), where
+  Tailscale gains 15–18% from the extra flows: the limit is in the tunnel,
+  not in TCP. Each end uses 1.5–1.6 cores of its two runtime workers at that
+  rate. Where the time goes now was not profiled; when the change was
+  developed the receiving side had become the slower one.
+- **Retransmits with several flows.** With four flows and the offload on,
+  seven of ten v0.0.76 uploads and six of ten downloads retransmitted, where
+  none and three of v0.0.75's did
+  ([Results](#linux-pair-tx-udp-segmentation-on)). On downloads most of it
+  is the server's queue for the client filling; on uploads it was put down
+  to the receiving end's QUIC datagram buffer, and that was not measured
+  again in these runs. One flow does not show it.
+- **Little gained at default NIC settings.** Without the offload v0.0.76 is
+  3–6% ahead of v0.0.75 where it is 13–31% ahead with it, at the same CPU.
+  What bounds the tunnel there was not profiled; the send, which then
+  segments each batch in the guest, is the likely place.
 - **Worker count off these VMs.** Two runtime workers was chosen on guests
   that overcommit their host two to one. A dedicated machine, or a server
   with many clients, may want a different number; `TOKIO_WORKER_THREADS` is
@@ -259,10 +412,11 @@ Design".
 **Windows**
 
 - **Not profiled.** The Windows client moves about 1.4 Gbit/s down and 1.7
-  up on a path that carries 2.1 and 2.36, at 1.45 and 1.15 cores. The
-  download is the slower direction, which points at the receive side (the
-  driver, the datagram reader and one Wintun write per packet), but nothing
-  is known yet about where its time goes.
+  up on a path that carries 2.1 and 2.37, at 1.37 and 1.15 cores. The
+  download is the slower direction, and it reads 8% lower with four flows
+  than with one, which points at the receive side (the driver, the datagram
+  reader and one Wintun write per packet), but nothing is known yet about
+  where its time goes.
 
 ## Reproducing
 
@@ -274,6 +428,7 @@ the other (the README's quick start has both). Wait for
 ```bash
 iperf3 -t 6 -O 1 -c <server VPN address>        # up
 iperf3 -t 6 -O 1 -c <server VPN address> -R     # down
+iperf3 -t 6 -O 1 -P 4 -c <server VPN address>   # four flows; -R for down
 ```
 
 A run that begins on a relay measures the relay. If the machines share
