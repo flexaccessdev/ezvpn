@@ -60,3 +60,4 @@ test-scripts/.tunnel_keys
 test-scripts/.keys/
 .claude/
 CLAUDE.local.md
+__pycache__/
